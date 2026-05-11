@@ -38,8 +38,7 @@ class DatabaseSchema:
         iron_mg REAL,
         vitamin_d_iu REAL,
         magnesium_mg REAL,
-        zinc_mg REAL,  -- Add zinc as a new micronutrient
-        -- Add more micronutrients as needed
+        # Add more micronutrients as needed
         raw_csv_path TEXT,
         imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
