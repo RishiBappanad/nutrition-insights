@@ -44,5 +44,5 @@ temp/
 # Keep base files but ignore user-specific data
 !workouts.csv
 !nutrition_insights.db
-# raw_data/*.csv
-# raw_data/*.json
+raw_data/*.csv
+raw_data/*.json
