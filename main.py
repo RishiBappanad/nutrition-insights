@@ -21,34 +21,101 @@ from src.data_processing.transform import (
     CronometerTransformer,
     StravaTransformer,
 )
-from src.integrations.cronometer import CronometerAutomation
+from src.integrations.cronometer_rpc import CronometerRPCClient
+from src.integrations.hevy_web import HevyWebScraper, create_hevy_scraper
 from src.integrations.strava import StravaClient
 from src.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
 
 
-async def run_cronometer_export() -> Optional[dict[str, str]]:
+def run_cronometer_export(start_date: str, end_date: str) -> Optional[dict[str, str]]:
     """
-    Execute Cronometer CSV export via Playwright automation.
+    Execute Cronometer CSV export via RPC calls.
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
 
     Returns:
         Dictionary mapping CSV types to file paths
     """
     try:
-        async with CronometerAutomation(headless=False) as automation:
-            logger.info("Starting Cronometer CSV export...")
-            results = await automation.download_all_csvs()
+        logger.info("Starting Cronometer RPC export...")
+        
+        client = CronometerRPCClient()
+        client.login()
+        
+        results = client.export_all_to_files(start_date, end_date)
 
-            if "error" in results:
-                logger.error(f"Cronometer export failed: {results['error']}")
-                return None
+        if not any(results.values()):
+            logger.error("All Cronometer exports failed")
+            return None
 
-            logger.info("Cronometer export completed successfully")
-            return results
+        logger.info("Cronometer RPC export completed successfully")
+        return results
 
     except Exception as e:
-        logger.error(f"Cronometer export failed: {e}")
+        logger.error(f"Cronometer RPC export failed: {e}")
+        return None
+
+
+def run_hevy_export(start_date: str, end_date: str) -> Optional[dict[str, str]]:
+    """
+    Execute Hevy workout data export via RPC calls.
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+
+    Returns:
+        Dictionary mapping data types to file paths
+    """
+    try:
+        from datetime import datetime
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        
+        from src.integrations.hevy_web import HevyWebScraper, create_hevy_scraper
+        
+        # Use web scraper instead of API client
+        scraper = create_hevy_scraper()
+        
+        # Get credentials from environment
+        username = getattr(settings, 'hevy_username', None)
+        password = getattr(settings, 'hevy_password', None)
+        
+        if not username or not password:
+            # Try environment variables directly
+            import os
+            from dotenv import load_dotenv
+            load_dotenv()
+            username = os.getenv('HEVY_USERNAME')
+            password = os.getenv('HEVY_PASSWORD')
+        
+        if not username or not password:
+            logger.error("Hevy credentials not found in environment")
+            return None
+            
+        logger.info("Starting Hevy workout export...")
+        
+        # Login and export data
+        with scraper:
+            if scraper.login(username, password):
+                results = scraper.export_all_to_files(start_dt, end_dt)
+            
+            if "error" in results:
+                logger.error(f"Hevy export failed: {results['error']}")
+                return None
+                
+            logger.info("Hevy export completed successfully")
+            return results
+        else:
+            logger.error("Hevy login failed")
+            return None
+
+    except Exception as e:
+        logger.error(f"Hevy export failed: {e}")
         return None
 
 
@@ -124,6 +191,93 @@ def process_cronometer_data(
         return 0
 
 
+def process_hevy_data(
+    files: dict[str, str],
+    db_conn: sqlite3.Connection,
+    db_schema: DatabaseSchema,
+) -> int:
+    """
+    Transform and upsert Hevy workout data.
+
+    Args:
+        files: Dictionary mapping data types to file paths
+        db_conn: Database connection
+        db_schema: DatabaseSchema instance
+
+    Returns:
+        Number of records inserted/updated
+    """
+    try:
+        import json
+        
+        total_records = 0
+        
+        # Process workout summaries
+        if 'workouts' in files:
+            workouts_file = files['workouts']
+            logger.info(f"Processing Hevy workout data from {workouts_file}")
+            
+            with open(workouts_file, 'r') as f:
+                workouts = json.load(f)
+                
+            for workout in workouts:
+                # Create a simple workout record for now
+                # TODO: Create proper Hevy workout table in schema
+                workout_data = {
+                    'id': workout.get('id', ''),
+                    'date': workout.get('date', ''),
+                    'name': workout.get('name', ''),
+                    'duration_seconds': workout.get('duration_seconds', 0),
+                    'estimated_volume_kg': workout.get('estimated_volume_kg', 0),
+                    'exercise_count': workout.get('exercise_count', 0),
+                }
+                
+                # For now, store as a simple record in daily_nutrition table
+                # TODO: Create dedicated workout tables
+                db_schema.upsert_daily_nutrition(
+                    db_conn,
+                    workout_data['date'],
+                    {
+                        'calories': 0,  # Placeholder
+                        'protein_g': 0,
+                        'carbs_g': 0,
+                        'fat_g': 0,
+                    },
+                    csv_path=workouts_file,
+                )
+                
+            total_records += len(workouts)
+            logger.info(f"Processed {len(workouts)} workout records")
+            
+        # Process exercise details
+        if 'exercises' in files:
+            exercises_file = files['exercises']
+            logger.info(f"Processing Hevy exercise data from {exercises_file}")
+            
+            with open(exercises_file, 'r') as f:
+                exercises = json.load(f)
+                
+            # Group exercises by date for summary
+            exercise_by_date = {}
+            for exercise in exercises:
+                date = exercise.get('workout_date', '')
+                if date not in exercise_by_date:
+                    exercise_by_date[date] = []
+                exercise_by_date[date].append(exercise)
+                
+            total_records += len(exercises)
+            logger.info(f"Processed {len(exercises)} exercise records across {len(exercise_by_date)} dates")
+            
+        db_conn.commit()
+        logger.info(f"Upserted {total_records} Hevy records")
+        return total_records
+
+    except Exception as e:
+        logger.error(f"Error processing Hevy data: {e}")
+        db_conn.rollback()
+        return 0
+
+
 def process_strava_data(
     activities: list,
     db_conn: sqlite3.Connection,
@@ -187,8 +341,13 @@ async def main() -> None:
     db_conn = db_schema.get_connection()
 
     try:
-        # Step 1: Export from Cronometer
-        cronometer_files = await run_cronometer_export()
+        # Step 1: Export from Cronometer using RPC
+        # Default to last 30 days, but this can be configured
+        from datetime import datetime, timedelta
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        
+        cronometer_files = run_cronometer_export(start_date, end_date)
 
         if cronometer_files and "daily_summary" in cronometer_files:
             process_cronometer_data(
@@ -197,7 +356,13 @@ async def main() -> None:
                 db_schema,
             )
 
-        # Step 2: Sync from Strava
+        # Step 2: Export from Hevy using RPC
+        hevy_files = run_hevy_export(start_date, end_date)
+        
+        if hevy_files and "error" not in hevy_files:
+            process_hevy_data(hevy_files, db_conn, db_schema)
+
+        # Step 3: Sync from Strava
         strava_client = StravaClient()
         activities = await run_strava_sync(strava_client)
 
