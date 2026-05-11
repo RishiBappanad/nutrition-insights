@@ -34,3 +34,15 @@ Thumbs.db
 # Config files (with secrets)
 config.local.*
 secrets.*
+
+# Debug and temporary files
+unnecessary/
+*.png
+screenshots/
+temp/
+
+# Keep base files but ignore user-specific data
+!workouts.csv
+!nutrition_insights.db
+# raw_data/*.csv
+# raw_data/*.json
