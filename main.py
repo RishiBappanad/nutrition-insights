@@ -8,10 +8,14 @@ This script demonstrates:
 4. Data transformation and validation
 5. Database upsert operations
 """
+from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import json
 import logging
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -22,11 +26,89 @@ from src.data_processing.transform import (
     StravaTransformer,
 )
 from src.integrations.cronometer_rpc import CronometerRPCClient
-from src.integrations.hevy_web import HevyWebScraper, create_hevy_scraper
 from src.integrations.strava import StravaClient
 from src.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
+
+
+def filter_biometrics(csv_path: str) -> None:
+    """Remove heart rate rows from biometrics CSV in place."""
+    path = Path(csv_path)
+    lines = path.read_text().splitlines()
+    filtered = [lines[0]] + [l for l in lines[1:] if "Heart Rate" not in l]
+    path.write_text("\n".join(filtered) + "\n")
+    logger.info(f"Filtered biometrics: {len(lines)} -> {len(filtered)} rows")
+
+
+def update_tdee_log(cronometer_files: dict) -> None:
+    """Update tdee_tracking_log.csv with weights, calories consumed, and active calories burned."""
+    import csv
+    from collections import defaultdict
+
+    csv_path = "tdee_tracking_log.csv"
+
+    # 1. Parse weight from biometrics (last entry per day)
+    weights = {}
+    bio_path = cronometer_files.get("biometrics")
+    if bio_path:
+        with open(bio_path) as f:
+            for row in csv.DictReader(f):
+                if "Weight" in row["Metric"] and "Apple Health" not in row["Metric"]:
+                    weights[row["Day"]] = float(row["Amount"])
+
+    # 2. Parse calories consumed from daily_summary (Total rows only)
+    calories_consumed = {}
+    summary_path = cronometer_files.get("daily_summary")
+    if summary_path:
+        with open(summary_path) as f:
+            for row in csv.DictReader(f):
+                if row["Group"].strip('"') == "Total" and row["Energy (kcal)"]:
+                    calories_consumed[row["Date"]] = round(float(row["Energy (kcal)"]), 1)
+
+    # 3. Parse active calories from exercises (sum per day, absolute value)
+    active_calories = defaultdict(float)
+    exercises_path = cronometer_files.get("exercises")
+    if exercises_path:
+        with open(exercises_path) as f:
+            for row in csv.DictReader(f):
+                if row["Calories Burned"]:
+                    active_calories[row["Day"]] += abs(float(row["Calories Burned"]))
+
+    # All dates we have data for
+    all_dates = set(weights) | set(calories_consumed) | set(active_calories.keys())
+    if not all_dates:
+        logger.warning("No data to update TDEE log")
+        return
+
+    # Load existing CSV if it exists
+    existing = {}
+    try:
+        with open(csv_path) as f:
+            for row in csv.DictReader(f):
+                existing[row["Date"]] = row
+    except FileNotFoundError:
+        pass
+
+    # Merge new data
+    for date_str in all_dates:
+        if date_str not in existing:
+            existing[date_str] = {"Date": date_str, "Weight_lbs": "", "Calories_Consumed": "", "Active_Calories_Burned": ""}
+        if date_str in weights:
+            existing[date_str]["Weight_lbs"] = weights[date_str]
+        if date_str in calories_consumed:
+            existing[date_str]["Calories_Consumed"] = calories_consumed[date_str]
+        if date_str in active_calories:
+            existing[date_str]["Active_Calories_Burned"] = round(active_calories[date_str], 1)
+
+    # Write sorted CSV
+    rows = sorted(existing.values(), key=lambda r: r["Date"])
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["Date", "Weight_lbs", "Calories_Consumed", "Active_Calories_Burned"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info(f"TDEE log updated: {len(rows)} rows")
 
 
 def run_cronometer_export(start_date: str, end_date: str) -> Optional[dict[str, str]]:
@@ -62,56 +144,21 @@ def run_cronometer_export(start_date: str, end_date: str) -> Optional[dict[str, 
 
 def run_hevy_export(start_date: str, end_date: str) -> Optional[dict[str, str]]:
     """
-    Execute Hevy workout data export via RPC calls.
-
-    Args:
-        start_date: Start date in YYYY-MM-DD format
-        end_date: End date in YYYY-MM-DD format
+    Execute Hevy workout data export via Playwright.
 
     Returns:
-        Dictionary mapping data types to file paths
+        Dictionary with 'workouts' key pointing to CSV path, or None on failure.
     """
     try:
-        from datetime import datetime
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-        
-        from src.integrations.hevy_web import HevyWebScraper, create_hevy_scraper
-        
-        # Use web scraper instead of API client
-        scraper = create_hevy_scraper()
-        
-        # Get credentials from environment
-        username = getattr(settings, 'hevy_username', None)
-        password = getattr(settings, 'hevy_password', None)
-        
-        if not username or not password:
-            # Try environment variables directly
-            import os
-            from dotenv import load_dotenv
-            load_dotenv()
-            username = os.getenv('HEVY_USERNAME')
-            password = os.getenv('HEVY_PASSWORD')
-        
-        if not username or not password:
-            logger.error("Hevy credentials not found in environment")
-            return None
-            
+        from src.integrations.hevy_web import export_hevy_data
+
         logger.info("Starting Hevy workout export...")
-        
-        # Login and export data
-        with scraper:
-            if scraper.login(username, password):
-                results = scraper.export_all_to_files(start_dt, end_dt)
-            
-            if "error" in results:
-                logger.error(f"Hevy export failed: {results['error']}")
-                return None
-                
+        path = export_hevy_data(headless=True)
+        if path:
             logger.info("Hevy export completed successfully")
-            return results
+            return {"workouts": path}
         else:
-            logger.error("Hevy login failed")
+            logger.error("Hevy export failed")
             return None
 
     except Exception as e:
@@ -302,17 +349,47 @@ def process_strava_data(
 
         for activity in activities:
             try:
-                # Transform individual activity
-                records = transformer.transform([activity])  # Type expects list
+                strava_id = activity.get("id")
+                timestamp = activity.get("start_date_local")
 
-                for record in records:
-                    activity_dict = record.model_dump(exclude_none=True)
-                    db_schema.upsert_cardio_activity(
-                        db_conn,
-                        record.strava_activity_id,
-                        activity_dict,
-                    )
-                    record_count += 1
+                if not strava_id or not timestamp:
+                    continue
+
+                try:
+                    dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    activity_date = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    continue
+
+                distance_m = activity.get("distance", 0)
+                duration_seconds = activity.get("elapsed_time", 0)
+                avg_speed_ms = (distance_m / duration_seconds) if duration_seconds > 0 else None
+
+                from src.data_processing.transform import CardioActivity
+                record = CardioActivity(
+                    strava_activity_id=strava_id,
+                    activity_date=activity_date,
+                    activity_type=transformer.normalize_activity_type(activity.get("type", "Unknown")),
+                    name=activity.get("name"),
+                    distance_m=distance_m,
+                    duration_seconds=duration_seconds,
+                    avg_speed_ms=avg_speed_ms,
+                    max_speed_ms=activity.get("max_speed"),
+                    elevation_gain_m=activity.get("total_elevation_gain"),
+                    avg_heartrate=activity.get("average_heartrate"),
+                    max_heartrate=activity.get("max_heartrate"),
+                    total_elevation_loss_m=activity.get("total_elevation_loss"),
+                    calories_burned=activity.get("calories"),
+                    raw_json=json.dumps(activity),
+                )
+
+                activity_dict = record.model_dump(exclude_none=True)
+                db_schema.upsert_cardio_activity(
+                    db_conn,
+                    record.strava_activity_id,
+                    activity_dict,
+                )
+                record_count += 1
 
             except Exception as e:
                 logger.warning(f"Error processing activity {activity.get('id')}: {e}")
@@ -341,24 +418,44 @@ async def main() -> None:
     db_conn = db_schema.get_connection()
 
     try:
-        # Step 1: Export from Cronometer using RPC
-        # Default to last 30 days, but this can be configured
+        # Step 1: Export from Cronometer using RPC (all history)
         from datetime import datetime, timedelta
         end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        start_date = "2026-04-06"  # Account start date
         
         cronometer_files = run_cronometer_export(start_date, end_date)
 
-        if cronometer_files and "daily_summary" in cronometer_files:
-            process_cronometer_data(
-                cronometer_files["daily_summary"],
-                db_conn,
-                db_schema,
-            )
+        if cronometer_files:
+            # Filter heart rate noise from biometrics
+            if cronometer_files.get("biometrics"):
+                filter_biometrics(cronometer_files["biometrics"])
 
-        # Step 2: Export from Hevy using RPC
-        hevy_files = run_hevy_export(start_date, end_date)
-        
+            # Update TDEE tracking log with weights, calories, and active calories
+            update_tdee_log(cronometer_files)
+
+            # Recalculate BMR and push back to Cronometer
+            from tdee import calculate_bmr
+            bmr = calculate_bmr()
+            if isinstance(bmr, (int, float)):
+                logger.info(f"Calculated BMR: {bmr} kcal")
+                try:
+                    client = CronometerRPCClient()
+                    client.login()
+                    client.set_bmr(int(bmr))
+                except Exception as e:
+                    logger.warning(f"Could not push BMR to Cronometer: {e}")
+
+            if "daily_summary" in cronometer_files:
+                process_cronometer_data(
+                    cronometer_files["daily_summary"],
+                    db_conn,
+                    db_schema,
+                )
+
+        # Step 2: Export from Hevy using RPC (run in thread to avoid asyncio/Playwright conflict)
+        loop = asyncio.get_event_loop()
+        hevy_files = await loop.run_in_executor(None, run_hevy_export, start_date, end_date)
+
         if hevy_files and "error" not in hevy_files:
             process_hevy_data(hevy_files, db_conn, db_schema)
 

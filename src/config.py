@@ -11,16 +11,19 @@ class Settings(BaseSettings):
     """Application settings from environment variables."""
 
     # Cronometer
-    cronometer_email: Optional[str] = None
+    cronometer_username: Optional[str] = None
     cronometer_password: Optional[str] = None
 
     # Strava
     strava_client_id: Optional[str] = None
     strava_client_secret: Optional[str] = None
     strava_refresh_token: Optional[str] = None
+    strava_access_token: Optional[str] = None
 
     # Hevy
     hevy_api_key: Optional[str] = None
+    hevy_username: Optional[str] = None
+    hevy_password: Optional[str] = None
 
     # Database
     database_path: str = "nutrition_insights.db"

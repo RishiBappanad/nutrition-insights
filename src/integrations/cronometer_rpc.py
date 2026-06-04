@@ -169,6 +169,41 @@ class CronometerRPCClient:
             "sec-fetch-site": "same-origin",
         }
 
+    def set_bmr(self, value: int) -> bool:
+        """Set a custom BMR value in Cronometer.
+
+        Args:
+            value: BMR in kcal (e.g. 1700)
+
+        Returns:
+            True on success
+        """
+        headers = {
+            "Content-Type": GWT_CONTENT_TYPE,
+            "x-gwt-module-base": GWT_MODULE_BASE,
+            "x-gwt-permutation": GWT_PERMUTATION,
+        }
+        payload = (
+            "7|0|9|https://cronometer.com/cronometer/|"
+            f"{GWT_HEADER}|"
+            "com.cronometer.shared.rpc.CronometerService|"
+            "setUserPreference|"
+            "java.lang.String/2004016611|"
+            "I|"
+            f"{self.nonce}|"
+            "bmr|"
+            f"{value}|"
+            f"1|2|3|4|4|5|6|5|5|7|{self.user_id}|8|9|"
+        )
+        resp = self.session.post(GWT_BASE_URL, headers=headers, data=payload, timeout=30)
+        resp.raise_for_status()
+        success = resp.text.startswith("//OK")
+        if success:
+            logger.info(f"BMR set to {value} kcal")
+        else:
+            logger.error(f"Failed to set BMR: {resp.text}")
+        return success
+
     def export(self, export_type: str, start_date: str, end_date: str) -> str:
         """
         Export data from Cronometer.
@@ -214,7 +249,7 @@ class CronometerRPCClient:
 
     def export_all_to_files(self, start_date: str, end_date: str, output_dir: str = "raw_data") -> Dict[str, Optional[str]]:
         """
-        Export all data types to files.
+        Export all data types to files with fixed filenames (overwritten each run).
         
         Args:
             start_date: Start date in YYYY-MM-DD format
@@ -227,7 +262,6 @@ class CronometerRPCClient:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         results = {}
         
         export_methods = [
@@ -243,7 +277,7 @@ class CronometerRPCClient:
                 logger.info(f"Exporting {export_type} data...")
                 csv_data = method(start_date, end_date)
                 
-                filename = f"cronometer_{export_type}_{timestamp}.csv"
+                filename = f"cronometer_{export_type}.csv"
                 filepath = output_path / filename
                 
                 with open(filepath, 'w', encoding='utf-8') as f:

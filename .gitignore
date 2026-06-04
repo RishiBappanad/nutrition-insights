@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 venv/
+.venv/
 env/
 
 # IDE
@@ -41,6 +42,9 @@ unnecessary/
 screenshots/
 temp/
 
+# TDEE tracking
+tdee_tracking_log.xlsx
+tdee_tracking_log.csv
 # Keep base files but ignore user-specific data
 !workouts.csv
 !nutrition_insights.db

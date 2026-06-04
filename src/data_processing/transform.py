@@ -7,12 +7,13 @@ Handles:
 - Data normalization and cleaning
 - Preparation for database upsert
 """
+from __future__ import annotations
 
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import pandas as pd
 from pydantic import BaseModel, Field, validator
@@ -100,7 +101,7 @@ class CronometerTransformer:
         """Initialize transformer."""
         self.last_error: Optional[str] = None
 
-    def read_csv(self, filepath: str | Path) -> Optional[pd.DataFrame]:
+    def read_csv(self, filepath: Union[str, Path]) -> Optional[pd.DataFrame]:
         """
         Read Cronometer CSV file.
 
@@ -181,7 +182,7 @@ class CronometerTransformer:
 
     def transform(
         self,
-        filepath: str | Path,
+        filepath: Union[str, Path],
         date_column: str = "Date",
     ) -> list[NutritionData]:
         """
@@ -265,7 +266,7 @@ class StravaTransformer:
         """Initialize transformer."""
         self.last_error: Optional[str] = None
 
-    def read_json(self, filepath: str | Path) -> Optional[list[dict[str, Any]]]:
+    def read_json(self, filepath: Union[str, Path]) -> Optional[list[dict[str, Any]]]:
         """
         Read Strava JSON file.
 
@@ -329,7 +330,7 @@ class StravaTransformer:
             logger.warning(f"Error parsing timestamp {epoch_seconds}: {e}")
             return ""
 
-    def transform(self, filepath: str | Path) -> list[CardioActivity]:
+    def transform(self, filepath: Union[str, Path]) -> list[CardioActivity]:
         """
         Transform Strava JSON to validated activity records.
 
@@ -409,7 +410,7 @@ class StravaTransformer:
 
 
 def transform_and_validate_nutrition(
-    csv_path: str | Path,
+    csv_path: Union[str, Path],
 ) -> tuple[bool, list[NutritionData]]:
     """
     Convenience function to transform and validate Cronometer data.
@@ -427,7 +428,7 @@ def transform_and_validate_nutrition(
 
 
 def transform_and_validate_strava(
-    json_path: str | Path,
+    json_path: Union[str, Path],
 ) -> tuple[bool, list[CardioActivity]]:
     """
     Convenience function to transform and validate Strava data.
