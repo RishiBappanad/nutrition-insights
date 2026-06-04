@@ -1,52 +1,30 @@
-# Environment variables
+# Environment
 .env
 .env.local
-.env.*.local
 
 # Dependencies
 node_modules/
 __pycache__/
 *.pyc
-*.egg-info/
-venv/
 .venv/
-env/
+venv/
 
 # IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
 
-# Build outputs
+# Build
 dist/
 build/
-.next/
 
-# Logs
-*.log
-npm-debug.log*
+# App data (per-user, not committed)
+app/backend/app_data/
 
 # OS
 .DS_Store
-Thumbs.db
 
-# Config files (with secrets)
-config.local.*
-secrets.*
+# Logs
+*.log
 
-# Debug and temporary files
-unnecessary/
-*.png
-screenshots/
-temp/
-
-# TDEE tracking
-tdee_tracking_log.xlsx
-tdee_tracking_log.csv
-# Keep base files but ignore user-specific data
-!workouts.csv
-!nutrition_insights.db
-raw_data/*.csv
-raw_data/*.json
+# Frontend build
+app/frontend/dist/
