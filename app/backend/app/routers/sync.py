@@ -50,8 +50,10 @@ def _update_tdee_log(cronometer_files: dict, output_path: str) -> None:
     if summary_path:
         with open(summary_path) as f:
             for row in csv.DictReader(f):
-                if row["Group"].strip('"') == "Total" and row["Energy (kcal)"]:
-                    calories_consumed[row["Date"]] = round(float(row["Energy (kcal)"]), 1)
+                if row.get("Energy (kcal)"):
+                    date = row.get("Date", "")
+                    if date:
+                        calories_consumed[date] = round(float(row["Energy (kcal)"]), 1)
 
     active_calories = defaultdict(float)
     exercises_path = cronometer_files.get("exercises")
@@ -113,6 +115,50 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
             _filter_biometrics(results["biometrics"])
         _update_tdee_log(results, tdee_path)
 
+        # Populate SQLite with nutrition data
+        from ..user_db import get_user_db, upsert_daily_nutrition
+        conn = get_user_db(user_data_dir(user_id))
+
+        # Insert daily summary metrics
+        if results.get("daily_summary"):
+            with open(results["daily_summary"]) as f:
+                for row in csv.DictReader(f):
+                    if "Group" in row and row.get("Group", "").strip('"') != "Total":
+                        continue
+                    date = row.get("Date", "")
+                    if not date:
+                        continue
+                    metrics = {}
+                    for k, v in row.items():
+                        if k in ("Date", "Group", "Completed") or not v:
+                            continue
+                        try:
+                            metrics[k] = float(v)
+                        except ValueError:
+                            pass
+                    if metrics:
+                        upsert_daily_nutrition(conn, date, metrics)
+
+        # Insert active calories burned as a nutrition metric
+        if results.get("exercises"):
+            from collections import defaultdict
+            daily_burn = defaultdict(float)
+            with open(results["exercises"]) as f:
+                for row in csv.DictReader(f):
+                    if row.get("Calories Burned"):
+                        daily_burn[row["Day"]] += abs(float(row["Calories Burned"]))
+            for date, val in daily_burn.items():
+                upsert_daily_nutrition(conn, date, {"Active Calories Burned": round(val, 1)})
+
+        # Insert weight as a nutrition metric (biometrics)
+        if results.get("biometrics"):
+            with open(results["biometrics"]) as f:
+                for row in csv.DictReader(f):
+                    if "Weight" in row["Metric"] and "Apple Health" not in row["Metric"]:
+                        upsert_daily_nutrition(conn, row["Day"], {"Weight (lbs)": float(row["Amount"])})
+
+        conn.close()
+
         bmr = calculate_bmr(tdee_path)
         if isinstance(bmr, (int, float)):
             client.set_bmr(int(bmr))
@@ -144,6 +190,33 @@ async def sync_hevy(user_id: int = Depends(get_current_user)):
         path = await loop.run_in_executor(None, _run_hevy)
         if not path:
             raise HTTPException(status_code=401, detail="Hevy login failed")
+
+        # Populate lift_orm table from exported CSV
+        from ..user_db import get_user_db, upsert_lift_orm
+        from ..routers.data import _compute_orm, _parse_hevy_date
+        conn = get_user_db(user_data_dir(user_id))
+
+        with open(path) as f:
+            for row in csv.DictReader(f):
+                exercise = row.get("exercise_title", "").strip()
+                weight_str = row.get("weight_lbs", "")
+                reps_str = row.get("reps", "")
+                start_time = row.get("start_time", "")
+                if not exercise or not weight_str or not reps_str:
+                    continue
+                try:
+                    weight = float(weight_str)
+                    reps = int(reps_str)
+                except (ValueError, TypeError):
+                    continue
+                date = _parse_hevy_date(start_time)
+                if not date:
+                    continue
+                orm = _compute_orm(weight, reps)
+                if orm > 0:
+                    upsert_lift_orm(conn, date, exercise, round(orm, 1))
+
+        conn.close()
         return {"status": "ok", "file": path}
     except HTTPException:
         raise

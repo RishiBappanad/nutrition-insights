@@ -62,3 +62,17 @@ td:first-child, th:first-child { text-align: left; }
 .toggle { color: #007aff; cursor: pointer; margin-top: 12px; text-align: center; }
 
 pre { font-size: 0.75rem; background: #f0f0f0; padding: 8px; border-radius: 6px; margin-top: 8px; overflow-x: auto; }
+
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; max-height: 120px; overflow-y: auto; }
+.chip { width: auto; padding: 4px 10px; font-size: 12px; border-radius: 16px; background: #eee; color: #333; margin: 0; }
+.chip.active { background: #007aff; color: white; }
+.cat-tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+.cat-tab { width: auto; padding: 6px 12px; font-size: 13px; background: #f0f0f0; border-radius: 8px; color: #555; margin: 0; }
+.cat-tab.active { background: #333; color: white; }
+.selected-label { font-size: 11px; color: #666; margin-top: 8px; }
+.view-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.timeframe { display: flex; gap: 6px; margin-top: 8px; }
+.sync-btns { display: flex; gap: 8px; }
+.sync-btns button { flex: 1; }
+.insight-controls { display: flex; flex-direction: column; gap: 8px; }
+.insight-controls select { padding: 8px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
