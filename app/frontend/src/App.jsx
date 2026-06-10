@@ -89,6 +89,7 @@ function Chart() {
   const [series, setSeries] = useState({})
   const [openCat, setOpenCat] = useState('biometrics')
   const [lookback, setLookback] = useState(1)
+  const [hoverIdx, setHoverIdx] = useState(null)
 
   useEffect(() => {
     api(`/data/chart?metrics=${encodeURIComponent('Energy (kcal)')}`).then(r => r.json()).then(d => {
@@ -143,7 +144,15 @@ function Chart() {
         </div>
       )}
       {allDates.length >= 2 ? (
-        <svg viewBox={`0 0 ${W} ${H + 30}`} style={{width: '100%', height: 'auto', marginTop: 12}}>
+        <svg viewBox={`0 0 ${W} ${H + 30}`} style={{width: '100%', height: 'auto', marginTop: 12}}
+          onMouseMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect()
+            const svgX = ((e.clientX - rect.left) / rect.width) * W
+            const idx = Math.round(((svgX - PAD) / (W - PAD * 2)) * (allDates.length - 1))
+            setHoverIdx(Math.max(0, Math.min(allDates.length - 1, idx)))
+          }}
+          onMouseLeave={() => setHoverIdx(null)}
+        >
           {Object.entries(series).map(([name, points], idx) => {
             if (points.length < 2) return null
             const vals = points.map(p => p.value)
@@ -152,15 +161,28 @@ function Chart() {
             const dateToX = (d) => PAD + ((allDates.indexOf(d)) / (allDates.length - 1)) * (W - PAD * 2)
             const valToY = (v) => H - PAD - ((v - min) / range) * (H - PAD * 2)
             const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${dateToX(p.date).toFixed(1)},${valToY(p.value).toFixed(1)}`).join(' ')
+            const hoverPoint = hoverIdx !== null ? points.find(p => p.date === allDates[hoverIdx]) : null
             return (
               <g key={name}>
                 <path d={pathD} fill="none" stroke={colors[idx % 3]} strokeWidth="2" />
                 <text x={W - PAD + 4} y={valToY(vals[vals.length - 1])} fill={colors[idx % 3]} fontSize="10">{name.split('(')[0].trim()}</text>
+                {hoverPoint && <circle cx={dateToX(hoverPoint.date)} cy={valToY(hoverPoint.value)} r="4" fill={colors[idx % 3]} />}
               </g>
             )
           })}
-          <text x={PAD} y={H + 5} fontSize="8" fill="#999">{allDates[0]}</text>
-          <text x={W - PAD} y={H + 5} fontSize="8" fill="#999" textAnchor="end">{allDates[allDates.length - 1]}</text>
+          {hoverIdx !== null && (
+            <g>
+              <line x1={PAD + (hoverIdx / (allDates.length - 1)) * (W - PAD * 2)} y1={0} x2={PAD + (hoverIdx / (allDates.length - 1)) * (W - PAD * 2)} y2={H - PAD + 10} stroke="#999" strokeWidth="0.5" strokeDasharray="3,2" />
+              <text x={PAD + (hoverIdx / (allDates.length - 1)) * (W - PAD * 2)} y={H + 15} fontSize="9" fill="#333" textAnchor="middle">{allDates[hoverIdx]}</text>
+              {Object.entries(series).map(([name, points], idx) => {
+                const pt = points.find(p => p.date === allDates[hoverIdx])
+                if (!pt) return null
+                return <text key={name} x={PAD + (hoverIdx / (allDates.length - 1)) * (W - PAD * 2) + 6} y={16 + idx * 12} fontSize="9" fill={colors[idx % 3]}>{name.split('(')[0].trim()}: {pt.value.toFixed(1)}</text>
+              })}
+            </g>
+          )}
+          {hoverIdx === null && <text x={PAD} y={H + 5} fontSize="8" fill="#999">{allDates[0]}</text>}
+          {hoverIdx === null && <text x={W - PAD} y={H + 5} fontSize="8" fill="#999" textAnchor="end">{allDates[allDates.length - 1]}</text>}
         </svg>
       ) : <p style={{color:'#999', marginTop:12}}>Select metrics to display chart.</p>}
     </div>
