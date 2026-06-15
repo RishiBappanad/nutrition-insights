@@ -1,7 +1,7 @@
 import pandas as pd
 
 
-def calculate_bmr(file_path="tdee_tracking_log.csv", window=14, alpha=0.1):
+def calculate_bmr(file_path="tdee_tracking_log.csv", window=21, alpha=0.1):
     """Calculate BMR. Uses linear model if last N days are continuous,
     otherwise falls back to exponential smoothing for gapped data.
 
@@ -13,9 +13,16 @@ def calculate_bmr(file_path="tdee_tracking_log.csv", window=14, alpha=0.1):
     df = pd.read_csv(file_path, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
 
-    # Exclude today's row — the day isn't over so data is incomplete
+    # Exclude today's row for calorie data (day isn't over), but keep today's weight
     today = pd.Timestamp.now().normalize()
+    today_weight = df.loc[df["Date"] == today, "Weight_lbs"].dropna()
     df = df[df["Date"] < today]
+
+    # Add today's weight back as a weight-only row
+    if not today_weight.empty:
+        today_row = pd.DataFrame({"Date": [today], "Weight_lbs": [today_weight.iloc[0]],
+                                  "Calories_Consumed": [None], "Active_Calories_Burned": [None]})
+        df = pd.concat([df, today_row], ignore_index=True)
 
     complete = df.dropna(subset=["Calories_Consumed", "Active_Calories_Burned", "Weight_lbs"])
     if len(complete) < 7:
@@ -33,52 +40,55 @@ def calculate_bmr(file_path="tdee_tracking_log.csv", window=14, alpha=0.1):
 
 
 def _linear_bmr(streak):
-    """Linear model using rolling average over continuous days.
+    """Linear model using regression over continuous days.
     Weight on day N reflects day N-1's intake (morning weigh-in)."""
-    avg_intake = streak["Calories_Consumed"].iloc[:-1].mean()
-    avg_burn = streak["Active_Calories_Burned"].iloc[:-1].mean()
-    weight_start = streak["Weight_lbs"].iloc[1]
-    weight_end = streak["Weight_lbs"].iloc[-1]
-    weight_change = weight_end - weight_start
-    n_days = len(streak) - 1
+    import numpy as np
 
-    tdee = avg_intake - (weight_change * 3500 / n_days)
-    bmr = tdee - avg_burn
+    net_intake = (streak["Calories_Consumed"] - streak["Active_Calories_Burned"]).iloc[:-1].mean()
+
+    weights = streak["Weight_lbs"].iloc[1:].values
+    day_nums = np.arange(len(weights), dtype=float)
+    slope, _ = np.polyfit(day_nums, weights, 1)
+
+    bmr = net_intake - (slope * 3500)
     return round(bmr, 0)
 
 
 def _exponential_bmr(df, window, alpha):
-    """Model for gapped data. Uses raw weigh-ins with exponential smoothing
-    only to average multiple weigh-ins, and actual calendar span for rate."""
-    # Need rows with intake + burn for averaging
+    """Model for gapped data. Uses median of first/last third of weigh-ins,
+    with net intake (consumed - burned) averaged over the same span."""
     has_cals = df.dropna(subset=["Calories_Consumed", "Active_Calories_Burned"])
     if len(has_cals) < 7:
         return "Need at least 7 days with complete data."
 
     recent_cals = has_cals.tail(window)
-    avg_intake = recent_cals["Calories_Consumed"].mean()
-    avg_burn = recent_cals["Active_Calories_Burned"].mean()
-
-    # For weight, use actual weigh-ins within the calorie window
     date_start = recent_cals["Date"].iloc[0]
-    date_end = recent_cals["Date"].iloc[-1]
-    weigh_ins = df[(df["Date"] >= date_start) & (df["Date"] <= date_end)].dropna(subset=["Weight_lbs"])
 
-    if len(weigh_ins) < 2:
-        return "Need at least 2 weigh-ins in the window."
+    # Weight window: from first calorie day to today (includes today's weigh-in)
+    weigh_ins = df[df["Date"] >= date_start].dropna(subset=["Weight_lbs"])
 
-    # Average first 3 and last 3 weigh-ins to smooth noise
-    n_avg = min(3, len(weigh_ins) // 2)
-    weight_start = weigh_ins["Weight_lbs"].iloc[:n_avg].mean()
-    weight_end = weigh_ins["Weight_lbs"].iloc[-n_avg:].mean()
-    weight_change = weight_end - weight_start
+    if len(weigh_ins) < 6:
+        return "Need at least 6 weigh-ins in the window."
+
     n_days = (weigh_ins["Date"].iloc[-1] - weigh_ins["Date"].iloc[0]).days
-
     if n_days < 7:
         return "Need at least 7 days between weigh-ins."
 
-    tdee = avg_intake - (weight_change * 3500 / n_days)
-    bmr = tdee - avg_burn
+    # Median of first/last third for stability
+    n_third = max(3, len(weigh_ins) // 3)
+    weight_start = weigh_ins["Weight_lbs"].iloc[:n_third].median()
+    weight_end = weigh_ins["Weight_lbs"].iloc[-n_third:].median()
+    weight_change = weight_end - weight_start
+
+    # Net intake: only days with complete data, up to (not including) last weigh-in day
+    last_weight_date = weigh_ins["Date"].iloc[-1]
+    cal_span = has_cals[(has_cals["Date"] >= date_start) & (has_cals["Date"] < last_weight_date)]
+    if len(cal_span) < 5:
+        cal_span = recent_cals
+
+    net_intake = (cal_span["Calories_Consumed"] - cal_span["Active_Calories_Burned"]).mean()
+
+    bmr = net_intake - (weight_change * 3500 / n_days)
     return round(bmr, 0)
 
 
