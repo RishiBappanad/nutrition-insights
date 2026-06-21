@@ -2,6 +2,9 @@ import os
 import aiosqlite
 from cryptography.fernet import Fernet
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DB_PATH = os.getenv("DB_PATH", "app_data/nutrition_insights_app.db")
 FERNET_KEY = os.getenv("FERNET_KEY", Fernet.generate_key().decode())
