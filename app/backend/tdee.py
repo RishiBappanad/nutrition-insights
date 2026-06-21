@@ -10,6 +10,10 @@ def calculate_bmr(file_path="tdee_tracking_log.csv", window=21, alpha=0.1):
         window: Number of days to consider
         alpha: Smoothing factor for exponential model (used only when gaps exist)
     """
+    from pathlib import Path
+    if not Path(file_path).exists():
+        return "No tracking data found. Run a sync first."
+
     df = pd.read_csv(file_path, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
 
