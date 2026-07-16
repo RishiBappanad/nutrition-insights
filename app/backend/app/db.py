@@ -35,19 +35,25 @@ async def get_pool() -> asyncpg.Pool:
 async def init_db():
     """Create app-level tables (users, credentials) plus user-scoped data
     tables (daily_nutrition, lift_orm, food_log) if they don't already exist.
-    All data tables are scoped by user_id since Postgres is shared across users."""
+    All data tables are scoped by user_id since Postgres is shared across users.
+
+    `users.id` is NOT auto-generated here — it's the account_id assigned by
+    trackstack-auth, the shared identity service. This table is a local
+    mirror (created lazily on first authenticated request, see
+    routers/auth.py::_ensure_local_user), not the source of truth for
+    identity/passwords."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
+                password_hash TEXT NOT NULL DEFAULT 'trackstack-auth',
                 created_at TIMESTAMPTZ DEFAULT now()
             );
 
             CREATE TABLE IF NOT EXISTS credentials (
-                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
                 hevy_username TEXT,
                 hevy_password TEXT,
                 cronometer_username TEXT,
@@ -55,7 +61,7 @@ async def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS daily_nutrition (
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
                 date TEXT NOT NULL,
                 metric TEXT NOT NULL,
                 value DOUBLE PRECISION NOT NULL,
@@ -63,7 +69,7 @@ async def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS lift_orm (
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
                 date TEXT NOT NULL,
                 exercise TEXT NOT NULL,
                 orm DOUBLE PRECISION NOT NULL,
@@ -72,7 +78,7 @@ async def init_db():
 
             CREATE TABLE IF NOT EXISTS food_log (
                 id SERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
                 date TEXT NOT NULL,
                 meal TEXT DEFAULT 'Snack',
                 food_name TEXT NOT NULL,

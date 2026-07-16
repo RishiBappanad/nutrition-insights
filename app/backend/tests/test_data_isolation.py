@@ -5,12 +5,17 @@ Ensures users can only access their own data.
 Architecture note: isolation is enforced at the row level — all users share
 one Postgres database, and every data table (daily_nutrition, lift_orm,
 food_log) is scoped by a user_id column that's checked on every query.
+Identity (registration/login) now lives in trackstack-auth, not here — this
+service only verifies JWTs signed with the shared secret and trusts the
+accountId claim, so tests mint their own trackstack-auth-shaped tokens
+directly rather than registering through a local endpoint.
 These tests verify that:
 1. Auth is required for all data endpoints
 2. Each user only sees their own food log entries
 3. Deleting an entry only affects rows owned by the requesting user_id
 4. Data reset only clears the current user's rows
 """
+import time
 import pytest
 from fastapi.testclient import TestClient
 
@@ -33,26 +38,25 @@ def client():
         yield c
 
 
-@pytest.fixture(scope="module")
-def user_a_token(client):
-    """Register user A and return their token."""
-    username = "isolation_test_user_a_xyz"
-    r = client.post("/auth/register", json={"username": username, "password": "password123"})
-    if r.status_code == 400 and "taken" in r.text:
-        r = client.post("/auth/login", json={"username": username, "password": "password123"})
-    assert r.status_code in (200, 201), f"Setup failed: {r.text}"
-    return r.json()["token"]
+def _mint_token(account_id: int, email: str) -> str:
+    """Simulate a token issued by trackstack-auth: { accountId, email },
+    signed with the same shared secret. This service never issues its own
+    tokens anymore, so tests construct one directly instead of registering."""
+    from jose import jwt
+    return jwt.encode({"accountId": account_id, "email": email}, "test-secret-do-not-use-in-prod", algorithm="HS256")
 
 
 @pytest.fixture(scope="module")
-def user_b_token(client):
-    """Register user B and return their token."""
-    username = "isolation_test_user_b_xyz"
-    r = client.post("/auth/register", json={"username": username, "password": "password123"})
-    if r.status_code == 400 and "taken" in r.text:
-        r = client.post("/auth/login", json={"username": username, "password": "password123"})
-    assert r.status_code in (200, 201), f"Setup failed: {r.text}"
-    return r.json()["token"]
+def user_a_token():
+    # Large, time-based ids to avoid colliding with real migrated accounts (1-5).
+    account_id = 900001 + int(time.time()) % 1000
+    return _mint_token(account_id, "isolation_test_user_a_xyz@example.com")
+
+
+@pytest.fixture(scope="module")
+def user_b_token():
+    account_id = 950001 + int(time.time()) % 1000
+    return _mint_token(account_id, "isolation_test_user_b_xyz@example.com")
 
 
 def auth(token):
