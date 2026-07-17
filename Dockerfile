@@ -11,8 +11,10 @@ COPY app/frontend/ ./
 #   docker build --build-arg BASE_PATH=/nutrition/ --build-arg API_BASE=/nutrition .
 ARG BASE_PATH=/
 ARG API_BASE=
+ARG TRACKSTACK_AUTH_URL=
 ENV VITE_BASE_PATH=${BASE_PATH}
 ENV VITE_API_BASE=${API_BASE}
+ENV VITE_TRACKSTACK_AUTH_URL=${TRACKSTACK_AUTH_URL}
 RUN npm run build
 
 # Stage 2: Python backend with frontend static files
