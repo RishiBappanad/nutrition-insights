@@ -162,6 +162,9 @@ async def google_callback(code: str):
 
     token = create_token(user_id)
 
-    # Redirect to app with token in URL fragment (client handles it)
+    # Redirect to app with token in URL fragment (client handles it).
+    # FRONTEND_BASE_PATH defaults to "/" for standalone deploys (Cloud Run);
+    # set to "/nutrition/" when running behind the proxy.
     from fastapi.responses import RedirectResponse
-    return RedirectResponse(url=f"/nutrition/#google_token={token}")
+    base_path = os.getenv("FRONTEND_BASE_PATH", "/")
+    return RedirectResponse(url=f"{base_path}#google_token={token}")
