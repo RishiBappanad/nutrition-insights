@@ -6,7 +6,10 @@ import Login from '@/pages/login'
 import Dashboard from '@/pages/dashboard'
 import Charts from '@/pages/charts'
 import Log from '@/pages/log'
+import FoodLog from '@/pages/food-log'
 import LiftInsights from '@/pages/lift-insights'
+import Profile from '@/pages/profile'
+import Targets from '@/pages/targets'
 import Settings from '@/pages/settings'
 
 // Extract the trackstack-auth token from the URL hash BEFORE AuthProvider
@@ -29,9 +32,12 @@ function AppRoutes({ onLogout }) {
     <Layout onLogout={onLogout}>
       <Switch>
         <Route path="/" component={Dashboard} />
+        <Route path="/food-log" component={FoodLog} />
         <Route path="/charts" component={Charts} />
         <Route path="/log" component={Log} />
         <Route path="/lift-insights" component={LiftInsights} />
+        <Route path="/profile" component={Profile} />
+        <Route path="/targets" component={Targets} />
         <Route path="/settings" component={Settings} />
         <Route>
           <div className="text-center py-12">

@@ -10,15 +10,21 @@ import {
   Menu,
   X,
   Apple,
+  UtensilsCrossed,
+  User,
+  Target,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { AppSwitcher, MobileAppSwitcher } from '@/components/app-switcher'
 
 const navItems = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
+  { href: '/food-log', label: 'Log Food', icon: UtensilsCrossed },
+  { href: '/targets', label: 'Targets', icon: Target },
   { href: '/charts', label: 'Charts', icon: BarChart3 },
   { href: '/log', label: 'Log', icon: ClipboardList },
   { href: '/lift-insights', label: 'Lifts', icon: Dumbbell },
+  { href: '/profile', label: 'Profile', icon: User },
   { href: '/settings', label: 'Settings', icon: Settings },
 ]
 
