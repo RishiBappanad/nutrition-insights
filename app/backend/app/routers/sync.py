@@ -5,16 +5,15 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from ..routers.auth import get_current_user
 from ..routers.data import user_data_dir
-from ..db import get_db, decrypt
+from ..db import get_pool, decrypt
 
 router = APIRouter()
 
 
 async def _get_user_creds(user_id: int) -> dict:
-    db = await get_db()
-    row = await db.execute("SELECT * FROM credentials WHERE user_id = ?", (user_id,))
-    creds = await row.fetchone()
-    await db.close()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        creds = await db.fetchrow("SELECT * FROM credentials WHERE user_id = $1", user_id)
     if not creds:
         raise HTTPException(status_code=400, detail="No credentials saved. Use /auth/credentials first.")
     return {
@@ -116,9 +115,8 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
             _filter_biometrics(results["biometrics"])
         _update_tdee_log(results, tdee_path)
 
-        # Populate SQLite with nutrition data
-        from ..user_db import get_user_db, upsert_daily_nutrition
-        conn = get_user_db(user_data_dir(user_id))
+        # Populate Postgres with nutrition data
+        from ..user_db import upsert_daily_nutrition
 
         # Insert daily summary metrics
         if results.get("daily_summary"):
@@ -138,7 +136,7 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
                         except ValueError:
                             pass
                     if metrics:
-                        upsert_daily_nutrition(conn, date, metrics)
+                        await upsert_daily_nutrition(user_id, date, metrics)
 
         # Insert active calories burned as a nutrition metric
         if results.get("exercises"):
@@ -149,16 +147,14 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
                     if row.get("Calories Burned"):
                         daily_burn[row["Day"]] += abs(float(row["Calories Burned"]))
             for date, val in daily_burn.items():
-                upsert_daily_nutrition(conn, date, {"Active Calories Burned": round(val, 1)})
+                await upsert_daily_nutrition(user_id, date, {"Active Calories Burned": round(val, 1)})
 
         # Insert weight as a nutrition metric (biometrics)
         if results.get("biometrics"):
             with open(results["biometrics"]) as f:
                 for row in csv.DictReader(f):
                     if "Weight" in row["Metric"] and "Apple Health" not in row["Metric"]:
-                        upsert_daily_nutrition(conn, row["Day"], {"Weight (lbs)": float(row["Amount"])})
-
-        conn.close()
+                        await upsert_daily_nutrition(user_id, row["Day"], {"Weight (lbs)": float(row["Amount"])})
 
         bmr = calculate_bmr(tdee_path)
         if isinstance(bmr, (int, float)):
@@ -193,9 +189,8 @@ async def sync_hevy(user_id: int = Depends(get_current_user)):
             raise HTTPException(status_code=401, detail="Hevy login failed")
 
         # Populate lift_orm table from exported CSV
-        from ..user_db import get_user_db, upsert_lift_orm
+        from ..user_db import upsert_lift_orm
         from ..routers.data import _compute_orm, _parse_hevy_date
-        conn = get_user_db(user_data_dir(user_id))
 
         with open(path) as f:
             for row in csv.DictReader(f):
@@ -215,9 +210,8 @@ async def sync_hevy(user_id: int = Depends(get_current_user)):
                     continue
                 orm = _compute_orm(weight, reps)
                 if orm > 0:
-                    upsert_lift_orm(conn, date, exercise, round(orm, 1))
+                    await upsert_lift_orm(user_id, date, exercise, round(orm, 1))
 
-        conn.close()
         return {"status": "ok", "file": path}
     except HTTPException:
         raise

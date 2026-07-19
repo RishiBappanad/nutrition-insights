@@ -2,6 +2,8 @@ import csv
 from pathlib import Path
 from fastapi import APIRouter, Depends
 from ..routers.auth import get_current_user
+from ..user_db import query_nutrition, query_orm, get_nutrition_metrics, get_exercises, upsert_daily_nutrition, upsert_lift_orm
+from ..db import get_pool
 
 router = APIRouter()
 
@@ -126,81 +128,16 @@ async def get_orm(user_id: int = Depends(get_current_user)):
 
 @router.get("/chart")
 async def get_chart_data(user_id: int = Depends(get_current_user), metrics: str = "", lookback: int = 1):
-    """Get chart data from SQLite. Rolling average applied via SQL for nutrition/burn metrics.
+    """Get chart data from Postgres. Rolling average applied via SQL for nutrition/burn metrics.
     ORM metrics are returned raw (no rolling avg)."""
-    from ..user_db import get_user_db, query_nutrition, query_orm, get_nutrition_metrics, get_exercises, upsert_daily_nutrition, upsert_lift_orm
-
-    data_dir = user_data_dir(user_id)
-    conn = get_user_db(data_dir)
-
-    # Auto-migrate: if DB is empty but CSVs exist, populate from them
-    if not get_nutrition_metrics(conn):
-        summary_path = data_dir / "cronometer_daily_summary.csv"
-        if summary_path.exists():
-            with open(summary_path) as f:
-                for row in csv.DictReader(f):
-                    if "Group" in row and row.get("Group", "").strip('"') != "Total":
-                        continue
-                    date = row.get("Date", "")
-                    if not date:
-                        continue
-                    m = {}
-                    for k, v in row.items():
-                        if k in ("Date", "Group", "Completed") or not v:
-                            continue
-                        try:
-                            m[k] = float(v)
-                        except ValueError:
-                            pass
-                    if m:
-                        upsert_daily_nutrition(conn, date, m)
-        # Burn from exercises
-        exercises_path = data_dir / "cronometer_exercises.csv"
-        if exercises_path.exists():
-            from collections import defaultdict
-            daily_burn = defaultdict(float)
-            with open(exercises_path) as f:
-                for row in csv.DictReader(f):
-                    if row.get("Calories Burned"):
-                        daily_burn[row["Day"]] += abs(float(row["Calories Burned"]))
-            for date, val in daily_burn.items():
-                upsert_daily_nutrition(conn, date, {"Active Calories Burned": round(val, 1)})
-
-    # Weight from biometrics (always check separately)
-    if not conn.execute("SELECT 1 FROM daily_nutrition WHERE metric = 'Weight (lbs)' LIMIT 1").fetchone():
-        bio_path = data_dir / "cronometer_biometrics.csv"
-        if bio_path.exists():
-            with open(bio_path) as f:
-                for row in csv.DictReader(f):
-                    if "Weight" in row.get("Metric", "") and "Apple Health" not in row.get("Metric", ""):
-                        upsert_daily_nutrition(conn, row["Day"], {"Weight (lbs)": float(row["Amount"])})
-
-    if not get_exercises(conn):
-        hevy_path = data_dir / "hevy_workouts.csv"
-        if hevy_path.exists():
-            with open(hevy_path) as f:
-                for row in csv.DictReader(f):
-                    ex = row.get("exercise_title", "").strip()
-                    w, r = row.get("weight_lbs", ""), row.get("reps", "")
-                    st = row.get("start_time", "")
-                    if not ex or not w or not r:
-                        continue
-                    try:
-                        weight, reps = float(w), int(r)
-                    except (ValueError, TypeError):
-                        continue
-                    date = _parse_hevy_date(st)
-                    if not date:
-                        continue
-                    orm = _compute_orm(weight, reps)
-                    if orm > 0:
-                        upsert_lift_orm(conn, date, ex, round(orm, 1))
+    # NOTE: Auto-migration removed - data is only populated via explicit sync
+    # This prevents new users from seeing stale data
 
     requested = [m.strip() for m in metrics.split(",") if m.strip()]
     lookback = max(1, min(3, lookback))
 
-    all_nutrition = get_nutrition_metrics(conn)
-    all_exercises = get_exercises(conn)
+    all_nutrition = await get_nutrition_metrics(user_id)
+    all_exercises = await get_exercises(user_id)
 
     # Split requested into nutrition vs exercise vs biometrics
     nutrition_requested = [m for m in requested if m in all_nutrition]
@@ -211,18 +148,16 @@ async def get_chart_data(user_id: int = Depends(get_current_user), metrics: str 
 
     # Biometrics: raw, no rolling avg
     if biometrics_requested:
-        series.update(query_nutrition(conn, biometrics_requested, 1))
+        series.update(await query_nutrition(user_id, biometrics_requested, 1))
 
     # Nutrition/burn: apply rolling avg via SQL
     if nutrition_requested:
-        series.update(query_nutrition(conn, nutrition_requested, lookback))
+        series.update(await query_nutrition(user_id, nutrition_requested, lookback))
 
     # Exercise ORM: raw, no rolling avg
     for ex in exercise_requested:
-        orm_data = query_orm(conn, ex)
+        orm_data = await query_orm(user_id, ex)
         series.update(orm_data)
-
-    conn.close()
 
     categories = {
         "biometrics": ["Weight (lbs)"],
@@ -241,45 +176,42 @@ async def get_lift_insights(
     lookback: int = 2,
 ):
     """Pair each lift day's ORM with a rolling average of a nutrition metric over lookback days prior."""
-    from ..user_db import get_user_db, get_exercises, get_nutrition_metrics
-
-    conn = get_user_db(user_data_dir(user_id))
-    exercises = get_exercises(conn)
-    nutrition_metrics = get_nutrition_metrics(conn)
+    exercises = await get_exercises(user_id)
+    nutrition_metrics = await get_nutrition_metrics(user_id)
 
     if not exercise:
-        conn.close()
         return {"exercises": exercises, "nutrition_metrics": nutrition_metrics, "data": []}
 
     lookback = max(1, min(3, lookback))
 
-    # Get ORM dates for this exercise
-    orm_rows = conn.execute(
-        "SELECT date, orm FROM lift_orm WHERE exercise = ? ORDER BY date", (exercise,)
-    ).fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Get ORM dates for this exercise
+        orm_rows = await conn.fetch(
+            "SELECT date, orm FROM lift_orm WHERE user_id = $1 AND exercise = $2 ORDER BY date",
+            user_id, exercise,
+        )
 
-    # For each lift day, get rolling avg of nutrition metric from prior days
-    from datetime import datetime, timedelta
-    results = []
-    for row in orm_rows:
-        lift_date = row["date"]
-        try:
-            dt = datetime.strptime(lift_date, "%Y-%m-%d")
-        except ValueError:
-            continue
+        # For each lift day, get rolling avg of nutrition metric from prior days
+        from datetime import datetime, timedelta
+        results = []
+        for row in orm_rows:
+            lift_date = row["date"]
+            try:
+                dt = datetime.strptime(lift_date, "%Y-%m-%d")
+            except ValueError:
+                continue
 
-        prior_dates = [(dt - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, lookback + 1)]
-        placeholders = ",".join("?" * len(prior_dates))
-        vals = conn.execute(
-            f"SELECT value FROM daily_nutrition WHERE metric = ? AND date IN ({placeholders})",
-            [nutrition_metric] + prior_dates
-        ).fetchall()
+            prior_dates = [(dt - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, lookback + 1)]
+            vals = await conn.fetch(
+                "SELECT value FROM daily_nutrition WHERE user_id = $1 AND metric = $2 AND date = ANY($3::text[])",
+                user_id, nutrition_metric, prior_dates,
+            )
 
-        if vals:
-            avg = round(sum(v["value"] for v in vals) / len(vals), 1)
-            results.append({"date": lift_date, "orm": row["orm"], "avg_metric": avg})
+            if vals:
+                avg = round(sum(v["value"] for v in vals) / len(vals), 1)
+                results.append({"date": lift_date, "orm": row["orm"], "avg_metric": avg})
 
-    conn.close()
     return {
         "exercises": exercises,
         "nutrition_metrics": nutrition_metrics,
@@ -288,3 +220,22 @@ async def get_lift_insights(
         "exercise": exercise,
         "data": results,
     }
+
+
+@router.delete("/reset")
+async def reset_user_data(user_id: int = Depends(get_current_user)):
+    """Delete all nutrition and lift data for the current user. Does not delete credentials."""
+    data_dir = user_data_dir(user_id)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM daily_nutrition WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM lift_orm WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM food_log WHERE user_id = $1", user_id)
+
+    # Remove CSV files (from old syncs) but keep the directory
+    for pattern in ["cronometer_*.csv", "hevy_workouts.csv", "tdee_tracking_log.csv"]:
+        for f in data_dir.glob(pattern):
+            f.unlink()
+
+    return {"status": "reset", "user_id": user_id}
