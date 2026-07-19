@@ -1,0 +1,319 @@
+"""Recipes API: aggregate food items into a batch, with servings-per-batch
+so logging "1 serving" divides the aggregated total accordingly. Includes
+a pantry "can I make this?" check (per user steering: recipes should let
+a user look back later and confirm they have all ingredients before
+cooking) and a log-to-diary action that scales by servings consumed.
+
+Distinct from meals (routers/meals.py): a recipe's whole point is batch
+division (a lasagna makes 6 servings, you eat 1). A meal has no batch
+concept — it's just a flat group of items logged at face value."""
+import json
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+
+from ..routers.auth import get_current_user
+from ..db import get_pool
+from ..portion_scaling import scale_macros, scale_nutrients
+
+router = APIRouter()
+
+
+class RecipeItemRequest(BaseModel):
+    food_name: str
+    source: Optional[str] = None
+    source_id: Optional[str] = None
+    amount_grams: Optional[float] = None
+    amount_multiple: Optional[float] = None
+    calories: float = 0
+    protein: float = 0
+    carbs: float = 0
+    fat: float = 0
+    fiber: float = 0
+    nutrients: dict = {}
+
+
+class RecipeRequest(BaseModel):
+    name: str
+    servings_per_batch: float = 1.0
+    items: list[RecipeItemRequest] = []
+
+
+class LogRecipeRequest(BaseModel):
+    date: str
+    meal: str = "Lunch"
+    servings: float = 1.0
+
+
+def _item_nutrient_rows(item_id: int, nutrients: dict) -> list[tuple]:
+    rows = []
+    for name, info in nutrients.items():
+        if not isinstance(info, dict) or info.get("value") is None:
+            continue
+        try:
+            value = float(info["value"])
+        except (TypeError, ValueError):
+            continue
+        rows.append((item_id, name, value, info.get("unit", "")))
+    return rows
+
+
+async def _save_items(conn, recipe_id: int, items: list[RecipeItemRequest]):
+    for item in items:
+        item_id = await conn.fetchval(
+            """INSERT INTO recipe_items (recipe_id, food_name, source, source_id, amount_grams, amount_multiple,
+                   calories, protein, carbs, fat, fiber, nutrients_json)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               RETURNING id""",
+            recipe_id, item.food_name, item.source, item.source_id, item.amount_grams, item.amount_multiple,
+            item.calories, item.protein, item.carbs, item.fat, item.fiber, json.dumps(item.nutrients),
+        )
+        rows = _item_nutrient_rows(item_id, item.nutrients)
+        if rows:
+            await conn.executemany(
+                "INSERT INTO recipe_item_nutrients (recipe_item_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
+                rows,
+            )
+
+
+@router.post("")
+async def create_recipe(req: RecipeRequest, user_id: int = Depends(get_current_user)):
+    if req.servings_per_batch <= 0:
+        raise HTTPException(status_code=400, detail="servings_per_batch must be positive")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            recipe_id = await conn.fetchval(
+                "INSERT INTO recipes (user_id, name, servings_per_batch) VALUES ($1, $2, $3) RETURNING id",
+                user_id, req.name, req.servings_per_batch,
+            )
+            await _save_items(conn, recipe_id, req.items)
+    return {"status": "created", "id": recipe_id}
+
+
+@router.get("")
+async def list_recipes(user_id: int = Depends(get_current_user)):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, name, servings_per_batch, created_at, updated_at FROM recipes WHERE user_id = $1 ORDER BY name",
+            user_id,
+        )
+    return {
+        "recipes": [
+            {"id": r["id"], "name": r["name"], "servings_per_batch": r["servings_per_batch"]}
+            for r in rows
+        ]
+    }
+
+
+async def _get_recipe_with_items(conn, recipe_id: int, user_id: int):
+    recipe = await conn.fetchrow("SELECT * FROM recipes WHERE id = $1 AND user_id = $2", recipe_id, user_id)
+    if recipe is None:
+        return None, []
+    item_rows = await conn.fetch("SELECT * FROM recipe_items WHERE recipe_id = $1 ORDER BY id", recipe_id)
+    item_ids = [r["id"] for r in item_rows]
+    nutrient_rows = []
+    if item_ids:
+        nutrient_rows = await conn.fetch(
+            "SELECT recipe_item_id, nutrient_name, value, unit FROM recipe_item_nutrients WHERE recipe_item_id = ANY($1::int[])",
+            item_ids,
+        )
+    nutrients_by_item: dict[int, dict] = {}
+    for nr in nutrient_rows:
+        nutrients_by_item.setdefault(nr["recipe_item_id"], {})[nr["nutrient_name"]] = {
+            "value": nr["value"], "unit": nr["unit"],
+        }
+    items = []
+    for r in item_rows:
+        items.append({
+            "id": r["id"],
+            "food_name": r["food_name"],
+            "source": r["source"],
+            "source_id": r["source_id"],
+            "amount_grams": r["amount_grams"],
+            "amount_multiple": r["amount_multiple"],
+            "calories": r["calories"],
+            "protein": r["protein"],
+            "carbs": r["carbs"],
+            "fat": r["fat"],
+            "fiber": r["fiber"],
+            "nutrients": nutrients_by_item.get(r["id"], {}),
+        })
+    return recipe, items
+
+
+def _aggregate_batch_totals(items: list[dict]) -> dict:
+    """Sum every item's macros + nutrients into one batch-level total —
+    the "whole recipe" nutrition, before dividing by servings_per_batch."""
+    macros = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0, "fiber": 0.0}
+    nutrients: dict[str, dict] = {}
+    for item in items:
+        for k in macros:
+            macros[k] += item.get(k, 0) or 0
+        for name, info in item.get("nutrients", {}).items():
+            bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
+            bucket["value"] += info["value"]
+    return {"macros": macros, "nutrients": nutrients}
+
+
+@router.get("/{recipe_id}")
+async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
+    """Returns the recipe, its items, batch-level totals (sum of all
+    items), and per-serving totals (batch totals / servings_per_batch) —
+    the per-serving numbers are what a diary log actually applies."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        recipe, items = await _get_recipe_with_items(conn, recipe_id, user_id)
+    if recipe is None:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+
+    batch = _aggregate_batch_totals(items)
+    per_serving_factor = 1.0 / recipe["servings_per_batch"]
+    per_serving = {
+        "macros": scale_macros(batch["macros"], per_serving_factor),
+        "nutrients": scale_nutrients(batch["nutrients"], per_serving_factor),
+    }
+    return {
+        "id": recipe["id"],
+        "name": recipe["name"],
+        "servings_per_batch": recipe["servings_per_batch"],
+        "items": items,
+        "batch_totals": batch,
+        "per_serving_totals": per_serving,
+    }
+
+
+@router.put("/{recipe_id}")
+async def update_recipe(recipe_id: int, req: RecipeRequest, user_id: int = Depends(get_current_user)):
+    """Full replace of name/servings_per_batch/items — simpler and less
+    error-prone than a partial-item-diff update for what's expected to be
+    an infrequent edit (re-saving a whole recipe), matching how a user
+    would naturally interact with a recipe editor (edit the whole thing,
+    save)."""
+    if req.servings_per_batch <= 0:
+        raise HTTPException(status_code=400, detail="servings_per_batch must be positive")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            existing = await conn.fetchrow("SELECT id FROM recipes WHERE id = $1 AND user_id = $2", recipe_id, user_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Recipe not found")
+            await conn.execute(
+                "UPDATE recipes SET name = $1, servings_per_batch = $2, updated_at = now() WHERE id = $3",
+                req.name, req.servings_per_batch, recipe_id,
+            )
+            await conn.execute("DELETE FROM recipe_items WHERE recipe_id = $1", recipe_id)
+            await _save_items(conn, recipe_id, req.items)
+    return {"status": "updated"}
+
+
+@router.delete("/{recipe_id}")
+async def delete_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM recipes WHERE id = $1 AND user_id = $2", recipe_id, user_id)
+    return {"status": "deleted"}
+
+
+@router.post("/{recipe_id}/log")
+async def log_recipe(recipe_id: int, req: LogRecipeRequest, user_id: int = Depends(get_current_user)):
+    """Log N servings of a recipe to the diary as one food_log entry
+    (named after the recipe), with macros/nutrients scaled from the
+    per-serving totals by `servings` — matches a user eating "1.5
+    servings of lasagna," not each ingredient being logged separately."""
+    if req.servings <= 0:
+        raise HTTPException(status_code=400, detail="servings must be positive")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            recipe, items = await _get_recipe_with_items(conn, recipe_id, user_id)
+            if recipe is None:
+                raise HTTPException(status_code=404, detail="Recipe not found")
+
+            batch = _aggregate_batch_totals(items)
+            factor = req.servings / recipe["servings_per_batch"]
+            macros = scale_macros(batch["macros"], factor)
+            nutrients = scale_nutrients(batch["nutrients"], factor)
+
+            food_log_id = await conn.fetchval(
+                """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
+                       serving_size, serving_unit, calories, protein, carbs, fat, fiber, nutrients_json)
+                   VALUES ($1, $2, $3, $4, 'recipe', $5, $6, 'serving', $7, $8, $9, $10, $11, $12)
+                   RETURNING id""",
+                user_id, req.date, req.meal, recipe["name"], str(recipe_id), req.servings,
+                macros["calories"], macros["protein"], macros["carbs"], macros["fat"], macros["fiber"],
+                json.dumps(nutrients),
+            )
+            nutrient_rows = [(food_log_id, name, info["value"], info["unit"]) for name, info in nutrients.items()]
+            if nutrient_rows:
+                await conn.executemany(
+                    "INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
+                    nutrient_rows,
+                )
+    return {"status": "logged", "food_log_id": food_log_id}
+
+
+@router.get("/{recipe_id}/can-make")
+async def can_make_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
+    """
+    "Can I make this?" check against the pantry — per user request, a
+    recipe should let someone look back later and confirm they have all
+    ingredients before cooking, not just aggregate-and-log blindly.
+
+    Matches recipe items to pantry items by (source, source_id) when both
+    are set — the same identity USDA/CNF/custom foods already carry
+    everywhere else. Items with no source (a recipe ingredient typed in
+    freehand, e.g. "a pinch of salt") can't be matched against inventory
+    at all and are reported separately as unmatchable, not silently
+    treated as missing or present.
+
+    For countable/single pantry items, availability also checks quantity
+    (amount_grams/amount_multiple requested vs. remaining_servings) where
+    that comparison is meaningful; bulk pantry items are only checked for
+    presence, since bulk items don't track an exact quantity by design.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        recipe, items = await _get_recipe_with_items(conn, recipe_id, user_id)
+        if recipe is None:
+            raise HTTPException(status_code=404, detail="Recipe not found")
+
+        pantry_rows = await conn.fetch(
+            "SELECT * FROM pantry_items WHERE user_id = $1 AND is_finished = FALSE", user_id
+        )
+
+    pantry_by_source = {(p["source"], p["source_id"]): p for p in pantry_rows if p["source"] and p["source_id"]}
+
+    have, missing, unmatchable = [], [], []
+    for item in items:
+        key = (item["source"], item["source_id"])
+        if not item["source"] or not item["source_id"]:
+            unmatchable.append({"food_name": item["food_name"]})
+            continue
+
+        pantry_item = pantry_by_source.get(key)
+        if pantry_item is None:
+            missing.append({"food_name": item["food_name"]})
+            continue
+
+        requested = item.get("amount_multiple")
+        entry = {"food_name": item["food_name"], "pantry_item_id": pantry_item["id"], "tracking_mode": pantry_item["tracking_mode"]}
+        if pantry_item["tracking_mode"] == "countable" and requested is not None:
+            if pantry_item["remaining_servings"] is not None and requested > pantry_item["remaining_servings"]:
+                entry["sufficient"] = False
+                entry["remaining_servings"] = pantry_item["remaining_servings"]
+                missing.append(entry)
+                continue
+        have.append(entry)
+
+    return {
+        "recipe_id": recipe_id,
+        "recipe_name": recipe["name"],
+        "can_make": len(missing) == 0 and len(unmatchable) == 0,
+        "have": have,
+        "missing": missing,
+        "unmatchable": unmatchable,
+    }
