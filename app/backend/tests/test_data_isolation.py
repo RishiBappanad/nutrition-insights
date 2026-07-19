@@ -15,7 +15,7 @@ These tests verify that:
 3. Deleting an entry only affects rows owned by the requesting user_id
 4. Data reset only clears the current user's rows
 """
-import time
+import uuid
 import pytest
 from fastapi.testclient import TestClient
 
@@ -48,15 +48,28 @@ def _mint_token(account_id: int, email: str) -> str:
 
 @pytest.fixture(scope="module")
 def user_a_token():
-    # Large, time-based ids to avoid colliding with real migrated accounts (1-5).
-    account_id = 900001 + int(time.time()) % 1000
-    return _mint_token(account_id, "isolation_test_user_a_xyz@example.com")
+    # Root cause of a real, previously-confirmed bug this exact fixture
+    # had: account_id was time.time()-based (changes every run) but the
+    # email was a hardcoded literal (identical every run). _ensure_local_
+    # user's ON CONFLICT (id) DO NOTHING only dedupes by id — a second run
+    # with a new id but the same email hits the separate `username UNIQUE`
+    # constraint instead, since a leftover row from an earlier run had
+    # already claimed that literal email. Fixed by tying both the id AND
+    # the email to the same per-run-unique value (a random UUID component,
+    # not time.time(), so back-to-back runs within the same second never
+    # collide either) — confirmed via direct query that leftover rows from
+    # this bug (ids 900702/950703) exist in the real database from before
+    # this fix, and that reruns collided against them every time.
+    run_id = uuid.uuid4().hex[:8]
+    account_id = 900001 + (uuid.uuid4().int % 90000)
+    return _mint_token(account_id, f"isolation_test_user_a_{run_id}@example.com")
 
 
 @pytest.fixture(scope="module")
 def user_b_token():
-    account_id = 950001 + int(time.time()) % 1000
-    return _mint_token(account_id, "isolation_test_user_b_xyz@example.com")
+    run_id = uuid.uuid4().hex[:8]
+    account_id = 950001 + (uuid.uuid4().int % 90000)
+    return _mint_token(account_id, f"isolation_test_user_b_{run_id}@example.com")
 
 
 def auth(token):
