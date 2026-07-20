@@ -185,6 +185,25 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_food_log_date ON food_log(user_id, date);
             CREATE INDEX IF NOT EXISTS idx_water_log_date ON water_log(user_id, date);
 
+            -- TDEE/BMR tracking data. Was previously a local CSV file
+            -- (app_data/user_{id}/tdee_tracking_log.csv) baked into the
+            -- container image with no persistent volume mount -- writes
+            -- during a request lived only as long as that container
+            -- instance, so BMR was computed against partial/reset
+            -- history depending on which instance handled the request.
+            -- This table is the fix: same one-row-per-(user,date) shape
+            -- as the CSV, but durable, matching every other table here.
+            CREATE TABLE IF NOT EXISTS tdee_log (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
+                date TEXT NOT NULL,
+                weight_lbs DOUBLE PRECISION,
+                calories_consumed DOUBLE PRECISION,
+                active_calories_burned DOUBLE PRECISION,
+                PRIMARY KEY (user_id, date)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tdee_log_date ON tdee_log(user_id, date);
+
             -- Pantry/fridge inventory. tracking_mode discriminates three
             -- "how much do I have" semantics rather than three separate
             -- tables (see nutrition-diary-design.md for the full design
@@ -352,8 +371,17 @@ async def init_db():
                 user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
                 colors_json TEXT,
                 sufficiency_threshold_pct DOUBLE PRECISION,
+                unit_system TEXT,
+                macro_chart_style TEXT,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
+
+            -- Additive columns for tables that existed before these
+            -- fields did — CREATE TABLE IF NOT EXISTS is a no-op against
+            -- an already-existing table, so new columns need an explicit
+            -- ALTER TABLE the first time they're introduced.
+            ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS unit_system TEXT;
+            ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS macro_chart_style TEXT;
         """)
 
 

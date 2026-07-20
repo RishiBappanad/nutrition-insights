@@ -497,3 +497,140 @@ class TestPreferencesValidation:
         for key, value in DEFAULT_COLORS.items():
             import re
             assert re.match(r"^#[0-9a-fA-F]{6}$", value), f"{key} has an invalid default: {value}"
+
+    def test_valid_unit_system_accepted(self):
+        from app.routers.preferences import PreferencesRequest
+        assert PreferencesRequest(unit_system="metric").unit_system == "metric"
+        assert PreferencesRequest(unit_system="imperial").unit_system == "imperial"
+
+    def test_invalid_unit_system_rejected(self):
+        from app.routers.preferences import PreferencesRequest
+        import pydantic
+        with pytest.raises(pydantic.ValidationError):
+            PreferencesRequest(unit_system="freedom_units")
+
+    def test_valid_macro_chart_style_accepted(self):
+        from app.routers.preferences import PreferencesRequest
+        assert PreferencesRequest(macro_chart_style="pie").macro_chart_style == "pie"
+        assert PreferencesRequest(macro_chart_style="bar").macro_chart_style == "bar"
+
+    def test_invalid_macro_chart_style_rejected(self):
+        from app.routers.preferences import PreferencesRequest
+        import pydantic
+        with pytest.raises(pydantic.ValidationError):
+            PreferencesRequest(macro_chart_style="donut")
+
+
+# ── tdee.py: calculate_bmr with records= (Postgres-backed path) ─────────────
+
+class TestCalculateBmrFromRecords:
+    def test_no_records_returns_message(self):
+        from tdee import calculate_bmr
+        assert calculate_bmr(records=[]) == "No tracking data found. Run a sync first."
+
+    def test_none_records_falls_back_to_file_path_behavior(self):
+        """records=None (the default) with no file_path should also
+        degrade gracefully, not raise."""
+        from tdee import calculate_bmr
+        assert calculate_bmr() == "No tracking data found. Run a sync first."
+
+    def test_insufficient_complete_days_returns_message(self):
+        from tdee import calculate_bmr
+        records = [
+            {"Date": "2026-01-01", "Weight_lbs": 150, "Calories_Consumed": 2000, "Active_Calories_Burned": 300},
+        ]
+        result = calculate_bmr(records=records)
+        assert "at least 7 days" in result
+
+    def test_continuous_week_uses_linear_model(self):
+        """7+ consecutive days should take the linear regression path,
+        not the exponential fallback -- both produce a numeric BMR, this
+        confirms the records= path reaches real calculation logic, not
+        just the guard clauses."""
+        from tdee import calculate_bmr
+        from datetime import date, timedelta
+        base = date(2026, 1, 1)
+        records = [
+            {
+                "Date": (base + timedelta(days=i)).isoformat(),
+                "Weight_lbs": 150 - i * 0.1,
+                "Calories_Consumed": 2000,
+                "Active_Calories_Burned": 300,
+            }
+            for i in range(10)
+        ]
+        result = calculate_bmr(records=records)
+        assert isinstance(result, (int, float))
+
+    def test_gapped_data_uses_exponential_fallback(self):
+        """Non-consecutive weigh-in dates should still produce a BMR via
+        the exponential path, not fail outright -- matches the real
+        user_8 data shape inspected during root-cause investigation
+        (weigh-ins every few days, not daily)."""
+        from tdee import calculate_bmr
+        records = [
+            {"Date": "2026-01-01", "Weight_lbs": 150.0, "Calories_Consumed": 2000, "Active_Calories_Burned": 300},
+            {"Date": "2026-01-03", "Weight_lbs": 149.8, "Calories_Consumed": 2100, "Active_Calories_Burned": 350},
+            {"Date": "2026-01-08", "Weight_lbs": 149.5, "Calories_Consumed": 1950, "Active_Calories_Burned": 280},
+            {"Date": "2026-01-09", "Weight_lbs": 149.4, "Calories_Consumed": 2050, "Active_Calories_Burned": 310},
+            {"Date": "2026-01-10", "Weight_lbs": 149.2, "Calories_Consumed": 2200, "Active_Calories_Burned": 400},
+            {"Date": "2026-01-15", "Weight_lbs": 148.9, "Calories_Consumed": 1900, "Active_Calories_Burned": 250},
+            {"Date": "2026-01-16", "Weight_lbs": 148.8, "Calories_Consumed": 2000, "Active_Calories_Burned": 300},
+        ]
+        result = calculate_bmr(records=records)
+        assert isinstance(result, (int, float))
+
+    def test_null_fields_in_records_are_treated_as_incomplete(self):
+        """A record missing weight (e.g. a day with only nutrition data
+        synced, no biometrics) should be excluded from the 'complete'
+        day count -- mirrors the None-safe COALESCE behavior in
+        upsert_tdee_log, verifying the read side handles it correctly
+        too."""
+        from tdee import calculate_bmr
+        records = [
+            {"Date": "2026-01-01", "Weight_lbs": None, "Calories_Consumed": 2000, "Active_Calories_Burned": 300},
+        ] * 3 + [
+            {"Date": "2026-01-02", "Weight_lbs": 150, "Calories_Consumed": 2000, "Active_Calories_Burned": 300},
+        ] * 3
+        result = calculate_bmr(records=records)
+        assert "at least 7 days" in result
+
+
+# ── routers/sync.py: _parse_tdee_rows ────────────────────────────────────────
+
+class TestParseTdeeRows:
+    def test_parses_weight_from_biometrics_excluding_apple_health(self, tmp_path):
+        from app.routers.sync import _parse_tdee_rows
+        bio_path = tmp_path / "biometrics.csv"
+        bio_path.write_text(
+            "Day,Metric,Amount\n"
+            "2026-01-01,Weight,150.5\n"
+            "2026-01-01,Weight (Apple Health),151.0\n"
+            "2026-01-01,Heart Rate,70\n"
+        )
+        result = _parse_tdee_rows({"biometrics": str(bio_path)})
+        assert result["2026-01-01"]["weight_lbs"] == 150.5
+
+    def test_sums_active_calories_across_multiple_exercises_same_day(self, tmp_path):
+        from app.routers.sync import _parse_tdee_rows
+        ex_path = tmp_path / "exercises.csv"
+        ex_path.write_text(
+            "Day,Calories Burned\n"
+            "2026-01-01,-200\n"
+            "2026-01-01,-150\n"
+        )
+        result = _parse_tdee_rows({"exercises": str(ex_path)})
+        assert result["2026-01-01"]["active_calories_burned"] == 350.0
+
+    def test_missing_files_produce_empty_result_not_error(self):
+        from app.routers.sync import _parse_tdee_rows
+        assert _parse_tdee_rows({}) == {}
+
+    def test_partial_data_per_date_has_none_for_missing_fields(self, tmp_path):
+        from app.routers.sync import _parse_tdee_rows
+        summary_path = tmp_path / "summary.csv"
+        summary_path.write_text("Date,Energy (kcal)\n2026-01-01,2000\n")
+        result = _parse_tdee_rows({"daily_summary": str(summary_path)})
+        assert result["2026-01-01"]["calories_consumed"] == 2000.0
+        assert result["2026-01-01"]["weight_lbs"] is None
+        assert result["2026-01-01"]["active_calories_burned"] is None

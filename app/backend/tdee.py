@@ -1,20 +1,34 @@
 import pandas as pd
 
 
-def calculate_bmr(file_path="tdee_tracking_log.csv", window=21, alpha=0.1):
+def calculate_bmr(file_path=None, window=21, alpha=0.1, records=None):
     """Calculate BMR. Uses linear model if last N days are continuous,
     otherwise falls back to exponential smoothing for gapped data.
 
     Args:
-        file_path: Path to TDEE tracking CSV
+        file_path: Path to TDEE tracking CSV (legacy — kept for the
+            standalone `python tdee.py` CLI entry point and any local
+            debugging; the live app passes `records` instead, sourced
+            from Postgres, not this file).
         window: Number of days to consider
         alpha: Smoothing factor for exponential model (used only when gaps exist)
+        records: List of dicts shaped like the CSV's rows (Date,
+            Weight_lbs, Calories_Consumed, Active_Calories_Burned) —
+            when provided, this is used directly instead of reading
+            file_path. This is what routers/data.py passes, backed by
+            the tdee_log Postgres table (see user_db.get_tdee_log) rather
+            than the old ephemeral local CSV file.
     """
-    from pathlib import Path
-    if not Path(file_path).exists():
-        return "No tracking data found. Run a sync first."
-
-    df = pd.read_csv(file_path, parse_dates=["Date"])
+    if records is not None:
+        if not records:
+            return "No tracking data found. Run a sync first."
+        df = pd.DataFrame.from_records(records)
+        df["Date"] = pd.to_datetime(df["Date"])
+    else:
+        from pathlib import Path
+        if not file_path or not Path(file_path).exists():
+            return "No tracking data found. Run a sync first."
+        df = pd.read_csv(file_path, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
 
     # Exclude today's row for calorie data (day isn't over), but keep today's weight

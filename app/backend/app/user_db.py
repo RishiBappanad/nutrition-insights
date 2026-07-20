@@ -114,3 +114,48 @@ async def get_nutrition_metrics(user_id: int) -> list:
             user_id,
         )
         return [r["metric"] for r in rows]
+
+
+async def upsert_tdee_log(user_id: int, date: str, weight_lbs: float = None,
+                           calories_consumed: float = None, active_calories_burned: float = None):
+    """Insert/merge a day's TDEE tracking fields. Partial updates merge
+    with any existing row for that date (e.g. a sync that only has
+    biometrics data for today shouldn't null out calories_consumed that
+    a different sync already wrote for the same day) -- COALESCE keeps
+    the existing value when the new value is NULL, matching the CSV
+    version's merge-by-date behavior in routers/sync.py's
+    _update_tdee_log."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO tdee_log (user_id, date, weight_lbs, calories_consumed, active_calories_burned)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (user_id, date) DO UPDATE SET
+                   weight_lbs = COALESCE(EXCLUDED.weight_lbs, tdee_log.weight_lbs),
+                   calories_consumed = COALESCE(EXCLUDED.calories_consumed, tdee_log.calories_consumed),
+                   active_calories_burned = COALESCE(EXCLUDED.active_calories_burned, tdee_log.active_calories_burned)""",
+            user_id, date, weight_lbs, calories_consumed, active_calories_burned,
+        )
+
+
+async def get_tdee_log(user_id: int) -> list:
+    """All TDEE tracking rows for a user, ordered by date -- the same
+    shape calculate_bmr expects (Date/Weight_lbs/Calories_Consumed/
+    Active_Calories_Burned), sourced from Postgres instead of a local
+    CSV file."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT date, weight_lbs, calories_consumed, active_calories_burned "
+            "FROM tdee_log WHERE user_id = $1 ORDER BY date",
+            user_id,
+        )
+    return [
+        {
+            "Date": r["date"],
+            "Weight_lbs": r["weight_lbs"],
+            "Calories_Consumed": r["calories_consumed"],
+            "Active_Calories_Burned": r["active_calories_burned"],
+        }
+        for r in rows
+    ]

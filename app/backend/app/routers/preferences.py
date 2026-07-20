@@ -46,11 +46,17 @@ DEFAULT_COLORS = {
     "lift_scatter": "#2d5344",
 }
 DEFAULT_SUFFICIENCY_THRESHOLD_PCT = 90.0
+DEFAULT_UNIT_SYSTEM = "imperial"
+DEFAULT_MACRO_CHART_STYLE = "pie"
+VALID_UNIT_SYSTEMS = {"metric", "imperial"}
+VALID_MACRO_CHART_STYLES = {"pie", "bar"}
 
 
 class PreferencesRequest(BaseModel):
     colors: dict = {}
     sufficiency_threshold_pct: Optional[float] = None
+    unit_system: Optional[str] = None
+    macro_chart_style: Optional[str] = None
 
     @field_validator("colors")
     @classmethod
@@ -69,12 +75,26 @@ class PreferencesRequest(BaseModel):
             raise ValueError("sufficiency_threshold_pct must be between 0 and 100")
         return v
 
+    @field_validator("unit_system")
+    @classmethod
+    def _validate_unit_system(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in VALID_UNIT_SYSTEMS:
+            raise ValueError(f"unit_system must be one of {sorted(VALID_UNIT_SYSTEMS)}")
+        return v
+
+    @field_validator("macro_chart_style")
+    @classmethod
+    def _validate_macro_chart_style(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in VALID_MACRO_CHART_STYLES:
+            raise ValueError(f"macro_chart_style must be one of {sorted(VALID_MACRO_CHART_STYLES)}")
+        return v
+
 
 @router.get("")
 async def get_preferences(user_id: int = Depends(get_current_user)):
     """Always returns a complete colors map (stored overrides merged over
-    defaults) and a resolved threshold — the frontend never needs its own
-    fallback logic for a partially-set preferences row."""
+    defaults) and resolved scalar preferences — the frontend never needs
+    its own fallback logic for a partially-set preferences row."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM user_preferences WHERE user_id = $1", user_id)
@@ -82,17 +102,24 @@ async def get_preferences(user_id: int = Depends(get_current_user)):
     stored_colors = json.loads(row["colors_json"]) if row and row["colors_json"] else {}
     colors = {**DEFAULT_COLORS, **stored_colors}
     threshold = row["sufficiency_threshold_pct"] if row and row["sufficiency_threshold_pct"] is not None else DEFAULT_SUFFICIENCY_THRESHOLD_PCT
+    unit_system = row["unit_system"] if row and row["unit_system"] else DEFAULT_UNIT_SYSTEM
+    macro_chart_style = row["macro_chart_style"] if row and row["macro_chart_style"] else DEFAULT_MACRO_CHART_STYLE
 
-    return {"colors": colors, "sufficiency_threshold_pct": threshold}
+    return {
+        "colors": colors,
+        "sufficiency_threshold_pct": threshold,
+        "unit_system": unit_system,
+        "macro_chart_style": macro_chart_style,
+    }
 
 
 @router.put("")
 async def set_preferences(req: PreferencesRequest, user_id: int = Depends(get_current_user)):
-    """Partial update — only the keys present in `colors` are changed;
-    omitted keys keep their current stored value (or default, if never
-    set). Mirrors nutrition_targets.py's is_custom-preserving pattern:
-    a user setting one color shouldn't reset every other color back to
-    default."""
+    """Partial update — only the fields actually present in the request
+    are changed; omitted fields keep their current stored value (or
+    default, if never set). Mirrors nutrition_targets.py's
+    is_custom-preserving pattern: a user setting one preference shouldn't
+    reset every other preference back to default."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         existing = await conn.fetchrow("SELECT * FROM user_preferences WHERE user_id = $1", user_id)
@@ -103,17 +130,32 @@ async def set_preferences(req: PreferencesRequest, user_id: int = Depends(get_cu
         if threshold is None and existing:
             threshold = existing["sufficiency_threshold_pct"]
 
+        unit_system = req.unit_system
+        if unit_system is None and existing:
+            unit_system = existing["unit_system"]
+
+        macro_chart_style = req.macro_chart_style
+        if macro_chart_style is None and existing:
+            macro_chart_style = existing["macro_chart_style"]
+
         await conn.execute(
-            """INSERT INTO user_preferences (user_id, colors_json, sufficiency_threshold_pct, updated_at)
-               VALUES ($1, $2, $3, now())
+            """INSERT INTO user_preferences (user_id, colors_json, sufficiency_threshold_pct, unit_system, macro_chart_style, updated_at)
+               VALUES ($1, $2, $3, $4, $5, now())
                ON CONFLICT (user_id) DO UPDATE SET
                    colors_json = EXCLUDED.colors_json,
                    sufficiency_threshold_pct = EXCLUDED.sufficiency_threshold_pct,
+                   unit_system = EXCLUDED.unit_system,
+                   macro_chart_style = EXCLUDED.macro_chart_style,
                    updated_at = now()""",
-            user_id, json.dumps(merged_colors), threshold,
+            user_id, json.dumps(merged_colors), threshold, unit_system, macro_chart_style,
         )
 
-    return {"colors": {**DEFAULT_COLORS, **merged_colors}, "sufficiency_threshold_pct": threshold or DEFAULT_SUFFICIENCY_THRESHOLD_PCT}
+    return {
+        "colors": {**DEFAULT_COLORS, **merged_colors},
+        "sufficiency_threshold_pct": threshold or DEFAULT_SUFFICIENCY_THRESHOLD_PCT,
+        "unit_system": unit_system or DEFAULT_UNIT_SYSTEM,
+        "macro_chart_style": macro_chart_style or DEFAULT_MACRO_CHART_STYLE,
+    }
 
 
 @router.delete("")
@@ -122,4 +164,9 @@ async def reset_preferences(user_id: int = Depends(get_current_user)):
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM user_preferences WHERE user_id = $1", user_id)
-    return {"colors": DEFAULT_COLORS, "sufficiency_threshold_pct": DEFAULT_SUFFICIENCY_THRESHOLD_PCT}
+    return {
+        "colors": DEFAULT_COLORS,
+        "sufficiency_threshold_pct": DEFAULT_SUFFICIENCY_THRESHOLD_PCT,
+        "unit_system": DEFAULT_UNIT_SYSTEM,
+        "macro_chart_style": DEFAULT_MACRO_CHART_STYLE,
+    }

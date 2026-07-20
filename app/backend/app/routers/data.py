@@ -18,29 +18,29 @@ def user_data_dir(user_id: int) -> Path:
 
 @router.get("/bmr")
 async def get_bmr(user_id: int = Depends(get_current_user)):
-    """Get current calculated BMR."""
-    csv_path = user_data_dir(user_id) / "tdee_tracking_log.csv"
-    if not csv_path.exists():
-        return {"bmr": None, "message": "No data yet. Run a sync first."}
+    """Get current calculated BMR, sourced from Postgres (tdee_log table)
+    — previously read a local CSV file with no persistent storage behind
+    it, so BMR was computed against whatever partial/reset history
+    happened to survive on the container instance handling the request."""
+    from ..user_db import get_tdee_log as _get_tdee_log_rows
+
+    records = await _get_tdee_log_rows(user_id)
 
     import sys
     sys.path.insert(0, str(BACKEND_ROOT))
     from tdee import calculate_bmr
 
-    bmr = calculate_bmr(str(csv_path))
+    bmr = calculate_bmr(records=records)
     return {"bmr": bmr if isinstance(bmr, (int, float)) else None, "message": str(bmr)}
 
 
 @router.get("/tdee-log")
 async def get_tdee_log(user_id: int = Depends(get_current_user)):
-    """Get TDEE tracking log as JSON."""
-    csv_path = user_data_dir(user_id) / "tdee_tracking_log.csv"
-    if not csv_path.exists():
-        return {"entries": []}
+    """Get TDEE tracking log as JSON, from Postgres."""
+    from ..user_db import get_tdee_log as _get_tdee_log_rows
 
-    with open(csv_path) as f:
-        entries = list(csv.DictReader(f))
-    return {"entries": entries}
+    records = await _get_tdee_log_rows(user_id)
+    return {"entries": records}
 
 
 @router.get("/workouts")

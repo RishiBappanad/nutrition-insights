@@ -32,9 +32,12 @@ def _filter_biometrics(csv_path: str) -> None:
     p.write_text("\n".join(filtered) + "\n")
 
 
-def _update_tdee_log(cronometer_files: dict, output_path: str) -> None:
-    """Update tdee_tracking_log.csv from cronometer exports."""
-    import csv
+def _parse_tdee_rows(cronometer_files: dict) -> dict:
+    """Parse the same 3 Cronometer export files the old CSV-merge step
+    always read, returning {date: {weight_lbs, calories_consumed,
+    active_calories_burned}} — pure parsing, no I/O to any persistent
+    store, so this is easy to point at Postgres instead of a CSV without
+    touching the parsing logic itself."""
     from collections import defaultdict
 
     weights = {}
@@ -64,47 +67,56 @@ def _update_tdee_log(cronometer_files: dict, output_path: str) -> None:
                     active_calories[row["Day"]] += abs(float(row["Calories Burned"]))
 
     all_dates = set(weights) | set(calories_consumed) | set(active_calories.keys())
-    if not all_dates:
-        return
+    return {
+        date: {
+            "weight_lbs": weights.get(date),
+            "calories_consumed": calories_consumed.get(date),
+            "active_calories_burned": round(active_calories[date], 1) if date in active_calories else None,
+        }
+        for date in all_dates
+    }
 
-    existing = {}
-    try:
-        with open(output_path) as f:
-            for row in csv.DictReader(f):
-                existing[row["Date"]] = row
-    except FileNotFoundError:
-        pass
 
-    for date_str in all_dates:
-        if date_str not in existing:
-            existing[date_str] = {"Date": date_str, "Weight_lbs": "", "Calories_Consumed": "", "Active_Calories_Burned": ""}
-        if date_str in weights:
-            existing[date_str]["Weight_lbs"] = weights[date_str]
-        if date_str in calories_consumed:
-            existing[date_str]["Calories_Consumed"] = calories_consumed[date_str]
-        if date_str in active_calories:
-            existing[date_str]["Active_Calories_Burned"] = round(active_calories[date_str], 1)
+async def _update_tdee_log(cronometer_files: dict, user_id: int) -> int:
+    """Merge Cronometer exports into the tdee_log Postgres table (one
+    upsert per date with new data) — previously merged into a local CSV
+    file with no persistent volume behind it, so BMR was computed
+    against whatever partial/reset history happened to survive on the
+    specific Cloud Run instance handling the request. Returns the number
+    of dates updated."""
+    from ..user_db import upsert_tdee_log
 
-    rows = sorted(existing.values(), key=lambda r: r["Date"])
-    with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["Date", "Weight_lbs", "Calories_Consumed", "Active_Calories_Burned"])
-        writer.writeheader()
-        writer.writerows(rows)
+    parsed = _parse_tdee_rows(cronometer_files)
+    for date_str, fields in parsed.items():
+        await upsert_tdee_log(user_id, date_str, **fields)
+    return len(parsed)
 
 
 @router.post("/cronometer")
 async def sync_cronometer(user_id: int = Depends(get_current_user)):
-    """Export Cronometer data and calculate BMR."""
+    """
+    Pull Cronometer data into this app — nutrition (daily_nutrition),
+    biometrics/weight, and exercise-calorie-burn history (tdee_log).
+    Pure pull, no side effects on the user's actual Cronometer account.
+
+    Previously this endpoint also computed a BMR and pushed it back to
+    Cronometer via client.set_bmr() as an automatic side effect of every
+    sync — split out into a separate, explicit POST /sync/bmr action
+    (see below) per the user's instruction that syncing should only
+    *get* data from Cronometer, not silently write back to it. The
+    underlying client already has set_bmr() as a real write-capable
+    method (kept as-is, not removed) since a future explicit push
+    feature is still wanted — this split just stops it from firing
+    automatically and unconditionally on every pull.
+    """
     creds = await _get_user_creds(user_id)
     if not creds["cronometer_username"] or not creds["cronometer_password"]:
         raise HTTPException(status_code=400, detail="Cronometer credentials not set")
 
     from integrations.cronometer_rpc import CronometerRPCClient
-    from tdee import calculate_bmr
     from datetime import datetime
 
     data_dir = str(user_data_dir(user_id))
-    tdee_path = str(user_data_dir(user_id) / "tdee_tracking_log.csv")
 
     try:
         client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
@@ -113,7 +125,7 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
 
         if results.get("biometrics"):
             _filter_biometrics(results["biometrics"])
-        _update_tdee_log(results, tdee_path)
+        tdee_days_updated = await _update_tdee_log(results, user_id)
 
         # Populate Postgres with nutrition data
         from ..user_db import upsert_daily_nutrition
@@ -156,14 +168,56 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
                     if "Weight" in row["Metric"] and "Apple Health" not in row["Metric"]:
                         await upsert_daily_nutrition(user_id, row["Day"], {"Weight (lbs)": float(row["Amount"])})
 
-        bmr = calculate_bmr(tdee_path)
-        if isinstance(bmr, (int, float)):
-            client.set_bmr(int(bmr))
-            return {"status": "ok", "bmr": bmr}
-
-        return {"status": "ok", "bmr": None, "message": str(bmr)}
+        return {"status": "ok", "tdee_days_updated": tdee_days_updated}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/bmr")
+async def sync_bmr(user_id: int = Depends(get_current_user), push_to_cronometer: bool = False):
+    """
+    Recalculate BMR from this user's tdee_log history (already pulled
+    in via POST /sync/cronometer — this endpoint does NOT talk to
+    Cronometer to fetch data, it only reads what's already stored).
+
+    `push_to_cronometer=true` additionally writes the computed BMR back
+    to the user's Cronometer account via the existing (write-capable)
+    CronometerRPCClient.set_bmr() — opt-in, not automatic, and requires
+    Cronometer credentials to be set even though this endpoint doesn't
+    pull new data from Cronometer otherwise. Defaults to false: recalc
+    without any push is the common case now that sync is pull-only.
+    """
+    from ..user_db import get_tdee_log as _get_tdee_log_rows
+    from tdee import calculate_bmr
+
+    # Check credentials before computing BMR, not after — a push request
+    # with no credentials should fail clearly regardless of whether BMR
+    # computation would have succeeded, rather than silently reporting
+    # "pushed_to_cronometer: false" for two totally different reasons
+    # (no credentials vs. no BMR to push) with the same 200 response.
+    if push_to_cronometer:
+        creds = await _get_user_creds(user_id)
+        if not creds["cronometer_username"] or not creds["cronometer_password"]:
+            raise HTTPException(status_code=400, detail="Cronometer credentials not set — required to push BMR")
+
+    records = await _get_tdee_log_rows(user_id)
+    bmr = calculate_bmr(records=records)
+
+    if not isinstance(bmr, (int, float)):
+        return {"status": "ok", "bmr": None, "message": str(bmr), "pushed_to_cronometer": False}
+
+    pushed = False
+    if push_to_cronometer:
+        from integrations.cronometer_rpc import CronometerRPCClient
+        try:
+            client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
+            client.login()
+            client.set_bmr(int(bmr))
+            pushed = True
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"BMR calculated ({bmr}) but push to Cronometer failed: {e}")
+
+    return {"status": "ok", "bmr": bmr, "pushed_to_cronometer": pushed}
 
 
 @router.post("/hevy")

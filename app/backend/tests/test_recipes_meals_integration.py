@@ -481,6 +481,70 @@ class TestPreferences:
         r = client.get("/preferences")
         assert r.status_code in (401, 403)
 
+    def test_get_preferences_defaults_include_unit_system_and_chart_style(self, client, other_user_token):
+        r = client.get("/preferences", headers=auth(other_user_token))
+        body = r.json()
+        assert body["unit_system"] == "imperial"
+        assert body["macro_chart_style"] == "pie"
+
+    def test_set_unit_system_persists(self, client, user_token):
+        r = client.put("/preferences", headers=auth(user_token), json={"unit_system": "metric"})
+        assert r.status_code == 200
+        assert r.json()["unit_system"] == "metric"
+
+        r2 = client.get("/preferences", headers=auth(user_token))
+        assert r2.json()["unit_system"] == "metric"
+
+    def test_set_macro_chart_style_persists(self, client, user_token):
+        r = client.put("/preferences", headers=auth(user_token), json={"macro_chart_style": "bar"})
+        assert r.status_code == 200
+        assert r.json()["macro_chart_style"] == "bar"
+
+    def test_unit_system_and_chart_style_independent_of_colors(self, client, user_token):
+        """Setting unit_system shouldn't reset colors or vice versa --
+        same is_custom-preserving pattern as every other preference
+        field."""
+        client.put("/preferences", headers=auth(user_token), json={"colors": {"macro_fat": "#111111"}})
+        client.put("/preferences", headers=auth(user_token), json={"unit_system": "metric"})
+        r = client.get("/preferences", headers=auth(user_token))
+        body = r.json()
+        assert body["colors"]["macro_fat"] == "#111111"
+        assert body["unit_system"] == "metric"
+
+    def test_invalid_unit_system_rejected_by_api(self, client, user_token):
+        r = client.put("/preferences", headers=auth(user_token), json={"unit_system": "furlongs"})
+        assert r.status_code == 422
+
+
+# ── Sync / BMR split ─────────────────────────────────────────────────────────
+
+class TestSyncBmrSplit:
+    """Verifies the sync/BMR split: POST /sync/bmr reads only from
+    tdee_log (Postgres) and never contacts Cronometer unless
+    push_to_cronometer=true is explicitly passed."""
+
+    def test_bmr_with_no_data_returns_none_gracefully(self, client, other_user_token):
+        r = client.post("/sync/bmr", headers=auth(other_user_token))
+        assert r.status_code == 200
+        body = r.json()
+        assert body["bmr"] is None
+        assert body["pushed_to_cronometer"] is False
+
+    def test_bmr_push_without_credentials_rejected(self, client, other_user_token):
+        """push_to_cronometer=true requires saved Cronometer credentials
+        -- confirms this path is gated, not silently attempted with no
+        credentials to use."""
+        r = client.post("/sync/bmr?push_to_cronometer=true", headers=auth(other_user_token))
+        assert r.status_code == 400
+        assert "credentials" in r.json()["detail"].lower()
+
+    def test_bmr_does_not_require_cronometer_credentials_when_not_pushing(self, client, other_user_token):
+        """The core of the split: recalculating BMR from already-synced
+        data should work with zero Cronometer credentials configured,
+        since it's reading from tdee_log, not calling Cronometer."""
+        r = client.post("/sync/bmr", headers=auth(other_user_token))
+        assert r.status_code == 200  # not a 400 credentials error
+
 
 # ── Label scanner ─────────────────────────────────────────────────────────────
 
