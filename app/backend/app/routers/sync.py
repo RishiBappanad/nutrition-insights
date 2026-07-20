@@ -92,12 +92,176 @@ async def _update_tdee_log(cronometer_files: dict, user_id: int) -> int:
     return len(parsed)
 
 
+# Cronometer's "servings" export IS the diary — one row per logged food/
+# recipe entry, already fetched on every sync via export_all_to_files but
+# never parsed until now (confirmed via search: parse_servings_csv existed
+# in cronometer_rpc.py but had zero callers anywhere in this codebase).
+# This is a materially simpler and more reliable path to diary data than
+# decoding raw GWT-RPC responses (getDayInfo/getAllFood) — it's a stable,
+# already-authenticated CSV export, not something requiring further
+# reverse-engineering.
+#
+# Column name -> (food_log column, is_macro) for the 5 hardcoded macro
+# fields; every other numeric column in the CSV becomes a
+# food_log_nutrients row instead. Cronometer's CSV header uses "Âµg" for
+# micrograms (a UTF-8/Latin-1 mojibake artifact in their own export, not
+# something this code introduces) — matched literally since that's what
+# real exports contain, confirmed against an actual downloaded file.
+_SERVINGS_MACRO_COLUMNS = {
+    "Energy (kcal)": "calories",
+    "Protein (g)": "protein",
+    "Carbs (g)": "carbs",
+    "Fat (g)": "fat",
+    "Fiber (g)": "fiber",
+}
+# Columns that are metadata, not nutrients — skipped when building the
+# food_log_nutrients rows so they don't show up as bogus "nutrients."
+_SERVINGS_NON_NUTRIENT_COLUMNS = {"Day", "Group", "Food Name", "Amount", "Category"}
+
+_MEAL_GROUP_MAP = {
+    "breakfast": "Breakfast", "lunch": "Lunch", "dinner": "Dinner",
+    "snack": "Snack", "snacks": "Snack",  # Cronometer's own export uses the plural "Snacks" -- confirmed against a real 898-row export
+}
+
+
+def _parse_amount(amount_str: str) -> tuple[float, str]:
+    """Split Cronometer's "Amount" column (e.g. "12.00 nugget", "8.00 fl
+    oz", "1.00 x 11.0 fl oz") into (numeric serving_size, serving_unit
+    text) -- food_log.serving_size is DOUBLE PRECISION, so the raw string
+    can't be stored there directly. Confirmed real formats against the
+    898-row sample export: always starts with a decimal number, followed
+    by a space and a free-text unit description (which may itself contain
+    spaces/further numbers, e.g. "1.00 x 11.0 fl oz" -- only the FIRST
+    number is the serving_size, the rest of the string is the unit label
+    verbatim, not further parsed)."""
+    amount_str = (amount_str or "").strip()
+    if not amount_str:
+        return 1.0, "serving"
+    parts = amount_str.split(None, 1)
+    try:
+        size = float(parts[0])
+    except ValueError:
+        return 1.0, amount_str
+    unit = parts[1] if len(parts) > 1 else "serving"
+    return size, unit
+
+
+def _servings_row_to_food_log_entry(row: dict) -> dict:
+    """Convert one row of Cronometer's servings CSV into the shape
+    routers/food.py's nutrients_to_rows() and the food_log INSERT already
+    expect — reusing the existing normalization, not reinventing it."""
+    macros = {}
+    for csv_col, macro_key in _SERVINGS_MACRO_COLUMNS.items():
+        val = row.get(csv_col)
+        try:
+            macros[macro_key] = float(val) if val not in (None, "") else 0.0
+        except ValueError:
+            macros[macro_key] = 0.0
+
+    nutrients = {}
+    for col, val in row.items():
+        if col in _SERVINGS_NON_NUTRIENT_COLUMNS or col in _SERVINGS_MACRO_COLUMNS:
+            continue
+        if val in (None, ""):
+            continue
+        try:
+            value = float(val)
+        except ValueError:
+            continue
+        # Column names are like "B1 (Thiamine) (mg)" -- the unit is the
+        # last parenthesized segment; store it alongside the value so
+        # this matches the {name: {value, unit}} shape used everywhere
+        # else nutrients are stored, not a bare number with no unit.
+        unit = ""
+        if col.endswith(")") and "(" in col:
+            unit = col[col.rindex("(") + 1:-1]
+        nutrients[col] = {"value": value, "unit": unit}
+
+    meal = _MEAL_GROUP_MAP.get((row.get("Group") or "").strip().lower(), row.get("Group") or "Uncategorized")
+    serving_size, serving_unit = _parse_amount(row.get("Amount", ""))
+
+    return {
+        "date": row.get("Day", ""),
+        "meal": meal,
+        "food_name": row.get("Food Name", "").strip() or "Unknown",
+        "serving_size": serving_size,
+        "serving_unit": serving_unit,
+        **macros,
+        "nutrients": nutrients,
+    }
+
+
+async def _sync_diary_entries(cronometer_files: dict, user_id: int) -> int:
+    """
+    Parse the servings export and write each entry into food_log +
+    food_log_nutrients (source='Cronometer'), the same tables TrackStack's
+    own food-logging UI writes into — so a Cronometer-synced entry shows
+    up on the Dashboard's diary exactly like a manually-logged one.
+
+    Duplicate-safe by construction: every sync re-parses the FULL export
+    range (export_all_to_files always re-exports from a fixed start date,
+    not incrementally) and re-inserts. This means a repeated sync
+    currently creates duplicate food_log rows for entries already
+    imported on a prior sync -- a real, known limitation, not a silent
+    bug: there's no natural unique key to dedupe against (Cronometer's
+    export has no per-serving ID, only day+food+amount, which isn't
+    reliably unique if you log the exact same food/amount twice in one
+    day on purpose). Deduping this properly would need either an explicit
+    "only import entries newer than last sync" date-based cutoff, or
+    accepting the small risk of legitimate double-entries not being
+    distinguishable from re-sync duplicates -- flagging as a known
+    follow-up, not fixing silently by picking one of those tradeoffs here.
+
+    Returns the number of entries imported.
+    """
+    from ..db import get_pool
+    from ..routers.food import nutrients_to_rows
+    import json as json_module
+
+    servings_path = cronometer_files.get("servings")
+    if not servings_path:
+        return 0
+
+    with open(servings_path) as f:
+        rows = list(csv.DictReader(f))
+
+    pool = await get_pool()
+    count = 0
+    async with pool.acquire() as conn:
+        for raw_row in rows:
+            entry = _servings_row_to_food_log_entry(raw_row)
+            if not entry["date"]:
+                continue
+            async with conn.transaction():
+                food_log_id = await conn.fetchval(
+                    """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
+                           serving_size, serving_unit, calories, protein, carbs, fat, fiber, nutrients_json)
+                       VALUES ($1, $2, $3, $4, 'Cronometer', NULL, $5, $6, $7, $8, $9, $10, $11, $12)
+                       RETURNING id""",
+                    user_id, entry["date"], entry["meal"], entry["food_name"], entry["serving_size"],
+                    entry["serving_unit"], entry["calories"], entry["protein"], entry["carbs"],
+                    entry["fat"], entry["fiber"], json_module.dumps(entry["nutrients"]),
+                )
+                nutrient_rows = nutrients_to_rows(food_log_id, entry["nutrients"])
+                if nutrient_rows:
+                    await conn.executemany(
+                        """INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit)
+                           VALUES ($1, $2, $3, $4)
+                           ON CONFLICT (food_log_id, nutrient_name) DO UPDATE SET value = EXCLUDED.value, unit = EXCLUDED.unit""",
+                        nutrient_rows,
+                    )
+            count += 1
+    return count
+
+
 @router.post("/cronometer")
 async def sync_cronometer(user_id: int = Depends(get_current_user)):
     """
     Pull Cronometer data into this app — nutrition (daily_nutrition),
-    biometrics/weight, and exercise-calorie-burn history (tdee_log).
-    Pure pull, no side effects on the user's actual Cronometer account.
+    biometrics/weight, exercise-calorie-burn history (tdee_log), AND
+    diary entries (food_log/food_log_nutrients, source='Cronometer') from
+    the servings export. Pure pull, no side effects on the user's actual
+    Cronometer account.
 
     Previously this endpoint also computed a BMR and pushed it back to
     Cronometer via client.set_bmr() as an automatic side effect of every
@@ -126,6 +290,7 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
         if results.get("biometrics"):
             _filter_biometrics(results["biometrics"])
         tdee_days_updated = await _update_tdee_log(results, user_id)
+        diary_entries_imported = await _sync_diary_entries(results, user_id)
 
         # Populate Postgres with nutrition data
         from ..user_db import upsert_daily_nutrition
@@ -168,7 +333,7 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
                     if "Weight" in row["Metric"] and "Apple Health" not in row["Metric"]:
                         await upsert_daily_nutrition(user_id, row["Day"], {"Weight (lbs)": float(row["Amount"])})
 
-        return {"status": "ok", "tdee_days_updated": tdee_days_updated}
+        return {"status": "ok", "tdee_days_updated": tdee_days_updated, "diary_entries_imported": diary_entries_imported}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -634,3 +634,120 @@ class TestParseTdeeRows:
         assert result["2026-01-01"]["calories_consumed"] == 2000.0
         assert result["2026-01-01"]["weight_lbs"] is None
         assert result["2026-01-01"]["active_calories_burned"] is None
+
+
+# ── routers/sync.py: _servings_row_to_food_log_entry ────────────────────────
+
+class TestServingsRowToFoodLogEntry:
+    def test_parses_macros_from_real_column_shape(self):
+        from app.routers.sync import _servings_row_to_food_log_entry
+        row = {
+            "Day": "2026-04-08", "Group": "Lunch", "Food Name": "Chick-fil-A, Grilled Nuggets",
+            "Amount": "12.00 nugget", "Energy (kcal)": "174.39", "Protein (g)": "30.14",
+            "Carbs (g)": "1.37", "Fat (g)": "4.40", "Fiber (g)": "0.02",
+            "Sodium (mg)": "615.33", "Category": "Fast Foods",
+        }
+        entry = _servings_row_to_food_log_entry(row)
+        assert entry["date"] == "2026-04-08"
+        assert entry["meal"] == "Lunch"
+        assert entry["food_name"] == "Chick-fil-A, Grilled Nuggets"
+        assert entry["calories"] == 174.39
+        assert entry["protein"] == 30.14
+        assert entry["carbs"] == 1.37
+        assert entry["fat"] == 4.40
+        assert entry["fiber"] == 0.02
+        assert entry["serving_size"] == 12.0
+        assert entry["serving_unit"] == "nugget"
+
+    def test_extracts_unit_from_nutrient_column_name(self):
+        from app.routers.sync import _servings_row_to_food_log_entry
+        row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "X", "Amount": "1",
+               "Sodium (mg)": "100", "Vitamin C (mg)": "5"}
+        entry = _servings_row_to_food_log_entry(row)
+        assert entry["nutrients"]["Sodium (mg)"] == {"value": 100.0, "unit": "mg"}
+        assert entry["nutrients"]["Vitamin C (mg)"] == {"value": 5.0, "unit": "mg"}
+
+    def test_metadata_columns_excluded_from_nutrients(self):
+        from app.routers.sync import _servings_row_to_food_log_entry
+        row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "X", "Amount": "1", "Category": "Beverages"}
+        entry = _servings_row_to_food_log_entry(row)
+        assert "Category" not in entry["nutrients"]
+        assert "Day" not in entry["nutrients"]
+        assert "Food Name" not in entry["nutrients"]
+
+    def test_empty_nutrient_values_skipped_not_zeroed(self):
+        from app.routers.sync import _servings_row_to_food_log_entry
+        row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "X", "Amount": "1", "Oxalate (mg)": ""}
+        entry = _servings_row_to_food_log_entry(row)
+        assert "Oxalate (mg)" not in entry["nutrients"]
+
+    def test_missing_macro_columns_default_to_zero(self):
+        from app.routers.sync import _servings_row_to_food_log_entry
+        row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "X", "Amount": "1"}
+        entry = _servings_row_to_food_log_entry(row)
+        assert entry["calories"] == 0.0
+        assert entry["protein"] == 0.0
+
+    def test_plural_snacks_group_normalizes_to_snack(self):
+        """Real export data uses 'Snacks' (plural) -- confirmed against
+        an actual 898-row Cronometer export, not assumed."""
+        from app.routers.sync import _servings_row_to_food_log_entry
+        row = {"Day": "2026-01-01", "Group": "Snacks", "Food Name": "X", "Amount": "1"}
+        entry = _servings_row_to_food_log_entry(row)
+        assert entry["meal"] == "Snack"
+
+    def test_all_four_standard_meals_normalize_correctly(self):
+        from app.routers.sync import _servings_row_to_food_log_entry
+        for group, expected in [("breakfast", "Breakfast"), ("LUNCH", "Lunch"), ("Dinner", "Dinner"), ("snack", "Snack")]:
+            row = {"Day": "2026-01-01", "Group": group, "Food Name": "X", "Amount": "1"}
+            entry = _servings_row_to_food_log_entry(row)
+            assert entry["meal"] == expected
+
+    def test_unrecognized_group_falls_through_as_is(self):
+        """A genuinely unmapped Group value (e.g. Cronometer adds a new
+        one in the future) should pass through rather than being silently
+        dropped or defaulted to a misleading value -- the diary UI's own
+        Uncategorized fallback (meal-sections.jsx) handles anything not in
+        its fixed Breakfast/Lunch/Dinner/Snack list."""
+        from app.routers.sync import _servings_row_to_food_log_entry
+        row = {"Day": "2026-01-01", "Group": "SomeNewMealType", "Food Name": "X", "Amount": "1"}
+        entry = _servings_row_to_food_log_entry(row)
+        assert entry["meal"] == "SomeNewMealType"
+
+    def test_empty_food_name_defaults_to_unknown(self):
+        from app.routers.sync import _servings_row_to_food_log_entry
+        row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "", "Amount": "1"}
+        entry = _servings_row_to_food_log_entry(row)
+        assert entry["food_name"] == "Unknown"
+
+
+class TestParseAmount:
+    def test_simple_amount(self):
+        from app.routers.sync import _parse_amount
+        assert _parse_amount("12.00 nugget") == (12.0, "nugget")
+
+    def test_amount_with_multi_word_unit(self):
+        from app.routers.sync import _parse_amount
+        assert _parse_amount("8.00 fl oz") == (8.0, "fl oz")
+
+    def test_amount_with_x_and_nested_unit(self):
+        """Real captured format: '1.00 x 11.0 fl oz' -- only the first
+        number is the serving_size, everything else is unit text
+        verbatim, not further parsed."""
+        from app.routers.sync import _parse_amount
+        assert _parse_amount("1.00 x 11.0 fl oz") == (1.0, "x 11.0 fl oz")
+
+    def test_empty_amount_defaults_to_one_serving(self):
+        from app.routers.sync import _parse_amount
+        assert _parse_amount("") == (1.0, "serving")
+        assert _parse_amount(None) == (1.0, "serving")
+
+    def test_non_numeric_amount_falls_back_gracefully(self):
+        from app.routers.sync import _parse_amount
+        size, unit = _parse_amount("some weird value")
+        assert size == 1.0
+        assert unit == "some weird value"
+
+    def test_number_with_no_unit_text(self):
+        from app.routers.sync import _parse_amount
+        assert _parse_amount("2.5") == (2.5, "serving")
