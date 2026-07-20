@@ -10,16 +10,22 @@ import {
   Menu,
   X,
   Apple,
-  UtensilsCrossed,
   User,
   Target,
+  Refrigerator,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { AppSwitcher, MobileAppSwitcher } from '@/components/app-switcher'
 
+// Log Food, Recipes, and Meals are intentionally NOT persistent sidebar
+// items — they're all diary-logging entry points, surfaced instead as
+// prominent buttons on the Dashboard (where the diary itself lives) to
+// keep the sidebar from accumulating one nav item per "way to add
+// something to today," per user request. Pantry stays in the sidebar
+// since it's a standalone inventory concept, not a diary-logging action.
 const navItems = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
-  { href: '/food-log', label: 'Log Food', icon: UtensilsCrossed },
+  { href: '/pantry', label: 'Pantry', icon: Refrigerator },
   { href: '/targets', label: 'Targets', icon: Target },
   { href: '/charts', label: 'Charts', icon: BarChart3 },
   { href: '/log', label: 'Log', icon: ClipboardList },

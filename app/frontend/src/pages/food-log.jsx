@@ -1,10 +1,11 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import { Search, Plus, CheckCircle } from 'lucide-react'
 
 const MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack']
+const SEARCH_DEBOUNCE_MS = 400
 
 // USDA FoodData Central reports macros as regular nutrient entries, not
 // separate fields — these are the exact nutrient names USDA uses
@@ -31,8 +32,12 @@ function extractMacro(nutrients, key) {
 }
 
 /**
- * Food search + log page. Search hits GET /food/search (USDA + CNF),
- * picking a result opens an inline logger where the user chooses a meal,
+ * Food search + log page. Live/autocomplete search: as the user types,
+ * a debounced request hits GET /food/search (USDA + CNF) automatically
+ * — no submit button required to see results, matching what "search
+ * autocomplete" actually means (the earlier explicit-submit-only version
+ * required pressing Enter/clicking Search, which isn't autocomplete).
+ * Picking a result opens an inline logger where the user chooses a meal,
  * date, and a gram amount to scale to — POST /food/log with `scale_to`
  * does the actual scaling server-side (portion_scaling.py), this page
  * never computes scaled nutrients itself.
@@ -41,20 +46,53 @@ export default function FoodLog() {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
   const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
   const [selected, setSelected] = useState(null)
   const [logging, setLogging] = useState(false)
   const [status, setStatus] = useState('')
 
-  async function handleSearch(e) {
-    e.preventDefault()
-    if (query.trim().length < 2) return
+  // Guards against a slow earlier request's results overwriting a
+  // newer one's — without this, typing "chi" then quickly "chicken"
+  // could show "chi"'s results last if that request happens to resolve
+  // after "chicken"'s, since fetches aren't guaranteed to resolve in
+  // the order they were sent.
+  const latestQueryRef = useRef('')
+
+  useEffect(() => {
+    const trimmed = query.trim()
+    if (trimmed.length < 2) {
+      setResults([])
+      setSearching(false)
+      setSearchError('')
+      return
+    }
+
     setSearching(true)
-    setStatus('')
-    const res = await api(`/food/search?q=${encodeURIComponent(query)}`)
-    const data = await res.json()
-    setResults(data.results || [])
-    setSearching(false)
-  }
+    setSearchError('')
+    const timer = setTimeout(async () => {
+      latestQueryRef.current = trimmed
+      try {
+        const res = await api(`/food/search?q=${encodeURIComponent(trimmed)}`)
+        if (latestQueryRef.current !== trimmed) return // a newer query has since started
+        if (!res.ok) {
+          setSearchError(`Search failed (${res.status})`)
+          setResults([])
+        } else {
+          const data = await res.json()
+          setResults(data.results || [])
+        }
+      } catch {
+        if (latestQueryRef.current === trimmed) {
+          setSearchError('Network error')
+          setResults([])
+        }
+      } finally {
+        if (latestQueryRef.current === trimmed) setSearching(false)
+      }
+    }, SEARCH_DEBOUNCE_MS)
+
+    return () => clearTimeout(timer)
+  }, [query])
 
   function selectResult(result) {
     // USDA results without an explicit servingSize are reported per
@@ -126,7 +164,7 @@ export default function FoodLog() {
           <CardTitle>Search</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <form onSubmit={handleSearch} className="flex gap-2">
+          <div className="flex gap-2">
             <input
               type="text"
               placeholder="e.g. banana, chicken breast, oatmeal"
@@ -134,15 +172,11 @@ export default function FoodLog() {
               onChange={(e) => setQuery(e.target.value)}
               className="flex-1 px-3 py-2 rounded-md border bg-background text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
             />
-            <button
-              type="submit"
-              disabled={searching || query.trim().length < 2}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
-            >
-              <Search className="h-4 w-4" />
-              {searching ? 'Searching...' : 'Search'}
-            </button>
-          </form>
+            <div className="inline-flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium text-muted-foreground">
+              <Search className={cn('h-4 w-4', searching && 'animate-pulse')} />
+              {searching ? 'Searching...' : ''}
+            </div>
+          </div>
 
           {results.length > 0 && (
             <div className="space-y-1.5 max-h-80 overflow-y-auto">
@@ -168,8 +202,11 @@ export default function FoodLog() {
             </div>
           )}
 
-          {!searching && query.trim().length >= 2 && results.length === 0 && (
+          {!searching && query.trim().length >= 2 && results.length === 0 && !searchError && (
             <p className="text-sm text-muted-foreground">No results. Try a different search term.</p>
+          )}
+          {searchError && (
+            <p className="text-sm text-destructive">{searchError}</p>
           )}
         </CardContent>
       </Card>

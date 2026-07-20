@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { Link } from 'wouter'
 import { api } from '@/lib/api'
 import { usePreferences } from '@/lib/use-preferences'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
@@ -6,17 +7,20 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { MacroCard } from '@/components/ui/macro-card'
 import { MicronutrientCard } from '@/components/ui/micronutrient-card'
 import { MealSections } from '@/components/ui/meal-sections'
-import { RefreshCw, Flame, Activity } from 'lucide-react'
+import { WaterWidget } from '@/components/ui/water-widget'
+import { RefreshCw, Flame, Activity, Calculator, UtensilsCrossed, BookOpen, Layers } from 'lucide-react'
 
 function todayIso() {
   return new Date().toISOString().slice(0, 10)
 }
 
 export default function Dashboard() {
-  const { colors, sufficiencyThresholdPct } = usePreferences()
+  const { colors, sufficiencyThresholdPct, unitSystem, macroChartStyle, updateMacroChartStyle } = usePreferences()
   const [bmr, setBmr] = useState(null)
+  const [bmrMessage, setBmrMessage] = useState('')
   const [syncing, setSyncing] = useState('')
   const [syncResult, setSyncResult] = useState(null)
+  const [calculatingBmr, setCalculatingBmr] = useState(false)
   const [loading, setLoading] = useState(true)
 
   const [foodLog, setFoodLog] = useState(null)
@@ -31,6 +35,7 @@ export default function Dashboard() {
       .then((r) => r.json())
       .then((d) => {
         setBmr(d.bmr)
+        setBmrMessage(d.bmr == null ? d.message : '')
         setLoading(false)
       })
       .catch(() => setLoading(false))
@@ -61,9 +66,20 @@ export default function Dashboard() {
     const data = await res.json()
     setSyncResult(data)
     setSyncing('')
-    api('/data/bmr')
-      .then((r) => r.json())
-      .then((d) => setBmr(d.bmr))
+  }
+
+  async function handleCalculateBmr() {
+    setCalculatingBmr(true)
+    setBmrMessage('')
+    const res = await api('/sync/bmr', { method: 'POST' })
+    const data = await res.json()
+    setCalculatingBmr(false)
+    if (res.ok) {
+      setBmr(data.bmr)
+      setBmrMessage(data.bmr == null ? data.message : '')
+    } else {
+      setBmrMessage(data.detail || `Failed (${res.status})`)
+    }
   }
 
   return (
@@ -75,6 +91,31 @@ export default function Dashboard() {
         </p>
       </div>
 
+      {/* Prominent logging entry points — Log Food, Recipes, and Meals
+          were pulled out of the persistent sidebar nav per user request
+          (too much clutter for "ways to add something to today") and
+          live here instead, next to the diary they feed. */}
+      <div className="grid gap-3 grid-cols-3">
+        <Link href="/food-log">
+          <div className="flex items-center gap-2 justify-center px-4 py-3 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors cursor-pointer">
+            <UtensilsCrossed className="h-4 w-4" />
+            Log Food
+          </div>
+        </Link>
+        <Link href="/recipes">
+          <div className="flex items-center gap-2 justify-center px-4 py-3 rounded-md border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors cursor-pointer">
+            <BookOpen className="h-4 w-4" />
+            Recipes
+          </div>
+        </Link>
+        <Link href="/meals">
+          <div className="flex items-center gap-2 justify-center px-4 py-3 rounded-md border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors cursor-pointer">
+            <Layers className="h-4 w-4" />
+            Meals
+          </div>
+        </Link>
+      </div>
+
       {/* Macro + Micronutrient summary */}
       {nutritionLoading ? (
         <div className="grid gap-4 md:grid-cols-2">
@@ -83,10 +124,20 @@ export default function Dashboard() {
         </div>
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
-          <MacroCard totals={foodLog?.totals} target={macroTarget} nutrientTotals={foodLog?.nutrient_totals} colors={colors} />
+          <MacroCard
+            totals={foodLog?.totals}
+            target={macroTarget}
+            nutrientTotals={foodLog?.nutrient_totals}
+            colors={colors}
+            chartStyle={macroChartStyle}
+            onChartStyleChange={updateMacroChartStyle}
+          />
           <MicronutrientCard progress={progress} colors={colors} sufficiencyThresholdPct={sufficiencyThresholdPct} />
         </div>
       )}
+
+      {/* Water tracking */}
+      <WaterWidget date={date} unitSystem={unitSystem} />
 
       {/* Diary, grouped by meal/time-of-day */}
       <div>
@@ -115,8 +166,16 @@ export default function Dashboard() {
             </div>
           )}
           <p className="text-xs text-muted-foreground mt-1">
-            {bmr ? 'Calculated from your latest data' : 'Sync data to calculate'}
+            {bmrMessage || (bmr ? 'Calculated from your synced data' : 'Recalculate after syncing data')}
           </p>
+          <button
+            onClick={handleCalculateBmr}
+            disabled={calculatingBmr}
+            className="mt-3 inline-flex items-center gap-2 px-4 py-2 rounded-md border border-border text-sm font-medium text-foreground hover:bg-muted disabled:opacity-50 transition-colors"
+          >
+            <Calculator className={`h-4 w-4 ${calculatingBmr ? 'animate-pulse' : ''}`} />
+            {calculatingBmr ? 'Calculating...' : 'Recalculate BMR'}
+          </button>
         </CardContent>
       </Card>
 
@@ -129,7 +188,8 @@ export default function Dashboard() {
           </CardHeader>
           <CardContent>
             <p className="text-xs text-muted-foreground mb-3">
-              Sync nutrition &amp; biometric data
+              Pull nutrition &amp; biometric data from Cronometer (does not affect your BMR —
+              use "Recalculate BMR" above for that)
             </p>
             <button
               onClick={() => handleSync('cronometer')}
