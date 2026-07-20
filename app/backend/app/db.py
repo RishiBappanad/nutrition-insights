@@ -23,12 +23,28 @@ def decrypt(value: str) -> str:
 
 
 async def get_pool() -> asyncpg.Pool:
-    """Get (or lazily create) the shared connection pool."""
+    """Get (or lazily create) the shared connection pool.
+
+    statement_cache_size=0 is required because DATABASE_URL points at
+    Neon's PgBouncer-pooled endpoint (transaction pooling mode) — asyncpg
+    normally caches prepared statement plans per-connection, but under
+    transaction pooling a given asyncpg "connection" can be multiplexed
+    across different real Postgres backend connections request-to-request,
+    so a cached plan can silently point at a backend where the schema has
+    since changed underneath it. This surfaced as a real production 500
+    (asyncpg.exceptions.InvalidCachedStatementError) immediately after a
+    live ALTER TABLE — confirmed via Cloud Run logs, not a hypothetical.
+    Disabling the statement cache is the standard, documented fix for
+    asyncpg + PgBouncer transaction pooling (see MagicStack/asyncpg#507,
+    #1065) and costs one extra prepare-and-execute round trip per query
+    instead of a cached plan — an acceptable tradeoff for correctness
+    over the alternative of every future schema change risking another
+    production outage until the pool happens to cycle."""
     global _pool
     if _pool is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL must be set")
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, statement_cache_size=0)
     return _pool
 
 
