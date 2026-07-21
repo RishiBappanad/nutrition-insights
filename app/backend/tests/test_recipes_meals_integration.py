@@ -481,6 +481,302 @@ class TestPreferences:
         r = client.get("/preferences")
         assert r.status_code in (401, 403)
 
+
+# ── Recipe as a first-class food reference (search/diary/pantry) ───────────
+
+class TestRecipeAsFoodReference:
+    """Per explicit user steering: recipes should have all the
+    functionality of a plain food -- searchable, loggable to diary,
+    addable to pantry -- without special-case handling by any caller.
+    Implemented by making GET /food/search include the user's own
+    recipes (source='recipe', id=<recipe id>) alongside USDA/CNF
+    results, in the exact same result shape."""
+
+    def test_recipe_appears_in_food_search_results(self, client, user_token):
+        r = client.post("/recipes", headers=auth(user_token), json={
+            "name": "Searchable Test Recipe", "servings_per_batch": 2,
+            "items": [{"food_name": "Rice", "calories": 400, "protein": 8, "carbs": 88, "fat": 2, "fiber": 2}],
+        })
+        recipe_id = r.json()["id"]
+
+        r2 = client.get("/food/search?q=Searchable+Test+Recipe", headers=auth(user_token))
+        results = r2.json()["results"]
+        recipe_result = next((res for res in results if res["source"] == "recipe"), None)
+        assert recipe_result is not None
+        assert recipe_result["id"] == str(recipe_id)
+        assert recipe_result["recipe"] is True
+
+    def test_recipe_search_result_shows_per_serving_not_batch_totals(self, client, user_token):
+        client.post("/recipes", headers=auth(user_token), json={
+            "name": "Per Serving Check Recipe", "servings_per_batch": 4,
+            "items": [{"food_name": "Beans", "calories": 800, "protein": 40, "carbs": 120, "fat": 8, "fiber": 40}],
+        })
+        r = client.get("/food/search?q=Per+Serving+Check+Recipe", headers=auth(user_token))
+        result = next(res for res in r.json()["results"] if res["source"] == "recipe")
+        assert result["nutrients"]["Energy"]["value"] == 200  # 800/4 servings
+
+    def test_recipe_search_result_can_be_logged_to_diary(self, client, user_token):
+        r = client.post("/recipes", headers=auth(user_token), json={
+            "name": "Loggable Recipe", "servings_per_batch": 1,
+            "items": [{"food_name": "Oats", "calories": 150, "protein": 5, "carbs": 27, "fat": 3, "fiber": 4}],
+        })
+        r2 = client.get("/food/search?q=Loggable+Recipe", headers=auth(user_token))
+        result = next(res for res in r2.json()["results"] if res["source"] == "recipe")
+
+        r3 = client.post("/food/log", headers=auth(user_token), json={
+            "date": TEST_DATE, "meal": "Breakfast", "food_name": result["name"],
+            "source": result["source"], "source_id": result["id"],
+            "calories": result["nutrients"]["Energy"]["value"],
+            "protein": result["nutrients"]["Protein"]["value"],
+            "carbs": result["nutrients"]["Carbohydrate, by difference"]["value"],
+            "fat": result["nutrients"]["Total lipid (fat)"]["value"],
+            "fiber": result["nutrients"]["Fiber, total dietary"]["value"],
+            "nutrients": result["nutrients"],
+        })
+        assert r3.status_code == 200
+
+        r4 = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token))
+        entry = next(e for e in r4.json()["entries"] if e["food_name"] == "Loggable Recipe")
+        assert entry["source"] == "recipe"
+        assert entry["calories"] == 150
+
+    def test_recipe_search_result_can_be_added_to_pantry(self, client, user_token):
+        r = client.post("/recipes", headers=auth(user_token), json={"name": "Pantry Recipe", "items": []})
+        r2 = client.get("/food/search?q=Pantry+Recipe", headers=auth(user_token))
+        result = next(res for res in r2.json()["results"] if res["source"] == "recipe")
+
+        r3 = client.post("/pantry", headers=auth(user_token), json={
+            "food_name": result["name"], "source": result["source"], "source_id": result["id"],
+            "tracking_mode": "countable", "remaining_servings": 5,
+        })
+        assert r3.status_code == 200
+
+        r4 = client.get("/pantry", headers=auth(user_token))
+        item = next(i for i in r4.json()["items"] if i["food_name"] == "Pantry Recipe")
+        assert item["source"] == "recipe"
+
+    def test_include_recipes_false_excludes_recipes_from_search(self, client, user_token):
+        client.post("/recipes", headers=auth(user_token), json={"name": "Excludable Recipe XYZ", "items": []})
+        r = client.get("/food/search?q=Excludable+Recipe+XYZ&include_own=false", headers=auth(user_token))
+        assert not any(res["source"] == "recipe" for res in r.json()["results"])
+
+    def test_recipe_search_scoped_to_owner(self, client, user_token, other_user_token):
+        client.post("/recipes", headers=auth(user_token), json={"name": "Owner Only Recipe ABC", "items": []})
+        r = client.get("/food/search?q=Owner+Only+Recipe+ABC", headers=auth(other_user_token))
+        assert not any(res["source"] == "recipe" for res in r.json()["results"])
+
+
+class TestMealAsFoodReference:
+    """Per explicit user steering: meals should be a valid food reference
+    at every point a plain food/recipe is -- searchable via
+    GET /food/search (source='meal'), with SUMMED (not scaled) item
+    totals since a meal has no servings-per-batch concept."""
+
+    def test_meal_appears_in_food_search_results(self, client, user_token):
+        r = client.post("/meals", headers=auth(user_token), json={
+            "name": "Searchable Test Meal",
+            "items": [
+                {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10, "fiber": 0},
+                {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1, "fiber": 1},
+            ],
+        })
+        meal_id = r.json()["id"]
+
+        r2 = client.get("/food/search?q=Searchable+Test+Meal", headers=auth(user_token))
+        results = r2.json()["results"]
+        meal_result = next((res for res in results if res["source"] == "meal"), None)
+        assert meal_result is not None
+        assert meal_result["id"] == str(meal_id)
+        assert meal_result["meal"] is True
+        assert meal_result["item_count"] == 2
+
+    def test_meal_search_result_shows_summed_not_scaled_totals(self, client, user_token):
+        client.post("/meals", headers=auth(user_token), json={
+            "name": "Summed Total Meal",
+            "items": [
+                {"food_name": "A", "calories": 100, "protein": 5, "carbs": 10, "fat": 2, "fiber": 1},
+                {"food_name": "B", "calories": 200, "protein": 10, "carbs": 20, "fat": 4, "fiber": 2},
+            ],
+        })
+        r = client.get("/food/search?q=Summed+Total+Meal", headers=auth(user_token))
+        result = next(res for res in r.json()["results"] if res["source"] == "meal")
+        assert result["nutrients"]["Energy"]["value"] == 300  # summed, not divided
+
+    def test_meal_search_result_can_be_logged_via_meals_endpoint(self, client, user_token):
+        r = client.post("/meals", headers=auth(user_token), json={
+            "name": "Loggable Meal",
+            "items": [{"food_name": "Oats", "calories": 150, "protein": 5, "carbs": 27, "fat": 3, "fiber": 4}],
+        })
+        r2 = client.get("/food/search?q=Loggable+Meal", headers=auth(user_token))
+        result = next(res for res in r2.json()["results"] if res["source"] == "meal")
+
+        # The frontend calls POST /meals/{id}/log for a source='meal'
+        # result (with combined=true, matching "meal as its own food"
+        # behavior), not POST /food/log directly.
+        r3 = client.post(f"/meals/{result['id']}/log", headers=auth(user_token), json={
+            "date": TEST_DATE, "meal": "Breakfast", "combined": True,
+        })
+        assert r3.status_code == 200
+        assert len(r3.json()["food_log_ids"]) == 1
+        assert r3.json()["combined"] is True
+
+        r4 = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token))
+        entry = next(e for e in r4.json()["entries"] if e["food_name"] == "Loggable Meal")
+        assert entry["source"] == "meal"
+        assert entry["calories"] == 150
+
+    def test_meal_logs_exploded_by_default(self, client, user_token):
+        """Calling POST /meals/{id}/log directly (not via search, no
+        combined flag) still defaults to the original exploded behavior
+        -- one food_log entry per item -- preserving existing behavior
+        for any caller not opting into combined mode."""
+        r = client.post("/meals", headers=auth(user_token), json={
+            "name": "Default Exploded Meal",
+            "items": [
+                {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10, "fiber": 0},
+                {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1, "fiber": 1},
+            ],
+        })
+        meal_id = r.json()["id"]
+        r2 = client.post(f"/meals/{meal_id}/log", headers=auth(user_token), json={"date": TEST_DATE, "meal": "Breakfast"})
+        assert r2.json()["combined"] is False
+        assert len(r2.json()["food_log_ids"]) == 2
+
+    def test_combined_meal_entry_can_be_exploded(self, client, user_token):
+        r = client.post("/meals", headers=auth(user_token), json={
+            "name": "Explodable Meal",
+            "items": [
+                {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10, "fiber": 0},
+                {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1, "fiber": 1,
+                 "nutrients": {"Sodium, Na": {"value": 150, "unit": "mg"}}},
+            ],
+        })
+        meal_id = r.json()["id"]
+
+        r2 = client.post(f"/meals/{meal_id}/log", headers=auth(user_token), json={
+            "date": TEST_DATE, "meal": "Breakfast", "combined": True,
+        })
+        combined_food_log_id = r2.json()["food_log_ids"][0]
+
+        # Confirm it's currently one combined entry
+        r3 = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token))
+        assert len([e for e in r3.json()["entries"] if e["food_name"] == "Explodable Meal"]) == 1
+
+        # Explode it
+        r4 = client.post(f"/meals/{meal_id}/explode/{combined_food_log_id}", headers=auth(user_token))
+        assert r4.status_code == 200
+        assert len(r4.json()["food_log_ids"]) == 2
+
+        # Combined entry is gone, replaced by 2 individual entries with the SAME date/meal
+        r5 = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token))
+        entries = r5.json()["entries"]
+        assert not any(e["food_name"] == "Explodable Meal" for e in entries)
+        assert any(e["food_name"] == "Eggs" and e["meal"] == "Breakfast" for e in entries)
+        assert any(e["food_name"] == "Toast" and e["nutrients"].get("Sodium, Na", {}).get("value") == 150 for e in entries)
+
+    def test_explode_rejects_wrong_meal_id(self, client, user_token):
+        """Exploding with a food_log_id that belongs to a DIFFERENT
+        meal's combined entry must 404, not silently explode against the
+        wrong meal's items."""
+        r1 = client.post("/meals", headers=auth(user_token), json={
+            "name": "Meal A", "items": [{"food_name": "X", "calories": 10}],
+        })
+        meal_a_id = r1.json()["id"]
+        r2 = client.post(f"/meals/{meal_a_id}/log", headers=auth(user_token), json={
+            "date": TEST_DATE, "meal": "Snack", "combined": True,
+        })
+        food_log_id = r2.json()["food_log_ids"][0]
+
+        r3 = client.post("/meals", headers=auth(user_token), json={"name": "Meal B", "items": []})
+        meal_b_id = r3.json()["id"]
+
+        r4 = client.post(f"/meals/{meal_b_id}/explode/{food_log_id}", headers=auth(user_token))
+        assert r4.status_code == 404
+
+    def test_explode_rejects_non_combined_entry(self, client, user_token):
+        """A plain food_log entry that was never a combined meal entry
+        (e.g. a normal USDA-sourced log) must not be explodable."""
+        r = client.post("/meals", headers=auth(user_token), json={"name": "Meal C", "items": []})
+        meal_id = r.json()["id"]
+
+        r2 = client.post("/food/log", headers=auth(user_token), json={
+            "date": TEST_DATE, "meal": "Snack", "food_name": "Random Food", "source": "USDA", "calories": 50,
+        })
+        random_food_log_id = r2.json()["id"]
+
+        r3 = client.post(f"/meals/{meal_id}/explode/{random_food_log_id}", headers=auth(user_token))
+        assert r3.status_code == 404
+
+    def test_explode_scoped_to_owner(self, client, user_token, other_user_token):
+        r = client.post("/meals", headers=auth(user_token), json={
+            "name": "Owner Meal", "items": [{"food_name": "X", "calories": 10}],
+        })
+        meal_id = r.json()["id"]
+        r2 = client.post(f"/meals/{meal_id}/log", headers=auth(user_token), json={
+            "date": TEST_DATE, "meal": "Snack", "combined": True,
+        })
+        food_log_id = r2.json()["food_log_ids"][0]
+
+        r3 = client.post(f"/meals/{meal_id}/explode/{food_log_id}", headers=auth(other_user_token))
+        assert r3.status_code == 404
+
+    def test_meal_search_result_can_be_added_to_pantry(self, client, user_token):
+        """Pantry is (source, source_id)-generic (see routers/pantry.py)
+        with zero special-casing for source -- so a meal search result
+        works as a pantry item the same way a recipe does. Since pantry
+        now carries nutrition PER serving alongside the item (see
+        TestPantryRemoveServings/test_pantry_item_stores_nutrition_at_add_time),
+        the search result's nutrients are passed through at add-time so
+        /consume can compute real macros without the caller resupplying
+        them later."""
+        r = client.post("/meals", headers=auth(user_token), json={
+            "name": "Pantry Meal",
+            "items": [{"food_name": "Cereal", "calories": 120, "protein": 3, "carbs": 24, "fat": 1, "fiber": 2}],
+        })
+        r2 = client.get("/food/search?q=Pantry+Meal", headers=auth(user_token))
+        result = next(res for res in r2.json()["results"] if res["source"] == "meal")
+
+        r3 = client.post("/pantry", headers=auth(user_token), json={
+            "food_name": result["name"],
+            "source": result["source"],
+            "source_id": result["id"],
+            "tracking_mode": "single",
+            "calories": result["nutrients"]["Energy"]["value"],
+            "protein": result["nutrients"]["Protein"]["value"],
+            "carbs": result["nutrients"]["Carbohydrate, by difference"]["value"],
+            "fat": result["nutrients"]["Total lipid (fat)"]["value"],
+            "fiber": result["nutrients"]["Fiber, total dietary"]["value"],
+        })
+        assert r3.status_code == 200
+        pantry_item_id = r3.json()["id"]
+
+        r4 = client.get("/pantry", headers=auth(user_token))
+        item = next(i for i in r4.json()["items"] if i["id"] == pantry_item_id)
+        assert item["source"] == "meal"
+        assert item["source_id"] == result["id"]
+        assert item["calories"] == 120
+
+        r5 = client.post(f"/pantry/{pantry_item_id}/consume", headers=auth(user_token), json={
+            "servings": 1, "date": TEST_DATE, "meal": "Breakfast",
+        })
+        assert r5.status_code == 200
+        assert r5.json()["pantry_status"] == "removed"  # single mode always removes on consume
+
+        r6 = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token))
+        logged = next(e for e in r6.json()["entries"] if e["food_name"] == "Pantry Meal")
+        assert logged["source"] == "meal"
+        assert logged["calories"] == 120
+
+    def test_include_own_false_excludes_meals_from_search(self, client, user_token):
+        client.post("/meals", headers=auth(user_token), json={"name": "Excludable Meal XYZ", "items": []})
+        r = client.get("/food/search?q=Excludable+Meal+XYZ&include_own=false", headers=auth(user_token))
+        assert not any(res["source"] == "meal" for res in r.json()["results"])
+
+    def test_meal_search_scoped_to_owner(self, client, user_token, other_user_token):
+        client.post("/meals", headers=auth(user_token), json={"name": "Owner Only Meal ABC", "items": []})
+        r = client.get("/food/search?q=Owner+Only+Meal+ABC", headers=auth(other_user_token))
+        assert not any(res["source"] == "meal" for res in r.json()["results"])
+
     def test_get_preferences_defaults_include_unit_system_and_chart_style(self, client, other_user_token):
         r = client.get("/preferences", headers=auth(other_user_token))
         body = r.json()

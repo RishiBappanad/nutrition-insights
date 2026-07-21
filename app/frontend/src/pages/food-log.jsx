@@ -95,14 +95,28 @@ export default function FoodLog() {
   }, [query])
 
   function selectResult(result) {
-    // USDA results without an explicit servingSize are reported per
-    // 100g by default — 100g is the correct implicit reference in that
-    // case, not a guess.
-    const referenceGrams = result.serving_size || 100
+    // Recipes are returned as search results per-serving (serving_size:
+    // 1, serving_unit: 'serving' -- see routers/food.py's
+    // _search_user_recipes) not per-gram like USDA/CNF results, so
+    // scaling a recipe means "how many servings," not "how many grams."
+    // Using gram-based scaling on a recipe result would silently divide
+    // its already-correct per-serving nutrition by ~1g instead of
+    // treating 1 as "the whole reference serving" -- caught before
+    // shipping, not a live bug users hit.
+    //
+    // Meals have NO scaling concept at all (routers/meals.py: "a meal
+    // always logs at face value") -- a meal result logs via
+    // POST /meals/{id}/log (multiple food_log rows, one per item), not
+    // POST /food/log, so there's no amount/serving picker for it either.
+    const isRecipe = result.source === 'recipe'
+    const isMeal = result.source === 'meal'
+    const referenceGrams = (isRecipe || isMeal) ? null : (result.serving_size || 100)
     setSelected({
       result,
+      isRecipe,
+      isMeal,
       referenceGrams,
-      targetGrams: referenceGrams,
+      targetGrams: isRecipe ? 1 : referenceGrams,
       meal: 'Snack',
       date: new Date().toISOString().slice(0, 10),
     })
@@ -114,7 +128,25 @@ export default function FoodLog() {
     setLogging(true)
     setStatus('')
 
-    const { result, referenceGrams, targetGrams, meal, date } = selected
+    const { result, isRecipe, isMeal, referenceGrams, targetGrams, meal, date } = selected
+
+    if (isMeal) {
+      const res = await api(`/meals/${result.id}/log`, {
+        method: 'POST',
+        body: JSON.stringify({ date, meal, combined: true }),
+      })
+      setLogging(false)
+      if (res.ok) {
+        setStatus('logged')
+        setSelected(null)
+        setTimeout(() => setStatus(''), 3000)
+      } else {
+        const data = await res.json().catch(() => ({}))
+        setStatus(data.detail || `Failed (${res.status})`)
+      }
+      return
+    }
+
     const res = await api('/food/log', {
       method: 'POST',
       body: JSON.stringify({
@@ -124,14 +156,16 @@ export default function FoodLog() {
         source: result.source,
         source_id: result.id,
         serving_size: targetGrams,
-        serving_unit: 'g',
+        serving_unit: isRecipe ? 'serving' : 'g',
         calories: extractMacro(result.nutrients, 'calories'),
         protein: extractMacro(result.nutrients, 'protein'),
         carbs: extractMacro(result.nutrients, 'carbs'),
         fat: extractMacro(result.nutrients, 'fat'),
         fiber: extractMacro(result.nutrients, 'fiber'),
         nutrients: result.nutrients,
-        scale_to: { mode: 'grams', from_grams: referenceGrams, to_grams: targetGrams },
+        scale_to: isRecipe
+          ? { mode: 'multiple', servings_requested: targetGrams }
+          : { mode: 'grams', from_grams: referenceGrams, to_grams: targetGrams },
       }),
     })
     setLogging(false)
@@ -145,7 +179,7 @@ export default function FoodLog() {
     }
   }
 
-  const factor = selected ? selected.targetGrams / selected.referenceGrams : 1
+  const factor = selected ? (selected.isRecipe ? selected.targetGrams : selected.targetGrams / selected.referenceGrams) : 1
   const previewCalories = selected
     ? Math.round(extractMacro(selected.result.nutrients, 'calories') * factor)
     : 0
@@ -216,12 +250,15 @@ export default function FoodLog() {
           <CardHeader>
             <CardTitle>{selected.result.name}</CardTitle>
             <CardDescription>
-              Reference: {selected.referenceGrams}g — enter the actual amount you're eating
-              and the nutrients scale automatically
+              {selected.isMeal
+                ? `Logs this meal as one combined entry (${selected.result.item_count ?? ''} items) — explode it later from the diary if you want to edit individual items`
+                : selected.isRecipe
+                ? 'Enter how many servings you\'re eating and the nutrients scale automatically'
+                : `Reference: ${selected.referenceGrams}g — enter the actual amount you're eating and the nutrients scale automatically`}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="grid gap-4 md:grid-cols-3">
+            <div className={cn('grid gap-4', selected.isMeal ? 'md:grid-cols-2' : 'md:grid-cols-3')}>
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-muted-foreground">Date</label>
                 <input
@@ -243,26 +280,33 @@ export default function FoodLog() {
                   ))}
                 </select>
               </div>
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-muted-foreground">Amount (g)</label>
-                <input
-                  type="number"
-                  min="0"
-                  value={selected.targetGrams}
-                  onChange={(e) => setSelected({ ...selected, targetGrams: Number(e.target.value) || 0 })}
-                  className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-                />
-              </div>
+              {!selected.isMeal && (
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-muted-foreground">
+                    {selected.isRecipe ? 'Servings' : 'Amount (g)'}
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    step={selected.isRecipe ? '0.5' : '1'}
+                    value={selected.targetGrams}
+                    onChange={(e) => setSelected({ ...selected, targetGrams: Number(e.target.value) || 0 })}
+                    className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                  />
+                </div>
+              )}
             </div>
 
-            <p className="text-sm text-muted-foreground">
-              ≈ <span className="font-mono text-foreground">{previewCalories} kcal</span> for {selected.targetGrams}g
-            </p>
+            {!selected.isMeal && (
+              <p className="text-sm text-muted-foreground">
+                ≈ <span className="font-mono text-foreground">{previewCalories} kcal</span> for {selected.targetGrams}{selected.isRecipe ? ' serving(s)' : 'g'}
+              </p>
+            )}
 
             <div className="flex items-center gap-3">
               <button
                 onClick={handleLog}
-                disabled={logging || selected.targetGrams <= 0}
+                disabled={logging || (!selected.isMeal && selected.targetGrams <= 0)}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
               >
                 <Plus className="h-4 w-4" />

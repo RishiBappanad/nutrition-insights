@@ -447,12 +447,13 @@ class TestPantryConsumeFlow:
     def test_consume_countable_item_decrements_and_logs_food(self, client, user_token):
         r = client.post("/pantry", headers=auth(user_token), json={
             "food_name": "Consume Test Crackers", "tracking_mode": "countable", "remaining_servings": 5,
+            "calories": 60, "protein": 1, "carbs": 10, "fat": 2, "fiber": 0.5,
+            "nutrients": {"Sodium, Na": {"value": 100, "unit": "mg"}},
         })
         item_id = r.json()["id"]
 
         r2 = client.post(f"/pantry/{item_id}/consume", headers=auth(user_token), json={
-            "servings": 2, "date": TEST_DATE, "meal": "Snack", "calories": 120,
-            "nutrients": {"Sodium, Na": {"value": 200, "unit": "mg"}},
+            "servings": 2, "date": TEST_DATE, "meal": "Snack",
         })
         assert r2.status_code == 200
         body = r2.json()
@@ -464,11 +465,29 @@ class TestPantryConsumeFlow:
         item = [i for i in r3.json()["items"] if i["id"] == item_id][0]
         assert item["remaining_servings"] == 3
 
-        # food_log has the entry with nutrients
+        # food_log has the entry with nutrients SCALED by servings consumed
+        # (stored per-serving on the pantry item, factor=2 for 2 servings)
         r4 = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token))
         entries = [e for e in r4.json()["entries"] if e["food_name"] == "Consume Test Crackers"]
         assert len(entries) == 1
+        assert entries[0]["calories"] == 120
         assert entries[0]["nutrients"]["Sodium, Na"]["value"] == 200
+
+    def test_pantry_item_stores_nutrition_at_add_time(self, client, user_token):
+        """Per explicit user request: pantry must carry nutrition
+        alongside the food/expiration data it already tracks — added
+        via the same POST /pantry contract, not a separate endpoint."""
+        r = client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Nutrition Carrying Item", "tracking_mode": "single",
+            "calories": 250, "protein": 10, "carbs": 30, "fat": 8, "fiber": 3,
+            "nutrients": {"Potassium, K": {"value": 400, "unit": "mg"}},
+        })
+        item_id = r.json()["id"]
+        r2 = client.get("/pantry", headers=auth(user_token))
+        item = [i for i in r2.json()["items"] if i["id"] == item_id][0]
+        assert item["calories"] == 250
+        assert item["protein"] == 10
+        assert item["fiber"] == 3
 
     def test_consume_countable_item_to_exactly_zero_removes_it(self, client, user_token):
         r = client.post("/pantry", headers=auth(user_token), json={
@@ -544,6 +563,66 @@ class TestPantryConsumeFlow:
     def test_finish_unknown_item_404s(self, client, user_token):
         r = client.post("/pantry/999999999/finish", headers=auth(user_token))
         assert r.status_code == 404
+
+
+class TestPantryRemoveServings:
+    """Remove servings from a countable pantry item WITHOUT logging to the
+    diary -- for sharing with someone else, spoilage, etc. Per explicit
+    user request: keep optionality to remove/decrement without forcing a
+    diary log."""
+
+    def test_remove_servings_decrements_without_logging(self, client, user_token):
+        r = client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Shared Snack Box", "tracking_mode": "countable", "remaining_servings": 10,
+            "calories": 100,
+        })
+        item_id = r.json()["id"]
+
+        r2 = client.post(f"/pantry/{item_id}/remove", headers=auth(user_token), json={"servings": 4})
+        assert r2.status_code == 200
+        assert r2.json()["pantry_status"] == "decremented"
+
+        r3 = client.get("/pantry", headers=auth(user_token))
+        item = [i for i in r3.json()["items"] if i["id"] == item_id][0]
+        assert item["remaining_servings"] == 6
+
+        # nothing logged to the diary
+        r4 = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token))
+        assert not any(e["food_name"] == "Shared Snack Box" for e in r4.json()["entries"])
+
+    def test_remove_servings_to_zero_deletes_item(self, client, user_token):
+        r = client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Fully Shared Item", "tracking_mode": "countable", "remaining_servings": 3,
+        })
+        item_id = r.json()["id"]
+
+        r2 = client.post(f"/pantry/{item_id}/remove", headers=auth(user_token), json={"servings": 3})
+        assert r2.json()["pantry_status"] == "removed"
+
+        r3 = client.get("/pantry", headers=auth(user_token))
+        assert item_id not in [i["id"] for i in r3.json()["items"]]
+
+    def test_remove_more_than_remaining_rejected(self, client, user_token):
+        r = client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Small Stock Item", "tracking_mode": "countable", "remaining_servings": 1,
+        })
+        item_id = r.json()["id"]
+
+        r2 = client.post(f"/pantry/{item_id}/remove", headers=auth(user_token), json={"servings": 5})
+        assert r2.status_code == 400
+
+    def test_remove_rejected_for_single_and_bulk_modes(self, client, user_token):
+        r1 = client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Single Mode Item", "tracking_mode": "single",
+        })
+        r2 = client.post(f"/pantry/{r1.json()['id']}/remove", headers=auth(user_token), json={"servings": 1})
+        assert r2.status_code == 400
+
+        r3 = client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Bulk Mode Item", "tracking_mode": "bulk",
+        })
+        r4 = client.post(f"/pantry/{r3.json()['id']}/remove", headers=auth(user_token), json={"servings": 1})
+        assert r4.status_code == 400
 
     def test_consume_does_not_affect_other_users_pantry(self, client, user_token, other_user_token):
         r = client.post("/pantry", headers=auth(user_token), json={

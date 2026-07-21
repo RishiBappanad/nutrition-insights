@@ -37,6 +37,15 @@ class MealRequest(BaseModel):
 class LogMealRequest(BaseModel):
     date: str
     meal: str = "Lunch"
+    combined: bool = False
+    """False (default): log every item individually (Cronometer calls
+    this exploding a meal — the existing behavior, unchanged). True: log
+    the meal as ONE aggregated food_log entry (source='meal',
+    source_id=<meal id>), matching how Cronometer treats a meal as "its
+    own food" until the user explicitly explodes it (see
+    cronometer.com/blog/custom-meals and how-to-recipes — the same
+    explode concept recipes have). A combined entry can later be split
+    into its per-item entries via POST /meals/{id}/explode/{food_log_id}."""
 
 
 def _item_nutrient_rows(item_id: int, nutrients: dict) -> list[tuple]:
@@ -160,17 +169,53 @@ async def delete_meal(meal_id: int, user_id: int = Depends(get_current_user)):
 
 @router.post("/{meal_id}/log")
 async def log_meal(meal_id: int, req: LogMealRequest, user_id: int = Depends(get_current_user)):
-    """Logs every item in the meal as its own food_log entry, all with the
-    same date/meal — a meal is a flat group of real foods logged
-    together, not one aggregated entry like a recipe serving is. This
-    means each item still shows individually in the diary (and can be
-    edited/deleted individually afterward), matching what "log my usual
-    breakfast" actually means to a user."""
+    """
+    Two logging modes (see LogMealRequest.combined docstring):
+
+    combined=false (default): logs every item in the meal as its own
+    food_log entry, all with the same date/meal — matches Cronometer's
+    "exploded" view. Each item still shows individually in the diary and
+    can be edited/deleted independently afterward.
+
+    combined=true: logs the whole meal as ONE aggregated food_log entry
+    (source='meal', source_id=<meal id>) — the meal behaves like its own
+    single food, matching how a recipe serving logs as one entry. Use
+    POST /meals/{meal_id}/explode/{food_log_id} afterward to convert that
+    one entry back into its per-item entries, if wanted later.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         meal, items = await _get_meal_with_items(conn, meal_id, user_id)
         if meal is None:
             raise HTTPException(status_code=404, detail="Meal not found")
+
+        if req.combined:
+            macros = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0, "fiber": 0.0}
+            nutrients: dict = {}
+            for item in items:
+                for k in macros:
+                    macros[k] += item.get(k, 0) or 0
+                for name, info in item.get("nutrients", {}).items():
+                    bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
+                    bucket["value"] += info["value"]
+
+            async with conn.transaction():
+                food_log_id = await conn.fetchval(
+                    """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
+                           serving_size, serving_unit, calories, protein, carbs, fat, fiber, nutrients_json)
+                       VALUES ($1, $2, $3, $4, 'meal', $5, 1, 'meal', $6, $7, $8, $9, $10, $11)
+                       RETURNING id""",
+                    user_id, req.date, req.meal, meal["name"], str(meal_id),
+                    macros["calories"], macros["protein"], macros["carbs"], macros["fat"], macros["fiber"],
+                    json.dumps(nutrients),
+                )
+                nutrient_rows = [(food_log_id, name, info["value"], info["unit"]) for name, info in nutrients.items()]
+                if nutrient_rows:
+                    await conn.executemany(
+                        "INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
+                        nutrient_rows,
+                    )
+            return {"status": "logged", "food_log_ids": [food_log_id], "combined": True}
 
         food_log_ids = []
         async with conn.transaction():
@@ -193,4 +238,57 @@ async def log_meal(meal_id: int, req: LogMealRequest, user_id: int = Depends(get
                         "INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
                         nutrient_rows,
                     )
-    return {"status": "logged", "food_log_ids": food_log_ids}
+    return {"status": "logged", "food_log_ids": food_log_ids, "combined": False}
+
+
+@router.post("/{meal_id}/explode/{food_log_id}")
+async def explode_meal_entry(meal_id: int, food_log_id: int, user_id: int = Depends(get_current_user)):
+    """
+    Convert a combined meal food_log entry (created by
+    POST /meals/{id}/log with combined=true) back into its per-item
+    entries — matches Cronometer's "explode" action on a logged recipe/
+    meal. Deletes the one combined entry and inserts one food_log entry
+    per meal item, using the SAME date/meal the combined entry had.
+
+    404s if food_log_id doesn't exist, isn't owned by this user, isn't
+    source='meal', or doesn't reference this meal_id — exploding the
+    wrong entry (e.g. a different meal's combined log) would silently
+    corrupt an unrelated diary entry, so all four are checked explicitly
+    rather than trusting the caller's meal_id/food_log_id pairing.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        entry = await conn.fetchrow(
+            "SELECT * FROM food_log WHERE id = $1 AND user_id = $2 AND source = 'meal' AND source_id = $3",
+            food_log_id, user_id, str(meal_id),
+        )
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Combined meal entry not found for this meal_id/food_log_id")
+
+        meal, items = await _get_meal_with_items(conn, meal_id, user_id)
+        if meal is None:
+            raise HTTPException(status_code=404, detail="Meal not found")
+
+        food_log_ids = []
+        async with conn.transaction():
+            await conn.execute("DELETE FROM food_log WHERE id = $1", food_log_id)
+            for item in items:
+                new_id = await conn.fetchval(
+                    """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
+                           serving_size, serving_unit, calories, protein, carbs, fat, fiber, nutrients_json)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                       RETURNING id""",
+                    user_id, entry["date"], entry["meal"], item["food_name"], item["source"], item["source_id"],
+                    item["serving_size"], item["serving_unit"], item["calories"], item["protein"],
+                    item["carbs"], item["fat"], item["fiber"], json.dumps(item["nutrients"]),
+                )
+                food_log_ids.append(new_id)
+                nutrient_rows = [
+                    (new_id, name, info["value"], info["unit"]) for name, info in item["nutrients"].items()
+                ]
+                if nutrient_rows:
+                    await conn.executemany(
+                        "INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
+                        nutrient_rows,
+                    )
+    return {"status": "exploded", "food_log_ids": food_log_ids}

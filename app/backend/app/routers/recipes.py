@@ -79,16 +79,21 @@ async def _save_items(conn, recipe_id: int, items: list[RecipeItemRequest]):
 
 @router.post("")
 async def create_recipe(req: RecipeRequest, user_id: int = Depends(get_current_user)):
+    """Delegates to food_entry_contract.import_recipe() — the same shared
+    function any recipe-import source (a future Cronometer recipe
+    importer, once addFood's schema is decoded, or any other source)
+    would call, so this endpoint and every import path share one
+    insert implementation rather than maintaining duplicate logic."""
     if req.servings_per_batch <= 0:
         raise HTTPException(status_code=400, detail="servings_per_batch must be positive")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            recipe_id = await conn.fetchval(
-                "INSERT INTO recipes (user_id, name, servings_per_batch) VALUES ($1, $2, $3) RETURNING id",
-                user_id, req.name, req.servings_per_batch,
-            )
-            await _save_items(conn, recipe_id, req.items)
+    from ..food_entry_contract import RecipeImportContract, RecipeItemContract, import_recipe
+
+    contract = RecipeImportContract(
+        name=req.name,
+        servings_per_batch=req.servings_per_batch,
+        items=[RecipeItemContract(**item.model_dump()) for item in req.items],
+    )
+    recipe_id = await import_recipe(user_id, contract)
     return {"status": "created", "id": recipe_id}
 
 

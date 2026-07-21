@@ -146,10 +146,18 @@ def _parse_amount(amount_str: str) -> tuple[float, str]:
     return size, unit
 
 
-def _servings_row_to_food_log_entry(row: dict) -> dict:
-    """Convert one row of Cronometer's servings CSV into the shape
-    routers/food.py's nutrients_to_rows() and the food_log INSERT already
-    expect — reusing the existing normalization, not reinventing it."""
+def _servings_row_to_food_log_entry(row: dict) -> "FoodLogEntryContract":
+    """Convert one row of Cronometer's servings CSV into a
+    FoodLogEntryContract (see app/food_entry_contract.py) — the same
+    canonical shape POST /food/log's request body uses. This is the
+    decoupling point: this function's only job is "Cronometer CSV row ->
+    the shared contract," nothing here knows about SQL or table
+    structure. The actual write happens via
+    food_entry_contract.log_food_entry(), called from
+    _sync_diary_entries() below — not from here, and not via any direct
+    INSERT in this module."""
+    from ..food_entry_contract import FoodLogEntryContract
+
     macros = {}
     for csv_col, macro_key in _SERVINGS_MACRO_COLUMNS.items():
         val = row.get(csv_col)
@@ -180,23 +188,29 @@ def _servings_row_to_food_log_entry(row: dict) -> dict:
     meal = _MEAL_GROUP_MAP.get((row.get("Group") or "").strip().lower(), row.get("Group") or "Uncategorized")
     serving_size, serving_unit = _parse_amount(row.get("Amount", ""))
 
-    return {
-        "date": row.get("Day", ""),
-        "meal": meal,
-        "food_name": row.get("Food Name", "").strip() or "Unknown",
-        "serving_size": serving_size,
-        "serving_unit": serving_unit,
+    return FoodLogEntryContract(
+        date=row.get("Day", ""),
+        meal=meal,
+        food_name=row.get("Food Name", "").strip() or "Unknown",
+        source="Cronometer",
+        source_id=None,  # Cronometer's servings export has no stable per-serving ID
+        serving_size=serving_size,
+        serving_unit=serving_unit,
+        nutrients=nutrients,
         **macros,
-        "nutrients": nutrients,
-    }
+    )
 
 
 async def _sync_diary_entries(cronometer_files: dict, user_id: int) -> int:
     """
-    Parse the servings export and write each entry into food_log +
-    food_log_nutrients (source='Cronometer'), the same tables TrackStack's
-    own food-logging UI writes into — so a Cronometer-synced entry shows
-    up on the Dashboard's diary exactly like a manually-logged one.
+    Parse the servings export, convert each row to a FoodLogEntryContract
+    (app/food_entry_contract.py), and write it via log_food_entry() — the
+    SAME shared write path POST /food/log uses. This module has zero
+    direct SQL against food_log/food_log_nutrients: parsing (CSV row ->
+    contract) and storage (contract -> database) are fully decoupled, so
+    a future change to how entries are validated/stored applies here
+    automatically, and a future import source only needs to produce a
+    FoodLogEntryContract, not learn the schema.
 
     Duplicate-safe by construction: every sync re-parses the FULL export
     range (export_all_to_files always re-exports from a fixed start date,
@@ -214,9 +228,7 @@ async def _sync_diary_entries(cronometer_files: dict, user_id: int) -> int:
 
     Returns the number of entries imported.
     """
-    from ..db import get_pool
-    from ..routers.food import nutrients_to_rows
-    import json as json_module
+    from ..food_entry_contract import log_food_entry
 
     servings_path = cronometer_files.get("servings")
     if not servings_path:
@@ -225,32 +237,13 @@ async def _sync_diary_entries(cronometer_files: dict, user_id: int) -> int:
     with open(servings_path) as f:
         rows = list(csv.DictReader(f))
 
-    pool = await get_pool()
     count = 0
-    async with pool.acquire() as conn:
-        for raw_row in rows:
-            entry = _servings_row_to_food_log_entry(raw_row)
-            if not entry["date"]:
-                continue
-            async with conn.transaction():
-                food_log_id = await conn.fetchval(
-                    """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                           serving_size, serving_unit, calories, protein, carbs, fat, fiber, nutrients_json)
-                       VALUES ($1, $2, $3, $4, 'Cronometer', NULL, $5, $6, $7, $8, $9, $10, $11, $12)
-                       RETURNING id""",
-                    user_id, entry["date"], entry["meal"], entry["food_name"], entry["serving_size"],
-                    entry["serving_unit"], entry["calories"], entry["protein"], entry["carbs"],
-                    entry["fat"], entry["fiber"], json_module.dumps(entry["nutrients"]),
-                )
-                nutrient_rows = nutrients_to_rows(food_log_id, entry["nutrients"])
-                if nutrient_rows:
-                    await conn.executemany(
-                        """INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit)
-                           VALUES ($1, $2, $3, $4)
-                           ON CONFLICT (food_log_id, nutrient_name) DO UPDATE SET value = EXCLUDED.value, unit = EXCLUDED.unit""",
-                        nutrient_rows,
-                    )
-            count += 1
+    for raw_row in rows:
+        entry = _servings_row_to_food_log_entry(raw_row)
+        if not entry.date:
+            continue
+        await log_food_entry(user_id, entry)
+        count += 1
     return count
 
 

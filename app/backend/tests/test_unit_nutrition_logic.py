@@ -648,45 +648,46 @@ class TestServingsRowToFoodLogEntry:
             "Sodium (mg)": "615.33", "Category": "Fast Foods",
         }
         entry = _servings_row_to_food_log_entry(row)
-        assert entry["date"] == "2026-04-08"
-        assert entry["meal"] == "Lunch"
-        assert entry["food_name"] == "Chick-fil-A, Grilled Nuggets"
-        assert entry["calories"] == 174.39
-        assert entry["protein"] == 30.14
-        assert entry["carbs"] == 1.37
-        assert entry["fat"] == 4.40
-        assert entry["fiber"] == 0.02
-        assert entry["serving_size"] == 12.0
-        assert entry["serving_unit"] == "nugget"
+        assert entry.date == "2026-04-08"
+        assert entry.meal == "Lunch"
+        assert entry.food_name == "Chick-fil-A, Grilled Nuggets"
+        assert entry.source == "Cronometer"
+        assert entry.calories == 174.39
+        assert entry.protein == 30.14
+        assert entry.carbs == 1.37
+        assert entry.fat == 4.40
+        assert entry.fiber == 0.02
+        assert entry.serving_size == 12.0
+        assert entry.serving_unit == "nugget"
 
     def test_extracts_unit_from_nutrient_column_name(self):
         from app.routers.sync import _servings_row_to_food_log_entry
         row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "X", "Amount": "1",
                "Sodium (mg)": "100", "Vitamin C (mg)": "5"}
         entry = _servings_row_to_food_log_entry(row)
-        assert entry["nutrients"]["Sodium (mg)"] == {"value": 100.0, "unit": "mg"}
-        assert entry["nutrients"]["Vitamin C (mg)"] == {"value": 5.0, "unit": "mg"}
+        assert entry.nutrients["Sodium (mg)"] == {"value": 100.0, "unit": "mg"}
+        assert entry.nutrients["Vitamin C (mg)"] == {"value": 5.0, "unit": "mg"}
 
     def test_metadata_columns_excluded_from_nutrients(self):
         from app.routers.sync import _servings_row_to_food_log_entry
         row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "X", "Amount": "1", "Category": "Beverages"}
         entry = _servings_row_to_food_log_entry(row)
-        assert "Category" not in entry["nutrients"]
-        assert "Day" not in entry["nutrients"]
-        assert "Food Name" not in entry["nutrients"]
+        assert "Category" not in entry.nutrients
+        assert "Day" not in entry.nutrients
+        assert "Food Name" not in entry.nutrients
 
     def test_empty_nutrient_values_skipped_not_zeroed(self):
         from app.routers.sync import _servings_row_to_food_log_entry
         row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "X", "Amount": "1", "Oxalate (mg)": ""}
         entry = _servings_row_to_food_log_entry(row)
-        assert "Oxalate (mg)" not in entry["nutrients"]
+        assert "Oxalate (mg)" not in entry.nutrients
 
     def test_missing_macro_columns_default_to_zero(self):
         from app.routers.sync import _servings_row_to_food_log_entry
         row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "X", "Amount": "1"}
         entry = _servings_row_to_food_log_entry(row)
-        assert entry["calories"] == 0.0
-        assert entry["protein"] == 0.0
+        assert entry.calories == 0.0
+        assert entry.protein == 0.0
 
     def test_plural_snacks_group_normalizes_to_snack(self):
         """Real export data uses 'Snacks' (plural) -- confirmed against
@@ -694,14 +695,14 @@ class TestServingsRowToFoodLogEntry:
         from app.routers.sync import _servings_row_to_food_log_entry
         row = {"Day": "2026-01-01", "Group": "Snacks", "Food Name": "X", "Amount": "1"}
         entry = _servings_row_to_food_log_entry(row)
-        assert entry["meal"] == "Snack"
+        assert entry.meal == "Snack"
 
     def test_all_four_standard_meals_normalize_correctly(self):
         from app.routers.sync import _servings_row_to_food_log_entry
         for group, expected in [("breakfast", "Breakfast"), ("LUNCH", "Lunch"), ("Dinner", "Dinner"), ("snack", "Snack")]:
             row = {"Day": "2026-01-01", "Group": group, "Food Name": "X", "Amount": "1"}
             entry = _servings_row_to_food_log_entry(row)
-            assert entry["meal"] == expected
+            assert entry.meal == expected
 
     def test_unrecognized_group_falls_through_as_is(self):
         """A genuinely unmapped Group value (e.g. Cronometer adds a new
@@ -712,13 +713,13 @@ class TestServingsRowToFoodLogEntry:
         from app.routers.sync import _servings_row_to_food_log_entry
         row = {"Day": "2026-01-01", "Group": "SomeNewMealType", "Food Name": "X", "Amount": "1"}
         entry = _servings_row_to_food_log_entry(row)
-        assert entry["meal"] == "SomeNewMealType"
+        assert entry.meal == "SomeNewMealType"
 
     def test_empty_food_name_defaults_to_unknown(self):
         from app.routers.sync import _servings_row_to_food_log_entry
         row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "", "Amount": "1"}
         entry = _servings_row_to_food_log_entry(row)
-        assert entry["food_name"] == "Unknown"
+        assert entry.food_name == "Unknown"
 
 
 class TestParseAmount:
@@ -751,3 +752,47 @@ class TestParseAmount:
     def test_number_with_no_unit_text(self):
         from app.routers.sync import _parse_amount
         assert _parse_amount("2.5") == (2.5, "serving")
+
+
+# ── food_entry_contract.py: shared contract models ──────────────────────────
+
+class TestFoodEntryContractModels:
+    def test_food_log_entry_contract_has_sensible_defaults(self):
+        from app.food_entry_contract import FoodLogEntryContract
+        entry = FoodLogEntryContract(date="2026-01-01", food_name="Test Food")
+        assert entry.meal == "Snack"
+        assert entry.serving_size == 1.0
+        assert entry.serving_unit == "serving"
+        assert entry.calories == 0
+        assert entry.source is None
+        assert entry.nutrients == {}
+
+    def test_food_log_entry_contract_accepts_full_fields(self):
+        from app.food_entry_contract import FoodLogEntryContract
+        entry = FoodLogEntryContract(
+            date="2026-01-01", meal="Lunch", food_name="Chicken", source="Cronometer",
+            source_id=None, serving_size=100, serving_unit="g", calories=200, protein=30,
+            carbs=0, fat=5, fiber=0, nutrients={"Sodium, Na": {"value": 50, "unit": "mg"}},
+        )
+        assert entry.source == "Cronometer"
+        assert entry.nutrients["Sodium, Na"]["value"] == 50
+
+    def test_recipe_import_contract_defaults(self):
+        from app.food_entry_contract import RecipeImportContract
+        recipe = RecipeImportContract(name="Test Recipe")
+        assert recipe.servings_per_batch == 1.0
+        assert recipe.items == []
+
+    def test_recipe_item_contract_nested_in_import_contract(self):
+        from app.food_entry_contract import RecipeImportContract, RecipeItemContract
+        recipe = RecipeImportContract(
+            name="Test Recipe", servings_per_batch=2,
+            items=[RecipeItemContract(food_name="Rice", amount_grams=100, calories=130)],
+        )
+        assert len(recipe.items) == 1
+        assert recipe.items[0].food_name == "Rice"
+
+    def test_nutrients_to_rows_skips_malformed_entries(self):
+        from app.food_entry_contract import _nutrients_to_rows
+        rows = _nutrients_to_rows(1, {"Bad": "not-a-dict", "Good": {"value": 5, "unit": "g"}, "NoValue": {"unit": "g"}})
+        assert rows == [(1, "Good", 5.0, "g")]

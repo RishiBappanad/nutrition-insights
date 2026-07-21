@@ -1,9 +1,9 @@
 """Food search and logging API routes."""
-import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from ..routers.auth import get_current_user
 from ..db import get_pool
 from ..portion_scaling import scale_food_entry
+from ..food_entry_contract import FoodLogEntryContract, log_food_entry, _nutrients_to_rows as nutrients_to_rows
 
 router = APIRouter()
 
@@ -12,14 +12,158 @@ router = APIRouter()
 async def search_food(
     q: str = Query(..., min_length=2),
     sources: str = Query("USDA,CNF"),
+    include_own: bool = Query(True),
     user_id: int = Depends(get_current_user),
 ):
-    """Search foods across USDA and CNF databases."""
+    """
+    Search foods across USDA and CNF databases, AND (by default) the
+    user's own saved recipes AND meals — matching Cronometer's own model,
+    where a recipe/meal is just another searchable, loggable food-like
+    entity (see nutrition-diary-design.md: Cronometer's real /food-search
+    response includes plain foods and recipes together, distinguished by
+    `recipe`/`meal` booleans, not separate searches). Per explicit user
+    steering: both recipes AND meals should be valid food references at
+    every point a plain food is — searchable, loggable to diary, and
+    addable to pantry — without any caller needing special-case logic.
+
+    A recipe result has source="recipe", id=<the recipe's own id>.
+    A meal result has source="meal", id=<the meal's own id>. Both use
+    the same (source, source_id) pair already used everywhere else a
+    food reference is stored (food_log, pantry_items, recipe_items,
+    meal_items) — but they resolve differently when actually LOGGED (see
+    routers/pantry.py's consume flow and the frontend's food-log.jsx):
+    a recipe logs as ONE aggregated food_log entry (scaled by servings),
+    a meal logs as MULTIPLE food_log entries (one per item, at face
+    value, matching POST /meals/{id}/log's existing behavior) — a caller
+    that only ever calls POST /food/log directly (bypassing the
+    recipe/meal-specific log endpoints) will NOT get a meal's per-item
+    breakdown; it should instead call POST /meals/{id}/log for a
+    source="meal" result, the same way the frontend does.
+
+    `include_own=false` restricts to only the external sources (e.g. if
+    a caller specifically wants to exclude the user's own recipes/meals,
+    though no current caller does this).
+    """
     from integrations.food_search import search_foods
 
     source_list = [s.strip() for s in sources.split(",")]
     results = search_foods(q, source_list)
+
+    if include_own:
+        results.extend(await _search_user_recipes(user_id, q))
+        results.extend(await _search_user_meals(user_id, q))
+
     return {"results": results}
+
+
+async def _search_user_recipes(user_id: int, query: str) -> list[dict]:
+    """Match the user's own recipes by name (case-insensitive substring)
+    and shape each as a food-search result — per-serving totals (not
+    batch totals), since logging a recipe from search should default to
+    "1 serving," matching how a plain food search result represents one
+    reference unit."""
+    from .recipes import _get_recipe_with_items, _aggregate_batch_totals
+    from ..portion_scaling import scale_macros, scale_nutrients
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, name, servings_per_batch FROM recipes WHERE user_id = $1 AND name ILIKE $2 ORDER BY name",
+            user_id, f"%{query}%",
+        )
+
+    results = []
+    for row in rows:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            recipe, items = await _get_recipe_with_items(conn, row["id"], user_id)
+        batch = _aggregate_batch_totals(items)
+        factor = 1.0 / recipe["servings_per_batch"]
+        per_serving_macros = scale_macros(batch["macros"], factor)
+        per_serving_nutrients = scale_nutrients(batch["nutrients"], factor)
+        results.append({
+            "source": "recipe",
+            "id": str(recipe["id"]),
+            "name": recipe["name"],
+            "brand": "",
+            "category": "Recipe",
+            "nutrients": {
+                **per_serving_nutrients,
+                # Also expose the 5 macro fields the same way USDA/CNF
+                # results carry them (as nutrient-map entries with
+                # standard names), so downstream extractMacro()-style
+                # helpers on the frontend work identically for a recipe
+                # result as for a plain food result.
+                "Energy": {"value": round(per_serving_macros["calories"]), "unit": "KCAL"},
+                "Protein": {"value": round(per_serving_macros["protein"], 2), "unit": "G"},
+                "Carbohydrate, by difference": {"value": round(per_serving_macros["carbs"], 2), "unit": "G"},
+                "Total lipid (fat)": {"value": round(per_serving_macros["fat"], 2), "unit": "G"},
+                "Fiber, total dietary": {"value": round(per_serving_macros["fiber"], 2), "unit": "G"},
+            },
+            "serving_size": 1,
+            "serving_unit": "serving",
+            "recipe": True,
+            "meal": False,
+            "recipeOrMeal": True,
+        })
+    return results
+
+
+async def _search_user_meals(user_id: int, query: str) -> list[dict]:
+    """Match the user's own meals by name and shape each as a food-search
+    result — SUMMED item totals (no batch division, since meals have no
+    servings-per-batch concept per routers/meals.py's design: a meal
+    always logs at face value). The `meal: True` flag on the result
+    signals to callers that logging this result means calling
+    POST /meals/{id}/log (multiple food_log rows, one per item) rather
+    than POST /food/log directly (which would create a single row with
+    no per-item breakdown) — see search_food()'s docstring."""
+    from .meals import _get_meal_with_items
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, name FROM meals WHERE user_id = $1 AND name ILIKE $2 ORDER BY name",
+            user_id, f"%{query}%",
+        )
+
+    results = []
+    for row in rows:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            meal, items = await _get_meal_with_items(conn, row["id"], user_id)
+
+        macros = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0, "fiber": 0.0}
+        nutrients: dict = {}
+        for item in items:
+            for k in macros:
+                macros[k] += item.get(k, 0) or 0
+            for name, info in item.get("nutrients", {}).items():
+                bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
+                bucket["value"] += info["value"]
+
+        results.append({
+            "source": "meal",
+            "id": str(meal["id"]),
+            "name": meal["name"],
+            "brand": "",
+            "category": "Meal",
+            "nutrients": {
+                **nutrients,
+                "Energy": {"value": round(macros["calories"]), "unit": "KCAL"},
+                "Protein": {"value": round(macros["protein"], 2), "unit": "G"},
+                "Carbohydrate, by difference": {"value": round(macros["carbs"], 2), "unit": "G"},
+                "Total lipid (fat)": {"value": round(macros["fat"], 2), "unit": "G"},
+                "Fiber, total dietary": {"value": round(macros["fiber"], 2), "unit": "G"},
+            },
+            "serving_size": 1,
+            "serving_unit": "meal",
+            "recipe": False,
+            "meal": True,
+            "recipeOrMeal": True,
+            "item_count": len(items),
+        })
+    return results
 
 
 @router.post("/log")
@@ -68,8 +212,13 @@ async def log_food(
         it's a weight).
       - mode="multiple": {"servings_requested": 2} — for foods with no
         gram reference (e.g. "1 jar"), just N of the reference serving.
+
+    The actual storage write goes through food_entry_contract.log_food_entry()
+    — the same shared function any import source (Cronometer sync, a
+    future importer) uses, so this endpoint and every sync path stay
+    behaviorally identical rather than maintaining two copies of the
+    insert logic.
     """
-    pool = await get_pool()
     nutrients: dict = entry.get("nutrients") or {}
     macros = {
         "calories": entry.get("calories", 0),
@@ -95,65 +244,23 @@ async def log_food(
         macros = scaled["macros"]
         nutrients = scaled["nutrients"]
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            food_log_id = await conn.fetchval(
-                """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                   serving_size, serving_unit, calories, protein, carbs, fat, fiber, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-                   RETURNING id""",
-                user_id,
-                entry.get("date"),
-                entry.get("meal", "Snack"),
-                entry.get("food_name"),
-                entry.get("source"),
-                entry.get("source_id"),
-                entry.get("serving_size", 1.0),
-                entry.get("serving_unit", "serving"),
-                macros["calories"],
-                macros["protein"],
-                macros["carbs"],
-                macros["fat"],
-                macros["fiber"],
-                json.dumps(nutrients),
-            )
-
-            rows = nutrients_to_rows(food_log_id, nutrients)
-            if rows:
-                await conn.executemany(
-                    """INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit)
-                       VALUES ($1, $2, $3, $4)
-                       ON CONFLICT (food_log_id, nutrient_name) DO UPDATE SET value = EXCLUDED.value, unit = EXCLUDED.unit""",
-                    rows,
-                )
-
+    contract_entry = FoodLogEntryContract(
+        date=entry.get("date"),
+        meal=entry.get("meal", "Snack"),
+        food_name=entry.get("food_name"),
+        source=entry.get("source"),
+        source_id=entry.get("source_id"),
+        serving_size=entry.get("serving_size", 1.0),
+        serving_unit=entry.get("serving_unit", "serving"),
+        calories=macros["calories"],
+        protein=macros["protein"],
+        carbs=macros["carbs"],
+        fat=macros["fat"],
+        fiber=macros["fiber"],
+        nutrients=nutrients,
+    )
+    food_log_id = await log_food_entry(user_id, contract_entry)
     return {"status": "logged", "id": food_log_id}
-
-
-def nutrients_to_rows(food_log_id: int, nutrients: dict) -> list[tuple]:
-    """Normalize the request body's `nutrients` dict into
-    (food_log_id, nutrient_name, value, unit) rows for food_log_nutrients.
-    Skips entries missing a numeric value rather than raising, since food
-    search results can legitimately have gaps in nutrient coverage per
-    food item (USDA/CNF don't guarantee every nutrient is reported for
-    every food).
-
-    Shared utility — also used by routers/pantry.py's consume flow, which
-    needs the identical nutrient-normalization logic when it creates a
-    food_log entry on the caller's behalf."""
-    rows = []
-    for name, info in nutrients.items():
-        if not isinstance(info, dict):
-            continue
-        value = info.get("value")
-        if value is None:
-            continue
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            continue
-        rows.append((food_log_id, name, value, info.get("unit", "")))
-    return rows
 
 
 @router.get("/log")

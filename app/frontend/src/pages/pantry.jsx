@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
-import { Plus, Trash2, CheckCheck, AlertTriangle, X, Refrigerator } from 'lucide-react'
+import { Plus, Trash2, CheckCheck, AlertTriangle, X, Refrigerator, Share2 } from 'lucide-react'
 
 const MACRO_NUTRIENT_NAMES = {
   calories: { name: 'Energy', unit: 'KCAL' },
@@ -34,6 +34,7 @@ export default function Pantry() {
   const [loading, setLoading] = useState(true)
   const [showAdd, setShowAdd] = useState(false)
   const [consumingId, setConsumingId] = useState(null)
+  const [removingId, setRemovingId] = useState(null)
   const [expiringOnly, setExpiringOnly] = useState(false)
   const [expiringItems, setExpiringItems] = useState(null)
 
@@ -117,6 +118,9 @@ export default function Pantry() {
               isConsuming={consumingId === item.id}
               onConsumeClick={() => setConsumingId(consumingId === item.id ? null : item.id)}
               onConsumed={() => { setConsumingId(null); refresh() }}
+              isRemoving={removingId === item.id}
+              onRemoveClick={() => setRemovingId(removingId === item.id ? null : item.id)}
+              onRemoved={() => { setRemovingId(null); refresh() }}
               onFinish={() => handleFinish(item.id)}
               onDelete={() => handleDelete(item.id)}
             />
@@ -127,7 +131,7 @@ export default function Pantry() {
   )
 }
 
-function PantryItemRow({ item, isConsuming, onConsumeClick, onConsumed, onFinish, onDelete }) {
+function PantryItemRow({ item, isConsuming, onConsumeClick, onConsumed, isRemoving, onRemoveClick, onRemoved, onFinish, onDelete }) {
   const isExpiringSoon = item.expiration_date && new Date(item.expiration_date) <= new Date(Date.now() + 7 * 86400000)
 
   return (
@@ -167,6 +171,16 @@ function PantryItemRow({ item, isConsuming, onConsumeClick, onConsumed, onFinish
                 Log & Consume
               </button>
             )}
+            {item.tracking_mode === 'countable' && (
+              <button
+                onClick={onRemoveClick}
+                title="Remove servings without logging (e.g. shared with someone)"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors"
+              >
+                <Share2 className="h-3.5 w-3.5" />
+                Remove
+              </button>
+            )}
             <button onClick={onDelete} title="Remove without logging" className="p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors">
               <Trash2 className="h-3.5 w-3.5" />
             </button>
@@ -174,8 +188,66 @@ function PantryItemRow({ item, isConsuming, onConsumeClick, onConsumed, onFinish
         </div>
 
         {isConsuming && <ConsumeForm item={item} onDone={onConsumed} onCancel={onConsumeClick} />}
+        {isRemoving && <RemoveServingsForm item={item} onDone={onRemoved} onCancel={onRemoveClick} />}
       </CardContent>
     </Card>
+  )
+}
+
+function RemoveServingsForm({ item, onDone, onCancel }) {
+  const [servings, setServings] = useState(1)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+
+  async function handleSubmit() {
+    setSubmitting(true)
+    setError('')
+    const res = await api(`/pantry/${item.id}/remove`, {
+      method: 'POST',
+      body: JSON.stringify({ servings: Number(servings) }),
+    })
+    setSubmitting(false)
+    if (res.ok) {
+      onDone()
+    } else {
+      const data = await res.json().catch(() => ({}))
+      setError(data.detail || `Failed (${res.status})`)
+    }
+  }
+
+  return (
+    <div className="mt-3 pt-3 border-t border-border space-y-3">
+      <p className="text-xs text-muted-foreground">
+        Takes servings out of the pantry without logging anything to your diary — for sharing, spoilage, etc.
+      </p>
+      <div className="flex items-center gap-3">
+        <div className="space-y-1.5">
+          <label className="text-xs font-medium text-muted-foreground">Servings ({item.remaining_servings} available)</label>
+          <input
+            type="number"
+            min="0"
+            max={item.remaining_servings}
+            step="0.5"
+            value={servings}
+            onChange={(e) => setServings(e.target.value)}
+            className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+          />
+        </div>
+      </div>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={handleSubmit}
+          disabled={submitting}
+          className="px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+        >
+          {submitting ? 'Removing...' : 'Confirm'}
+        </button>
+        <button onClick={onCancel} className="px-4 py-2 rounded-md border border-border text-sm font-medium text-muted-foreground hover:bg-muted transition-colors">
+          Cancel
+        </button>
+        {error && <span className="text-sm text-destructive">{error}</span>}
+      </div>
+    </div>
   )
 }
 
@@ -189,11 +261,9 @@ function ConsumeForm({ item, onDone, onCancel }) {
   async function handleSubmit() {
     setSubmitting(true)
     setError('')
-    // The pantry item doesn't store its own nutrition data (design doc:
-    // it resolves back to the same USDA/CNF food entry) -- without a
-    // cached nutrient payload from when the item was added, this consume
-    // action logs 0 macros/nutrients rather than fabricating values.
-    // A future improvement could re-fetch by source/source_id here.
+    // Nutrition is now stored on the pantry item itself (see
+    // routers/pantry.py) and scaled server-side by `servings` -- no
+    // macro/nutrient payload needed here anymore.
     const res = await api(`/pantry/${item.id}/consume`, {
       method: 'POST',
       body: JSON.stringify({ servings: Number(servings), date, meal }),
@@ -260,8 +330,10 @@ function AddItemForm({ onDone, onCancel }) {
   const [sourceId, setSourceId] = useState(null)
   const [trackingMode, setTrackingMode] = useState('countable')
   const [remainingServings, setRemainingServings] = useState(1)
+  const [servingSize, setServingSize] = useState(1)
   const [servingUnit, setServingUnit] = useState('serving')
   const [expirationDate, setExpirationDate] = useState('')
+  const [nutrition, setNutrition] = useState(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
@@ -286,10 +358,22 @@ function AddItemForm({ onDone, onCancel }) {
   }, [query])
 
   function selectResult(r) {
+    // Store nutrition PER the result's own reference serving (serving_size/
+    // serving_unit) alongside the pantry item -- so /consume and /remove
+    // never need this data resupplied later (see routers/pantry.py).
     setFoodName(r.name)
     setSource(r.source)
     setSourceId(r.id)
+    setServingSize(r.serving_size || 100)
     setServingUnit(r.serving_unit || 'g')
+    setNutrition({
+      calories: extractMacro(r.nutrients, 'calories'),
+      protein: extractMacro(r.nutrients, 'protein'),
+      carbs: extractMacro(r.nutrients, 'carbs'),
+      fat: extractMacro(r.nutrients, 'fat'),
+      fiber: extractMacro(r.nutrients, 'fiber'),
+      nutrients: r.nutrients,
+    })
     setQuery('')
     setResults([])
   }
@@ -310,10 +394,17 @@ function AddItemForm({ onDone, onCancel }) {
       body: JSON.stringify({
         food_name: foodName,
         source, source_id: sourceId,
+        serving_size: servingSize,
         serving_unit: servingUnit,
         tracking_mode: trackingMode,
         remaining_servings: trackingMode === 'countable' ? Number(remainingServings) : null,
         expiration_date: expirationDate || null,
+        calories: nutrition?.calories || 0,
+        protein: nutrition?.protein || 0,
+        carbs: nutrition?.carbs || 0,
+        fat: nutrition?.fat || 0,
+        fiber: nutrition?.fiber || 0,
+        nutrients: nutrition?.nutrients || {},
       }),
     })
     setSaving(false)

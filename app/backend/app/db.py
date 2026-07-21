@@ -110,6 +110,12 @@ async def init_db():
                 nutrients_json TEXT
             );
 
+            -- Additive column for the TrackStack -> Cronometer push sync
+            -- pointer (cronometer_sync_state.last_pushed_at) to find
+            -- entries created since the last push -- food_log predates
+            -- this feature and had no creation timestamp at all.
+            ALTER TABLE food_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
             -- Normalized per-nutrient breakdown for a food_log entry.
             -- Replaces relying on nutrients_json (write-only, never read back
             -- structured) so per-nutrient daily totals can be aggregated with
@@ -227,9 +233,18 @@ async def init_db():
             -- 'bulk' (presence-only, until explicitly marked finished),
             -- 'single' (one item, no partial state — consuming it deletes
             -- the row outright). Links to the same food database food_log
-            -- uses (source/source_id) so nutrition info is never
-            -- re-entered; a pantry item is inventory metadata, not its own
-            -- nutrient-storage subject.
+            -- uses (source/source_id) so a pantry item never duplicates a
+            -- food's canonical definition elsewhere -- but it DOES store
+            -- its own nutrition data (calories/protein/carbs/fat/fiber +
+            -- pantry_item_nutrients below), PER serving_size/serving_unit,
+            -- the same "reference amount + scale by count" convention
+            -- custom_foods uses. This was NOT true originally (a pantry
+            -- item stored zero nutrition, relying on the caller to
+            -- resupply it at /consume time, which the frontend never did
+            -- -- consuming anything silently logged 0 macros to the
+            -- diary). Fixed per explicit user request: removing/eating a
+            -- pantry item must reflect real nutrition in the diary
+            -- without the caller re-entering it.
             CREATE TABLE IF NOT EXISTS pantry_items (
                 id SERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
@@ -242,13 +257,41 @@ async def init_db():
                 remaining_servings DOUBLE PRECISION,
                 is_finished BOOLEAN NOT NULL DEFAULT FALSE,
                 expiration_date TEXT,
+                calories DOUBLE PRECISION DEFAULT 0,
+                protein DOUBLE PRECISION DEFAULT 0,
+                carbs DOUBLE PRECISION DEFAULT 0,
+                fat DOUBLE PRECISION DEFAULT 0,
+                fiber DOUBLE PRECISION DEFAULT 0,
+                nutrients_json TEXT,
                 added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
 
+            -- pantry_items predates the nutrition columns above -- ALTER
+            -- needed since CREATE TABLE IF NOT EXISTS is a no-op against
+            -- an already-existing table (learned the hard way earlier
+            -- this project via the user_preferences columns bug).
+            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS calories DOUBLE PRECISION DEFAULT 0;
+            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS protein DOUBLE PRECISION DEFAULT 0;
+            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS carbs DOUBLE PRECISION DEFAULT 0;
+            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS fat DOUBLE PRECISION DEFAULT 0;
+            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS fiber DOUBLE PRECISION DEFAULT 0;
+            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS nutrients_json TEXT;
+
             CREATE INDEX IF NOT EXISTS idx_pantry_items_user ON pantry_items(user_id);
             CREATE INDEX IF NOT EXISTS idx_pantry_items_expiration ON pantry_items(user_id, expiration_date)
                 WHERE expiration_date IS NOT NULL;
+
+            -- Mirrors custom_food_nutrients/food_log_nutrients -- one row
+            -- per (pantry_item, nutrient), PER serving_size/serving_unit,
+            -- instead of only relying on the nutrients_json cache column.
+            CREATE TABLE IF NOT EXISTS pantry_item_nutrients (
+                pantry_item_id INTEGER NOT NULL REFERENCES pantry_items(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
+                nutrient_name TEXT NOT NULL,
+                value DOUBLE PRECISION NOT NULL,
+                unit TEXT NOT NULL,
+                PRIMARY KEY (pantry_item_id, nutrient_name)
+            );
 
             -- User-defined foods with manually entered nutrients. Slots
             -- into the exact same "food reference" shape USDA/CNF results
@@ -398,6 +441,29 @@ async def init_db():
             -- ALTER TABLE the first time they're introduced.
             ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS unit_system TEXT;
             ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS macro_chart_style TEXT;
+
+            -- Two independent sync pointers, per user, for the two-way
+            -- Cronometer sync: last_pulled_at tracks how far the
+            -- Cronometer -> TrackStack diary import has progressed (used
+            -- to only import entries newer than the last successful
+            -- sync, instead of re-parsing the full export range every
+            -- time -- fixes the duplicate-import issue flagged when the
+            -- read path was first built). last_pushed_at tracks how far
+            -- the TrackStack -> Cronometer push has progressed (used to
+            -- find food_log entries logged since the last push that
+            -- still need to go to Cronometer). Deliberately two separate
+            -- timestamps, not one shared pointer -- the two directions
+            -- run independently and can succeed/fail on different
+            -- schedules (e.g. a pull succeeds but a push fails, or vice
+            -- versa), so conflating them into one pointer would silently
+            -- skip or re-process entries in whichever direction didn't
+            -- actually run.
+            CREATE TABLE IF NOT EXISTS cronometer_sync_state (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
+                last_pulled_at TIMESTAMPTZ,
+                last_pushed_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
         """)
 
 
