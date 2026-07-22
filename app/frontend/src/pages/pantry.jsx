@@ -1,8 +1,11 @@
 import { useState, useEffect } from 'react'
+import { Link } from 'wouter'
 import { api } from '@/lib/api'
+import { usePendingAction } from '@/lib/pending-action'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
-import { Plus, Trash2, CheckCheck, AlertTriangle, X, Refrigerator, Share2 } from 'lucide-react'
+import { Plus, Trash2, CheckCheck, AlertTriangle, X, Refrigerator, Share2, ChefHat, ChevronDown, ChevronRight } from 'lucide-react'
+import { todayIso } from '@/lib/dates'
 
 const MACRO_NUTRIENT_NAMES = {
   calories: { name: 'Energy', unit: 'KCAL' },
@@ -37,6 +40,13 @@ export default function Pantry() {
   const [removingId, setRemovingId] = useState(null)
   const [expiringOnly, setExpiringOnly] = useState(false)
   const [expiringItems, setExpiringItems] = useState(null)
+  // Items with a buffered (not-yet-committed) removal/finish/delete/
+  // consume action -- hidden from the list immediately (optimistic),
+  // matching what the user just did, even though the real API call is
+  // still buffered by the toast (see lib/pending-action.jsx) and hasn't
+  // actually run yet.
+  const [pendingHiddenIds, setPendingHiddenIds] = useState(new Set())
+  const bufferAction = usePendingAction()
 
   function refresh() {
     setLoading(true)
@@ -57,17 +67,44 @@ export default function Pantry() {
     setExpiringOnly(!expiringOnly)
   }
 
-  async function handleFinish(id) {
-    await api(`/pantry/${id}/finish`, { method: 'POST' })
-    refresh()
+  function hideOptimistically(id) {
+    setPendingHiddenIds((prev) => new Set(prev).add(id))
   }
 
-  async function handleDelete(id) {
-    await api(`/pantry/${id}`, { method: 'DELETE' })
-    refresh()
+  function unhide(id) {
+    setPendingHiddenIds((prev) => {
+      const next = new Set(prev)
+      next.delete(id)
+      return next
+    })
   }
 
-  const visibleItems = expiringOnly ? items.filter((i) => expiringItems?.has(i.id)) : items
+  function handleFinish(item) {
+    hideOptimistically(item.id)
+    bufferAction(
+      `Finished ${item.food_name}`,
+      async () => {
+        await api(`/pantry/${item.id}/finish`, { method: 'POST' })
+        refresh()
+      },
+      () => unhide(item.id),
+    )
+  }
+
+  function handleDelete(item) {
+    hideOptimistically(item.id)
+    bufferAction(
+      `Removed ${item.food_name}`,
+      async () => {
+        await api(`/pantry/${item.id}`, { method: 'DELETE' })
+        refresh()
+      },
+      () => unhide(item.id),
+    )
+  }
+
+  const visibleItems = (expiringOnly ? items.filter((i) => expiringItems?.has(i.id)) : items)
+    .filter((i) => !pendingHiddenIds.has(i.id))
 
   return (
     <div className="space-y-6">
@@ -98,6 +135,8 @@ export default function Pantry() {
         {expiringOnly ? 'Showing expiring soon (7 days)' : 'Show expiring soon'}
       </button>
 
+      <MakeRecipeFromPantry />
+
       {showAdd && <AddItemForm onDone={() => { setShowAdd(false); refresh() }} onCancel={() => setShowAdd(false)} />}
 
       {loading ? (
@@ -121,8 +160,8 @@ export default function Pantry() {
               isRemoving={removingId === item.id}
               onRemoveClick={() => setRemovingId(removingId === item.id ? null : item.id)}
               onRemoved={() => { setRemovingId(null); refresh() }}
-              onFinish={() => handleFinish(item.id)}
-              onDelete={() => handleDelete(item.id)}
+              onFinish={() => handleFinish(item)}
+              onDelete={() => handleDelete(item)}
             />
           ))}
         </div>
@@ -196,23 +235,33 @@ function PantryItemRow({ item, isConsuming, onConsumeClick, onConsumed, isRemovi
 
 function RemoveServingsForm({ item, onDone, onCancel }) {
   const [servings, setServings] = useState(1)
-  const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const bufferAction = usePendingAction()
 
-  async function handleSubmit() {
-    setSubmitting(true)
-    setError('')
-    const res = await api(`/pantry/${item.id}/remove`, {
-      method: 'POST',
-      body: JSON.stringify({ servings: Number(servings) }),
-    })
-    setSubmitting(false)
-    if (res.ok) {
-      onDone()
-    } else {
-      const data = await res.json().catch(() => ({}))
-      setError(data.detail || `Failed (${res.status})`)
+  function handleSubmit() {
+    const n = Number(servings)
+    if (!n || n <= 0) {
+      setError('Enter a positive amount')
+      return
     }
+    if (n > item.remaining_servings) {
+      setError(`Only ${item.remaining_servings} available`)
+      return
+    }
+    setError('')
+    // Buffered: closes the form immediately (matches the user's intent
+    // right away), but the real POST /pantry/{id}/remove call is
+    // deferred until the toast's window elapses or the user navigates
+    // away -- Undo on the toast means this never actually happens.
+    // onDone (passed in) already triggers a refresh, but that refresh
+    // runs BEFORE the buffered call actually lands -- refresh again
+    // inside commit so the UI reflects the real decrement once it
+    // actually happens, not just once the form closes.
+    bufferAction(`Removed ${n} ${item.serving_unit} of ${item.food_name}`, async () => {
+      await api(`/pantry/${item.id}/remove`, { method: 'POST', body: JSON.stringify({ servings: n }) })
+      onDone()
+    })
+    onCancel() // close the form without the immediate refresh onDone would also trigger
   }
 
   return (
@@ -237,10 +286,9 @@ function RemoveServingsForm({ item, onDone, onCancel }) {
       <div className="flex items-center gap-3">
         <button
           onClick={handleSubmit}
-          disabled={submitting}
-          className="px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+          className="px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
         >
-          {submitting ? 'Removing...' : 'Confirm'}
+          Confirm
         </button>
         <button onClick={onCancel} className="px-4 py-2 rounded-md border border-border text-sm font-medium text-muted-foreground hover:bg-muted transition-colors">
           Cancel
@@ -254,27 +302,35 @@ function RemoveServingsForm({ item, onDone, onCancel }) {
 function ConsumeForm({ item, onDone, onCancel }) {
   const [servings, setServings] = useState(item.tracking_mode === 'single' ? 1 : 1)
   const [meal, setMeal] = useState('Snack')
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10))
-  const [submitting, setSubmitting] = useState(false)
+  const [date, setDate] = useState(todayIso())
   const [error, setError] = useState('')
+  const bufferAction = usePendingAction()
 
-  async function handleSubmit() {
-    setSubmitting(true)
-    setError('')
-    // Nutrition is now stored on the pantry item itself (see
-    // routers/pantry.py) and scaled server-side by `servings` -- no
-    // macro/nutrient payload needed here anymore.
-    const res = await api(`/pantry/${item.id}/consume`, {
-      method: 'POST',
-      body: JSON.stringify({ servings: Number(servings), date, meal }),
-    })
-    setSubmitting(false)
-    if (res.ok) {
-      onDone()
-    } else {
-      const data = await res.json().catch(() => ({}))
-      setError(data.detail || `Failed (${res.status})`)
+  function handleSubmit() {
+    const n = Number(servings)
+    if (!n || n <= 0) {
+      setError('Enter a positive amount')
+      return
     }
+    if (item.tracking_mode === 'countable' && n > item.remaining_servings) {
+      setError(`Only ${item.remaining_servings} available`)
+      return
+    }
+    setError('')
+    // Buffered: closes the form immediately, but the real
+    // POST /pantry/{id}/consume call (which both logs to the diary AND
+    // decrements the pantry item) is deferred -- Undo means neither the
+    // diary entry nor the decrement ever happens. Nutrition is read
+    // from the pantry item server-side (see routers/pantry.py), no
+    // macro/nutrient payload needed here.
+    bufferAction(`Logged ${n} ${item.serving_unit} of ${item.food_name} to ${meal}`, async () => {
+      await api(`/pantry/${item.id}/consume`, {
+        method: 'POST',
+        body: JSON.stringify({ servings: n, date, meal }),
+      })
+      onDone()
+    })
+    onCancel()
   }
 
   return (
@@ -310,10 +366,9 @@ function ConsumeForm({ item, onDone, onCancel }) {
       <div className="flex items-center gap-3">
         <button
           onClick={handleSubmit}
-          disabled={submitting}
-          className="px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+          className="px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
         >
-          {submitting ? 'Logging...' : 'Confirm'}
+          Confirm
         </button>
         <button onClick={onCancel} className="px-4 py-2 rounded-md border border-border text-sm font-medium text-muted-foreground hover:bg-muted transition-colors">
           Cancel
@@ -321,6 +376,137 @@ function ConsumeForm({ item, onDone, onCancel }) {
         {error && <span className="text-sm text-destructive">{error}</span>}
       </div>
     </div>
+  )
+}
+
+function MakeRecipeFromPantry() {
+  // Pantry-driven entry point into the SAME "make a recipe" flow the
+  // recipe detail page has -- per explicit user request: someone
+  // looking at their pantry should be able to jump straight to "what
+  // can I make with what I already have," not just discover it from
+  // the recipes page. Reuses GET /recipes/{id}/can-make and
+  // POST /recipes/{id}/make exactly, no separate backend logic --
+  // this is purely a different UI entry point onto existing endpoints.
+  const [expanded, setExpanded] = useState(false)
+  const [recipes, setRecipes] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const [checks, setChecks] = useState({}) // recipeId -> can-make result
+  const [makingId, setMakingId] = useState(null)
+  const [status, setStatus] = useState('')
+
+  async function load() {
+    if (loaded) return
+    setLoading(true)
+    const res = await api('/recipes')
+    const data = await res.json()
+    const list = data.recipes || []
+    setRecipes(list)
+    setLoaded(true)
+    setLoading(false)
+
+    // Check every recipe against the pantry up front -- this is the
+    // whole point of a pantry-driven view: show what's makeable RIGHT
+    // NOW without the user having to open each recipe individually.
+    const results = await Promise.all(
+      list.map((r) => api(`/recipes/${r.id}/can-make`).then((res) => res.json()))
+    )
+    const byId = {}
+    results.forEach((r) => { byId[r.recipe_id] = r })
+    setChecks(byId)
+  }
+
+  function toggle() {
+    setExpanded((e) => !e)
+    if (!expanded) load()
+  }
+
+  async function handleMake(recipeId) {
+    setMakingId(recipeId)
+    setStatus('')
+    const res = await api(`/recipes/${recipeId}/make`, { method: 'POST' })
+    setMakingId(null)
+    if (res.ok) {
+      const data = await res.json()
+      setStatus(`Added ${data.servings_added} servings to your pantry`)
+      setLoaded(false)
+      load() // pantry state changed for every recipe's ingredients, not just this one
+      setTimeout(() => setStatus(''), 4000)
+    } else {
+      const data = await res.json().catch(() => ({}))
+      const detail = data.detail
+      setStatus(typeof detail === 'object' ? detail.message : detail || `Failed (${res.status})`)
+    }
+  }
+
+  const makeable = recipes.filter((r) => checks[r.id]?.can_make)
+  const notMakeable = recipes.filter((r) => checks[r.id] && !checks[r.id].can_make)
+
+  return (
+    <Card>
+      <CardHeader className="cursor-pointer" onClick={toggle}>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <ChefHat className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-sm font-medium">Make a Recipe from Your Pantry</CardTitle>
+          </div>
+          {expanded ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
+        </div>
+      </CardHeader>
+      {expanded && (
+        <CardContent className="space-y-3">
+          {loading ? (
+            <p className="text-sm text-muted-foreground">Checking your recipes against your pantry...</p>
+          ) : recipes.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No recipes yet. <Link href="/recipes"><span className="text-primary underline cursor-pointer">Create one</span></Link> to see what you can make from your pantry.
+            </p>
+          ) : (
+            <>
+              {makeable.length === 0 && notMakeable.length === 0 && (
+                <p className="text-sm text-muted-foreground">Checking...</p>
+              )}
+              {makeable.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-emerald-500">You can make right now:</p>
+                  {makeable.map((r) => (
+                    <div key={r.id} className="flex items-center justify-between gap-3 px-3 py-2 rounded-md border border-emerald-500/30 bg-emerald-500/5">
+                      <div>
+                        <p className="text-sm font-medium text-foreground">{r.name}</p>
+                        <p className="text-xs text-muted-foreground">{r.servings_per_batch} servings per batch</p>
+                      </div>
+                      <button
+                        onClick={() => handleMake(r.id)}
+                        disabled={makingId === r.id}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors flex-shrink-0"
+                      >
+                        {makingId === r.id ? 'Making...' : 'Make It'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {notMakeable.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-muted-foreground">Missing ingredients for:</p>
+                  {notMakeable.map((r) => (
+                    <Link key={r.id} href="/recipes">
+                      <div className="px-3 py-2 rounded-md border border-border hover:bg-muted transition-colors cursor-pointer">
+                        <p className="text-sm text-foreground">{r.name}</p>
+                        <p className="text-xs text-muted-foreground">
+                          Missing: {checks[r.id].missing.map((m) => m.food_name).join(', ') || 'unmatchable ingredients'}
+                        </p>
+                      </div>
+                    </Link>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+          {status && <p className="text-sm text-emerald-500">{status}</p>}
+        </CardContent>
+      )}
+    </Card>
   )
 }
 

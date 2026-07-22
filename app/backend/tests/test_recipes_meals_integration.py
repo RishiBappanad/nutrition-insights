@@ -329,6 +329,162 @@ class TestRecipePantryIntegration:
         assert r2.json()["can_make"] is False
 
 
+class TestMakeRecipe:
+    """POST /recipes/{id}/make -- per explicit user request: making a
+    recipe decrements the pantry ingredients used, then adds the
+    FINISHED BATCH itself to the pantry (not straight to the diary --
+    a cooked batch usually isn't eaten all at once)."""
+
+    def test_make_recipe_decrements_countable_ingredient(self, client, user_token):
+        client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Rice Bag", "source": "USDA", "source_id": "make-rice-1",
+            "tracking_mode": "countable", "remaining_servings": 10,
+        })
+        r = client.post("/recipes", headers=auth(user_token), json={
+            "name": "Rice Bowl", "servings_per_batch": 2,
+            "items": [{"food_name": "Rice", "source": "USDA", "source_id": "make-rice-1", "amount_multiple": 3}],
+        })
+        recipe_id = r.json()["id"]
+
+        r2 = client.post(f"/recipes/{recipe_id}/make", headers=auth(user_token))
+        assert r2.status_code == 200
+        body = r2.json()
+        assert body["servings_added"] == 2
+
+        r3 = client.get("/pantry", headers=auth(user_token))
+        rice = next(i for i in r3.json()["items"] if i["source_id"] == "make-rice-1")
+        assert rice["remaining_servings"] == 7  # 10 - 3
+
+    def test_make_recipe_removes_countable_ingredient_at_zero(self, client, user_token):
+        client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Last Eggs", "source": "USDA", "source_id": "make-eggs-1",
+            "tracking_mode": "countable", "remaining_servings": 2,
+        })
+        r = client.post("/recipes", headers=auth(user_token), json={
+            "name": "Omelette", "servings_per_batch": 1,
+            "items": [{"food_name": "Eggs", "source": "USDA", "source_id": "make-eggs-1", "amount_multiple": 2}],
+        })
+        recipe_id = r.json()["id"]
+
+        client.post(f"/recipes/{recipe_id}/make", headers=auth(user_token))
+
+        r2 = client.get("/pantry", headers=auth(user_token))
+        assert not any(i["source_id"] == "make-eggs-1" for i in r2.json()["items"])
+
+    def test_make_recipe_removes_single_ingredient_entirely(self, client, user_token):
+        client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "One Onion", "source": "USDA", "source_id": "make-onion-1",
+            "tracking_mode": "single",
+        })
+        r = client.post("/recipes", headers=auth(user_token), json={
+            "name": "Onion Soup", "servings_per_batch": 1,
+            "items": [{"food_name": "Onion", "source": "USDA", "source_id": "make-onion-1"}],
+        })
+        recipe_id = r.json()["id"]
+
+        client.post(f"/recipes/{recipe_id}/make", headers=auth(user_token))
+
+        r2 = client.get("/pantry", headers=auth(user_token))
+        assert not any(i["source_id"] == "make-onion-1" for i in r2.json()["items"])
+
+    def test_make_recipe_never_decrements_bulk_ingredient(self, client, user_token):
+        client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Salt Jar", "source": "USDA", "source_id": "make-salt-1",
+            "tracking_mode": "bulk",
+        })
+        r = client.post("/recipes", headers=auth(user_token), json={
+            "name": "Salted Dish", "servings_per_batch": 1,
+            "items": [{"food_name": "Salt", "source": "USDA", "source_id": "make-salt-1"}],
+        })
+        recipe_id = r.json()["id"]
+
+        client.post(f"/recipes/{recipe_id}/make", headers=auth(user_token))
+
+        r2 = client.get("/pantry", headers=auth(user_token))
+        salt = next(i for i in r2.json()["items"] if i["source_id"] == "make-salt-1")
+        assert salt["tracking_mode"] == "bulk"  # still present, untouched
+
+    def test_make_recipe_adds_finished_batch_to_pantry_not_diary(self, client, user_token):
+        client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Flour Bag", "source": "USDA", "source_id": "make-flour-1",
+            "tracking_mode": "countable", "remaining_servings": 5,
+        })
+        r = client.post("/recipes", headers=auth(user_token), json={
+            "name": "Bread Loaf", "servings_per_batch": 4,
+            "items": [{
+                "food_name": "Flour", "source": "USDA", "source_id": "make-flour-1", "amount_multiple": 2,
+                "calories": 100, "protein": 3, "carbs": 20, "fat": 1, "fiber": 1,
+            }],
+        })
+        recipe_id = r.json()["id"]
+
+        r2 = client.post(f"/recipes/{recipe_id}/make", headers=auth(user_token))
+        assert r2.status_code == 200
+        pantry_item_id = r2.json()["pantry_item_id"]
+
+        r3 = client.get("/pantry", headers=auth(user_token))
+        bread = next(i for i in r3.json()["items"] if i["id"] == pantry_item_id)
+        assert bread["source"] == "recipe"
+        assert bread["source_id"] == str(recipe_id)
+        assert bread["tracking_mode"] == "countable"
+        assert bread["remaining_servings"] == 4
+        # batch total = the recipe item's own stored calories (100 --
+        # recipe items store their batch contribution directly, NOT
+        # calories * amount_multiple), / 4 servings_per_batch = 25/serving
+        assert bread["calories"] == 25
+
+        # NOT logged to the diary -- making is not eating
+        r4 = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token))
+        assert not any(e["food_name"] == "Bread Loaf" for e in r4.json()["entries"])
+
+    def test_make_recipe_rejects_when_missing_ingredients(self, client, user_token):
+        r = client.post("/recipes", headers=auth(user_token), json={
+            "name": "Impossible Recipe", "servings_per_batch": 1,
+            "items": [{"food_name": "Unicorn Meat", "source": "USDA", "source_id": "make-nonexistent-1"}],
+        })
+        recipe_id = r.json()["id"]
+
+        r2 = client.post(f"/recipes/{recipe_id}/make", headers=auth(user_token))
+        assert r2.status_code == 400
+        assert len(r2.json()["detail"]["missing"]) == 1
+
+    def test_make_recipe_does_not_decrement_on_rejected_attempt(self, client, user_token):
+        """A 400 (missing ingredients) must not partially decrement the
+        ingredients it DOES have -- all-or-nothing, matching the
+        transaction the endpoint documents."""
+        client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Partial Ingredient", "source": "USDA", "source_id": "make-partial-1",
+            "tracking_mode": "countable", "remaining_servings": 5,
+        })
+        r = client.post("/recipes", headers=auth(user_token), json={
+            "name": "Partially Possible Recipe", "servings_per_batch": 1,
+            "items": [
+                {"food_name": "Partial Ingredient", "source": "USDA", "source_id": "make-partial-1", "amount_multiple": 1},
+                {"food_name": "Missing Thing", "source": "USDA", "source_id": "make-missing-1"},
+            ],
+        })
+        recipe_id = r.json()["id"]
+
+        r2 = client.post(f"/recipes/{recipe_id}/make", headers=auth(user_token))
+        assert r2.status_code == 400
+
+        r3 = client.get("/pantry", headers=auth(user_token))
+        partial = next(i for i in r3.json()["items"] if i["source_id"] == "make-partial-1")
+        assert partial["remaining_servings"] == 5  # untouched
+
+    def test_make_recipe_scoped_to_owner(self, client, user_token, other_user_token):
+        r = client.post("/recipes", headers=auth(other_user_token), json={
+            "name": "Other User Make Recipe", "servings_per_batch": 1, "items": [],
+        })
+        recipe_id = r.json()["id"]
+        r2 = client.post(f"/recipes/{recipe_id}/make", headers=auth(user_token))
+        assert r2.status_code == 404
+
+    def test_make_recipe_unknown_id_404s(self, client, user_token):
+        r = client.post("/recipes/999999999/make", headers=auth(user_token))
+        assert r.status_code == 404
+
+
 # ── Meals ─────────────────────────────────────────────────────────────────────
 
 BREAKFAST_ITEMS = [
@@ -480,6 +636,71 @@ class TestPreferences:
     def test_preferences_requires_auth(self, client):
         r = client.get("/preferences")
         assert r.status_code in (401, 403)
+
+    def test_important_nutrients_defaults_to_a_starter_preset(self, client, other_user_token):
+        """Never customized -- falls back to a real starter preset (not
+        an empty list), so the dashboard card has something to show
+        before a user ever visits settings."""
+        r = client.get("/preferences", headers=auth(other_user_token))
+        assert len(r.json()["important_nutrients"]) > 0
+
+    def test_set_important_nutrients(self, client, user_token):
+        r = client.put("/preferences", headers=auth(user_token), json={
+            "important_nutrients": ["Vitamin D (D2 + D3)", "Calcium, Ca"],
+        })
+        assert r.status_code == 200
+        assert r.json()["important_nutrients"] == ["Vitamin D (D2 + D3)", "Calcium, Ca"]
+
+        r2 = client.get("/preferences", headers=auth(user_token))
+        assert r2.json()["important_nutrients"] == ["Vitamin D (D2 + D3)", "Calcium, Ca"]
+
+    def test_set_important_nutrients_rejects_unknown_name(self, client, user_token):
+        r = client.put("/preferences", headers=auth(user_token), json={
+            "important_nutrients": ["Not A Real Nutrient"],
+        })
+        assert r.status_code == 422
+
+    def test_set_important_nutrients_to_empty_list_is_respected(self, client, user_token):
+        """An explicit empty list is a real, intentional 'nothing pinned'
+        state -- distinct from never having set it at all (which falls
+        back to a starter preset instead)."""
+        r = client.put("/preferences", headers=auth(user_token), json={"important_nutrients": []})
+        assert r.json()["important_nutrients"] == []
+
+        r2 = client.get("/preferences", headers=auth(user_token))
+        assert r2.json()["important_nutrients"] == []
+
+    def test_important_nutrients_persists_across_unrelated_color_update(self, client, user_token):
+        client.put("/preferences", headers=auth(user_token), json={"important_nutrients": ["Iron, Fe"]})
+        r = client.put("/preferences", headers=auth(user_token), json={"colors": {"lift_scatter": "#111111"}})
+        assert r.json()["important_nutrients"] == ["Iron, Fe"]
+
+    def test_important_nutrients_scoped_to_owner(self, client, user_token, other_user_token):
+        client.put("/preferences", headers=auth(user_token), json={"important_nutrients": ["Zinc, Zn"]})
+        r = client.get("/preferences", headers=auth(other_user_token))
+        assert r.json()["important_nutrients"] != ["Zinc, Zn"]
+
+
+class TestNutrientGroups:
+    def test_returns_groups_and_starter_presets(self, client, user_token):
+        r = client.get("/targets/nutrient-groups", headers=auth(user_token))
+        assert r.status_code == 200
+        body = r.json()
+        assert "Vitamins" in body["groups"]
+        assert "Minerals" in body["groups"]
+        assert len(body["important_to_me_starter_presets"]) > 0
+
+    def test_every_grouped_nutrient_is_a_valid_preference_choice(self, client, user_token):
+        """The preferences endpoint's allowlist for important_nutrients
+        must exactly match what this endpoint exposes as pickable --
+        otherwise the profile settings UI could offer a nutrient name
+        that PUT /preferences then rejects."""
+        r = client.get("/targets/nutrient-groups", headers=auth(user_token))
+        all_names = [n for group in r.json()["groups"].values() for n in group]
+        for name in all_names:
+            r2 = client.put("/preferences", headers=auth(user_token), json={"important_nutrients": [name]})
+            assert r2.status_code == 200, f"{name!r} rejected by PUT /preferences"
+
 
 
 # ── Recipe as a first-class food reference (search/diary/pantry) ───────────

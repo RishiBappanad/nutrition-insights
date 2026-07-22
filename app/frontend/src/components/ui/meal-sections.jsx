@@ -25,8 +25,12 @@ function groupByMeal(entries) {
  * `entries` array. Sections with no entries are omitted rather than shown
  * empty — an empty "Breakfast" header with nothing under it isn't useful
  * information for a given day.
+ *
+ * `onSelectEntry` (optional) makes each row clickable, opening the full
+ * detail view (see EntryDetailPanel) — per explicit user request to be
+ * able to view a logged food/recipe/meal's full nutrient breakdown.
  */
-export function MealSections({ entries }) {
+export function MealSections({ entries, onSelectEntry }) {
   const groups = groupByMeal(entries || [])
   const orderedMeals = [...MEAL_ORDER, UNCATEGORIZED].filter((m) => groups[m]?.length)
 
@@ -53,7 +57,11 @@ export function MealSections({ entries }) {
             </CardHeader>
             <CardContent className="space-y-2">
               {mealEntries.map((entry) => (
-                <div key={entry.id} className="flex items-center justify-between text-sm py-1">
+                <div
+                  key={entry.id}
+                  onClick={() => onSelectEntry?.(entry)}
+                  className={`flex items-center justify-between text-sm py-1 ${onSelectEntry ? 'cursor-pointer hover:bg-muted/50 rounded-md px-1.5 -mx-1.5 transition-colors' : ''}`}
+                >
                   <div className="min-w-0">
                     <p className="truncate text-foreground">{entry.food_name}</p>
                     <p className="text-xs text-muted-foreground">

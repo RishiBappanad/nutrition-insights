@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pathlib import Path
 
-from .routers import auth, sync, data, food, targets, water, notes, pantry, profile, custom_foods, recipes, meals, label_scanner, preferences
+from .routers import auth, sync, data, food, targets, water, notes, pantry, profile, custom_foods, recipes, meals, label_scanner, preferences, exercise
 from .db import init_db, close_db
 
 app = FastAPI(title="Nutrition Insights API")
@@ -31,6 +31,7 @@ app.include_router(recipes.router, prefix="/recipes", tags=["recipes"])
 app.include_router(meals.router, prefix="/meals", tags=["meals"])
 app.include_router(label_scanner.router, prefix="/label-scanner", tags=["label-scanner"])
 app.include_router(preferences.router, prefix="/preferences", tags=["preferences"])
+app.include_router(exercise.router, prefix="/exercise", tags=["exercise"])
 
 
 @app.on_event("startup")

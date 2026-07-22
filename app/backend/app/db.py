@@ -441,6 +441,15 @@ async def init_db():
             -- ALTER TABLE the first time they're introduced.
             ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS unit_system TEXT;
             ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS macro_chart_style TEXT;
+            -- User-picked nutrient names for the "Important to me"
+            -- micronutrient card (see app/nutrient_groups.py) -- a plain
+            -- JSON array of nutrient_name strings, same
+            -- store-as-JSON-text convention colors_json already uses on
+            -- this table. NULL/absent means "use a starter preset,"
+            -- not "show nothing" -- resolved at read time, not written
+            -- eagerly, so future starter-preset changes still reach
+            -- users who never customized their list.
+            ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS important_nutrients_json TEXT;
 
             -- Two independent sync pointers, per user, for the two-way
             -- Cronometer sync: last_pulled_at tracks how far the
@@ -464,6 +473,34 @@ async def init_db():
                 last_pushed_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
+
+            -- Named exercise/activity entries -- Cronometer's "Exercise"
+            -- diary tab equivalent (e.g. "Running, 30 min, 300 kcal"),
+            -- distinct from lift_orm (Hevy's structured strength-training
+            -- sets: exercise/weight/reps per set) and tdee_log (one
+            -- aggregate active_calories_burned NUMBER per day with no
+            -- per-activity detail at all). A user can have any number of
+            -- named activity entries per day. `source` distinguishes
+            -- manually-logged ('manual', this app's own log form) from
+            -- synced-in entries ('Cronometer') -- same convention
+            -- food_log.source already uses, so the future push-direction
+            -- sync can filter on "not already synced from Cronometer"
+            -- the same way food_log's Cronometer push logic will.
+            CREATE TABLE IF NOT EXISTS exercise_log (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
+                date TEXT NOT NULL,
+                activity_name TEXT NOT NULL,
+                duration_minutes DOUBLE PRECISION,
+                calories_burned DOUBLE PRECISION NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'manual',
+                source_id TEXT,
+                notes TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_exercise_log_user_date ON exercise_log(user_id, date);
         """)
 
 

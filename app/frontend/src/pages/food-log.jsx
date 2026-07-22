@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
-import { Search, Plus, CheckCircle } from 'lucide-react'
+import { todayIso } from '@/lib/dates'
+import { Search, Plus, CheckCircle, Info } from 'lucide-react'
 
 const MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack']
 const SEARCH_DEBOUNCE_MS = 400
@@ -48,6 +49,7 @@ export default function FoodLog() {
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
   const [selected, setSelected] = useState(null)
+  const [previewing, setPreviewing] = useState(null)
   const [logging, setLogging] = useState(false)
   const [status, setStatus] = useState('')
 
@@ -118,7 +120,7 @@ export default function FoodLog() {
       referenceGrams,
       targetGrams: isRecipe ? 1 : referenceGrams,
       meal: 'Snack',
-      date: new Date().toISOString().slice(0, 10),
+      date: todayIso(),
     })
     setStatus('')
   }
@@ -215,24 +217,56 @@ export default function FoodLog() {
           {results.length > 0 && (
             <div className="space-y-1.5 max-h-80 overflow-y-auto">
               {results.map((r) => (
-                <button
+                <div
                   key={`${r.source}-${r.id}`}
-                  onClick={() => selectResult(r)}
                   className={cn(
-                    'w-full text-left px-3 py-2 rounded-md border transition-colors flex items-center justify-between gap-3',
+                    'w-full rounded-md border transition-colors flex items-center gap-2',
                     selected?.result === r ? 'border-primary bg-accent' : 'border-border hover:bg-muted'
                   )}
                 >
-                  <div className="min-w-0">
-                    <p className="text-sm text-foreground truncate">{r.name}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {r.source}{r.brand ? ` · ${r.brand}` : ''}
-                      {r.serving_size ? ` · ${r.serving_size}${r.serving_unit || 'g'} serving` : ' · per 100g'}
-                    </p>
-                  </div>
-                  <Plus className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-                </button>
+                  <button
+                    onClick={() => selectResult(r)}
+                    className="flex-1 text-left px-3 py-2 flex items-center justify-between gap-3 min-w-0"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-sm text-foreground truncate">{r.name}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {r.source}{r.brand ? ` · ${r.brand}` : ''}
+                        {r.serving_size ? ` · ${r.serving_size}${r.serving_unit || 'g'} serving` : ' · per 100g'}
+                      </p>
+                    </div>
+                    <Plus className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                  </button>
+                  <button
+                    onClick={() => setPreviewing(previewing === r ? null : r)}
+                    title="Preview full nutrient breakdown"
+                    className="p-2 mr-1 rounded-md text-muted-foreground hover:bg-muted transition-colors flex-shrink-0"
+                  >
+                    <Info className="h-4 w-4" />
+                  </button>
+                </div>
               ))}
+            </div>
+          )}
+
+          {previewing && (
+            <div className="rounded-md border border-border p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-medium text-foreground">{previewing.name} — nutrient breakdown</p>
+                <button onClick={() => setPreviewing(null)} className="text-xs text-muted-foreground hover:text-foreground">
+                  Close
+                </button>
+              </div>
+              <div className="space-y-1 max-h-48 overflow-y-auto">
+                {Object.entries(previewing.nutrients || {})
+                  .sort(([a], [b]) => a.localeCompare(b))
+                  .map(([name, info]) => (
+                    <div key={name} className="flex items-center justify-between text-xs">
+                      <span className="text-foreground">{name}</span>
+                      <span className="font-mono text-muted-foreground">{info.value}{info.unit}</span>
+                    </div>
+                  ))}
+              </div>
             </div>
           )}
 

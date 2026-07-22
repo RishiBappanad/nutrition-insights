@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Plus, Save, CheckCircle, ArrowLeft, Layers, X } from 'lucide-react'
+import { todayIso } from '@/lib/dates'
 
 const MACRO_NUTRIENT_NAMES = {
   calories: { name: 'Energy', unit: 'KCAL' },
@@ -100,7 +101,7 @@ function MealDetail({ mealId, onBack, onEdit }) {
   const [meal, setMeal] = useState(null)
   const [loading, setLoading] = useState(true)
   const [logMeal, setLogMeal] = useState('Breakfast')
-  const [logDate, setLogDate] = useState(new Date().toISOString().slice(0, 10))
+  const [logDate, setLogDate] = useState(todayIso())
   const [logging, setLogging] = useState(false)
   const [status, setStatus] = useState('')
 

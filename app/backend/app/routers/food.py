@@ -62,8 +62,7 @@ async def _search_user_recipes(user_id: int, query: str) -> list[dict]:
     batch totals), since logging a recipe from search should default to
     "1 serving," matching how a plain food search result represents one
     reference unit."""
-    from .recipes import _get_recipe_with_items, _aggregate_batch_totals
-    from ..portion_scaling import scale_macros, scale_nutrients
+    from .recipes import _get_recipe_with_items
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -77,10 +76,7 @@ async def _search_user_recipes(user_id: int, query: str) -> list[dict]:
         pool = await get_pool()
         async with pool.acquire() as conn:
             recipe, items = await _get_recipe_with_items(conn, row["id"], user_id)
-        batch = _aggregate_batch_totals(items)
-        factor = 1.0 / recipe["servings_per_batch"]
-        per_serving_macros = scale_macros(batch["macros"], factor)
-        per_serving_nutrients = scale_nutrients(batch["nutrients"], factor)
+        per_serving_macros, per_serving_nutrients = _recipe_per_serving_nutrition(recipe, items)
         results.append({
             "source": "recipe",
             "id": str(recipe["id"]),
@@ -107,6 +103,21 @@ async def _search_user_recipes(user_id: int, query: str) -> list[dict]:
             "recipeOrMeal": True,
         })
     return results
+
+
+def _recipe_per_serving_nutrition(recipe, items) -> tuple[dict, dict]:
+    """Batch totals (from recipe items) divided down to ONE serving —
+    shared by _search_user_recipes (a recipe search result shows
+    per-serving totals) and routers/recipes.py's make_recipe (the
+    resulting pantry item is added at 1-serving-per-unit, same
+    convention). Isolated here so both call sites can't silently drift
+    apart on how "per serving" is computed. Returns (macros, nutrients)."""
+    from .recipes import _aggregate_batch_totals
+    from ..portion_scaling import scale_macros, scale_nutrients
+
+    batch = _aggregate_batch_totals(items)
+    factor = 1.0 / recipe["servings_per_batch"]
+    return scale_macros(batch["macros"], factor), scale_nutrients(batch["nutrients"], factor)
 
 
 async def _search_user_meals(user_id: int, query: str) -> list[dict]:

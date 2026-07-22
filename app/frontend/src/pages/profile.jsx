@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react'
 import { api } from '@/lib/api'
 import { usePreferences } from '@/lib/use-preferences'
+import { useScrollToHash } from '@/lib/use-scroll-to-hash'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
-import { Save, CheckCircle, User } from 'lucide-react'
+import { Save, CheckCircle, User, Star } from 'lucide-react'
 import { cmToFeetInches, feetInchesToCm, kgToLb, lbToKg } from '@/lib/units'
 
 const ACTIVITY_LEVELS = [
@@ -135,6 +136,15 @@ export default function Profile() {
       )
     }
   }
+
+  // Fires after `loading` flips false (the guard below returns null
+  // until then, so #micronutrient-settings doesn't exist in the DOM
+  // yet on the first render) -- see use-scroll-to-hash.js for why this
+  // is needed at all for a client-side-routed <Link href="#...">. Called
+  // unconditionally, before the early return, per React's rules of
+  // hooks (a hook after a conditional return would be called a
+  // different number of times across renders and throw).
+  useScrollToHash([loading])
 
   if (loading) return null
 
@@ -320,6 +330,123 @@ export default function Profile() {
           </form>
         </CardContent>
       </Card>
+
+      <MicronutrientCardSettings />
     </div>
+  )
+}
+
+function MicronutrientCardSettings() {
+  const { importantNutrients, updateImportantNutrients } = usePreferences()
+  const [groups, setGroups] = useState(null)
+  const [selected, setSelected] = useState(importantNutrients)
+  const [saving, setSaving] = useState(false)
+  const [status, setStatus] = useState('')
+
+  useEffect(() => {
+    api('/targets/nutrient-groups')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => setGroups(d))
+  }, [])
+
+  // Keep local selection in sync once the real preference loads (avoids
+  // a flash of the hook's fallback list before /preferences resolves).
+  useEffect(() => setSelected(importantNutrients), [importantNutrients])
+
+  function toggle(name) {
+    setSelected((prev) => prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name])
+  }
+
+  function applyPreset(names) {
+    setSelected(names)
+  }
+
+  async function handleSave() {
+    setSaving(true)
+    setStatus('')
+    const res = await updateImportantNutrients(selected)
+    setSaving(false)
+    if (res.ok) {
+      setStatus('saved')
+      setTimeout(() => setStatus(''), 3000)
+    } else {
+      setStatus('Failed to save')
+    }
+  }
+
+  const allNutrients = groups ? Object.values(groups.groups).flat() : []
+
+  return (
+    <Card id="micronutrient-settings">
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <Star className="h-4 w-4 text-muted-foreground" />
+          <CardTitle>"Important to Me" Micronutrients</CardTitle>
+        </div>
+        <CardDescription>
+          Pick which micronutrients show on your dashboard's "Important to Me" card — everything
+          else is still tracked and visible in the full report, just not front-and-center.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {groups && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">Quick presets</label>
+            <div className="flex flex-wrap gap-2">
+              {Object.entries(groups.important_to_me_starter_presets).map(([name, names]) => (
+                <button
+                  key={name}
+                  type="button"
+                  onClick={() => applyPreset(names)}
+                  className="px-3 py-1.5 rounded-md border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors"
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-1.5">
+          <label className="text-xs font-medium text-muted-foreground">
+            Or pick individually ({selected.length} selected)
+          </label>
+          <div className="flex flex-wrap gap-1.5 max-h-56 overflow-y-auto p-1">
+            {allNutrients.map((name) => (
+              <button
+                key={name}
+                type="button"
+                onClick={() => toggle(name)}
+                className={cn(
+                  'px-2.5 py-1 rounded-md border text-xs font-medium transition-colors',
+                  selected.includes(name)
+                    ? 'bg-primary text-primary-foreground border-primary'
+                    : 'border-border text-muted-foreground hover:bg-muted'
+                )}
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+          >
+            <Save className="h-4 w-4" />
+            {saving ? 'Saving...' : 'Save Selection'}
+          </button>
+          {status === 'saved' && (
+            <span className="inline-flex items-center gap-1 text-sm text-green-700">
+              <CheckCircle className="h-4 w-4" /> Saved
+            </span>
+          )}
+          {status && status !== 'saved' && <span className="text-sm text-destructive">{status}</span>}
+        </div>
+      </CardContent>
+    </Card>
   )
 }

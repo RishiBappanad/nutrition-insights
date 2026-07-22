@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from ..routers.auth import get_current_user
 from ..db import get_pool
 from ..nutrition_targets import derive_macro_grams, get_nutrient_progress, get_resolved_macro_targets
+from ..nutrient_groups import get_nutrient_groups
 
 router = APIRouter()
 
@@ -152,3 +153,16 @@ async def get_progress(date: str = Query(...), user_id: int = Depends(get_curren
     server-side (see nutrition_targets.get_nutrient_progress) so the
     frontend never re-derives percentages itself."""
     return {"date": date, "progress": await get_nutrient_progress(user_id, date)}
+
+
+@router.get("/nutrient-groups")
+async def get_nutrient_groups_endpoint():
+    """Grouped micronutrient preset structure (Vitamins/Minerals groups,
+    plus starter presets for the user-customizable 'important to me'
+    card) — see app/nutrient_groups.py. A real, independently-callable
+    endpoint (not frontend-hardcoded groups) so any client builds the
+    same swipeable-card grouping without re-deriving it. Not user-scoped
+    — the groupings themselves aren't personal data, only which
+    nutrients a given user has pinned as "important to me" is (that's
+    GET /preferences' important_nutrients field)."""
+    return get_nutrient_groups()

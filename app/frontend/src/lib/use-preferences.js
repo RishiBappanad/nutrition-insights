@@ -23,6 +23,7 @@ const FALLBACK_COLORS = {
 const FALLBACK_THRESHOLD = 90
 const FALLBACK_UNIT_SYSTEM = 'imperial'
 const FALLBACK_MACRO_CHART_STYLE = 'pie'
+const FALLBACK_IMPORTANT_NUTRIENTS = ['Vitamin B-12', 'Iron, Fe', 'Vitamin D (D2 + D3)']
 
 /**
  * Shared hook for reading + writing user-configurable display
@@ -37,6 +38,7 @@ export function usePreferences() {
   const [sufficiencyThresholdPct, setSufficiencyThresholdPct] = useState(FALLBACK_THRESHOLD)
   const [unitSystem, setUnitSystem] = useState(FALLBACK_UNIT_SYSTEM)
   const [macroChartStyle, setMacroChartStyle] = useState(FALLBACK_MACRO_CHART_STYLE)
+  const [importantNutrients, setImportantNutrients] = useState(FALLBACK_IMPORTANT_NUTRIENTS)
   const [loading, setLoading] = useState(true)
 
   function applyResponse(d) {
@@ -44,6 +46,7 @@ export function usePreferences() {
     setSufficiencyThresholdPct(d.sufficiency_threshold_pct)
     setUnitSystem(d.unit_system)
     setMacroChartStyle(d.macro_chart_style)
+    if (d.important_nutrients) setImportantNutrients(d.important_nutrients)
   }
 
   const refresh = useCallback(() => {
@@ -95,6 +98,15 @@ export function usePreferences() {
     return res
   }
 
+  async function updateImportantNutrients(nutrientNames) {
+    const res = await api('/preferences', {
+      method: 'PUT',
+      body: JSON.stringify({ important_nutrients: nutrientNames }),
+    })
+    if (res.ok) applyResponse(await res.json())
+    return res
+  }
+
   async function resetToDefaults() {
     const res = await api('/preferences', { method: 'DELETE' })
     if (res.ok) applyResponse(await res.json())
@@ -106,11 +118,13 @@ export function usePreferences() {
     sufficiencyThresholdPct,
     unitSystem,
     macroChartStyle,
+    importantNutrients,
     loading,
     updateColors,
     updateThreshold,
     updateUnitSystem,
     updateMacroChartStyle,
+    updateImportantNutrients,
     resetToDefaults,
     refresh,
   }

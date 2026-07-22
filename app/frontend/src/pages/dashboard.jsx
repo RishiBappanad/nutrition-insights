@@ -1,21 +1,19 @@
 import { useState, useEffect } from 'react'
-import { Link } from 'wouter'
+import { Link, useSearchParams } from 'wouter'
 import { api } from '@/lib/api'
 import { usePreferences } from '@/lib/use-preferences'
+import { todayIso, addDays, friendlyDate, isToday } from '@/lib/dates'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { MacroCard } from '@/components/ui/macro-card'
 import { MicronutrientCard } from '@/components/ui/micronutrient-card'
 import { MealSections } from '@/components/ui/meal-sections'
 import { WaterWidget } from '@/components/ui/water-widget'
-import { RefreshCw, Flame, Activity, Calculator, UtensilsCrossed, BookOpen, Layers } from 'lucide-react'
-
-function todayIso() {
-  return new Date().toISOString().slice(0, 10)
-}
+import { EntryDetailPanel } from '@/components/ui/entry-detail-panel'
+import { RefreshCw, Flame, Activity, Calculator, UtensilsCrossed, BookOpen, Layers, ChevronLeft, ChevronRight, CalendarDays, Dumbbell } from 'lucide-react'
 
 export default function Dashboard() {
-  const { colors, sufficiencyThresholdPct, unitSystem, macroChartStyle, updateMacroChartStyle } = usePreferences()
+  const { colors, sufficiencyThresholdPct, unitSystem, macroChartStyle, importantNutrients, updateMacroChartStyle } = usePreferences()
   const [bmr, setBmr] = useState(null)
   const [bmrMessage, setBmrMessage] = useState('')
   const [syncing, setSyncing] = useState('')
@@ -27,23 +25,24 @@ export default function Dashboard() {
   const [macroTarget, setMacroTarget] = useState(null)
   const [progress, setProgress] = useState(null)
   const [nutritionLoading, setNutritionLoading] = useState(true)
+  const [selectedEntry, setSelectedEntry] = useState(null)
 
-  const date = todayIso()
+  // Selected date lives in the URL (?date=YYYY-MM-DD), not local state --
+  // per explicit user request, switching days must not reset whatever
+  // page/view the user is on (this persists across reloads/back-forward
+  // too, which plain useState wouldn't). Defaults to today when absent.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const date = searchParams.get('date') || todayIso()
 
-  useEffect(() => {
-    api('/data/bmr')
-      .then((r) => r.json())
-      .then((d) => {
-        setBmr(d.bmr)
-        setBmrMessage(d.bmr == null ? d.message : '')
-        setLoading(false)
-      })
-      .catch(() => setLoading(false))
-  }, [])
+  function setDate(newDate) {
+    const next = new URLSearchParams(searchParams)
+    next.set('date', newDate)
+    setSearchParams(next, { replace: true })
+  }
 
-  useEffect(() => {
+  function loadNutritionData() {
     setNutritionLoading(true)
-    Promise.all([
+    return Promise.all([
       api(`/food/log?date=${date}`).then((r) => (r.ok ? r.json() : null)),
       // Macro targets are optional (404 if the user has never set them,
       // e.g. before completing profile setup) — treat that as "no target"
@@ -57,6 +56,25 @@ export default function Dashboard() {
         setProgress(prog?.progress ?? null)
       })
       .finally(() => setNutritionLoading(false))
+  }
+
+  function loadBmr() {
+    return api('/data/bmr')
+      .then((r) => r.json())
+      .then((d) => {
+        setBmr(d.bmr)
+        setBmrMessage(d.bmr == null ? d.message : '')
+      })
+  }
+
+  useEffect(() => {
+    loadBmr().catch(() => {}).finally(() => setLoading(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    loadNutritionData()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [date])
 
   async function handleSync(target) {
@@ -66,6 +84,17 @@ export default function Dashboard() {
     const data = await res.json()
     setSyncResult(data)
     setSyncing('')
+    // Bug fix: a successful sync writes new food_log/tdee_log rows, but
+    // nothing previously re-fetched the dashboard's data afterward — the
+    // sync would genuinely succeed (confirmed against real Cloud Run
+    // logs) while the UI kept showing pre-sync data until a manual
+    // reload. Both refetches run regardless of date, since a Cronometer
+    // sync can touch BMR (tdee_log) and/or the currently-viewed date's
+    // diary.
+    if (res.ok) {
+      loadNutritionData()
+      loadBmr()
+    }
   }
 
   async function handleCalculateBmr() {
@@ -84,18 +113,51 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
-        <p className="text-muted-foreground text-sm mt-1">
-          Your daily nutrition overview
-        </p>
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
+          <p className="text-muted-foreground text-sm mt-1">
+            Your daily nutrition overview
+          </p>
+        </div>
+
+        {/* Calendar nav — the date lives in the URL (see above), so
+            switching days here doesn't reset which page/view the user is
+            on (e.g. staying on /report while paging back a few days). */}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setDate(addDays(date, -1))}
+            className="p-2 rounded-md border border-border text-muted-foreground hover:bg-muted transition-colors"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-md border border-border min-w-[120px] justify-center">
+            <CalendarDays className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="text-sm font-medium">{friendlyDate(date)}</span>
+          </div>
+          <button
+            onClick={() => setDate(addDays(date, 1))}
+            disabled={isToday(date)}
+            className="p-2 rounded-md border border-border text-muted-foreground hover:bg-muted disabled:opacity-30 transition-colors"
+          >
+            <ChevronRight className="h-4 w-4" />
+          </button>
+          {!isToday(date) && (
+            <button
+              onClick={() => setDate(todayIso())}
+              className="text-xs font-medium text-muted-foreground hover:text-foreground transition-colors underline ml-1"
+            >
+              Today
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Prominent logging entry points — Log Food, Recipes, and Meals
           were pulled out of the persistent sidebar nav per user request
           (too much clutter for "ways to add something to today") and
           live here instead, next to the diary they feed. */}
-      <div className="grid gap-3 grid-cols-3">
+      <div className="grid gap-3 grid-cols-2 md:grid-cols-4">
         <Link href="/food-log">
           <div className="flex items-center gap-2 justify-center px-4 py-3 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors cursor-pointer">
             <UtensilsCrossed className="h-4 w-4" />
@@ -112,6 +174,12 @@ export default function Dashboard() {
           <div className="flex items-center gap-2 justify-center px-4 py-3 rounded-md border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors cursor-pointer">
             <Layers className="h-4 w-4" />
             Meals
+          </div>
+        </Link>
+        <Link href="/exercise">
+          <div className="flex items-center gap-2 justify-center px-4 py-3 rounded-md border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors cursor-pointer">
+            <Dumbbell className="h-4 w-4" />
+            Exercise
           </div>
         </Link>
       </div>
@@ -132,7 +200,13 @@ export default function Dashboard() {
             chartStyle={macroChartStyle}
             onChartStyleChange={updateMacroChartStyle}
           />
-          <MicronutrientCard progress={progress} colors={colors} sufficiencyThresholdPct={sufficiencyThresholdPct} />
+          <MicronutrientCard
+            progress={progress}
+            colors={colors}
+            sufficiencyThresholdPct={sufficiencyThresholdPct}
+            importantNutrients={importantNutrients}
+            date={date}
+          />
         </div>
       )}
 
@@ -141,13 +215,21 @@ export default function Dashboard() {
 
       {/* Diary, grouped by meal/time-of-day */}
       <div>
-        <h2 className="text-lg font-semibold mb-3">Today's Diary</h2>
+        <h2 className="text-lg font-semibold mb-3">{isToday(date) ? "Today's" : friendlyDate(date)} Diary</h2>
         {nutritionLoading ? (
           <Skeleton className="h-40" />
         ) : (
-          <MealSections entries={foodLog?.entries} />
+          <MealSections entries={foodLog?.entries} onSelectEntry={setSelectedEntry} />
         )}
       </div>
+
+      {selectedEntry && (
+        <EntryDetailPanel
+          entry={selectedEntry}
+          onClose={() => setSelectedEntry(null)}
+          onChanged={loadNutritionData}
+        />
+      )}
 
       {/* BMR Card */}
       <Card>

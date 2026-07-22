@@ -261,6 +261,48 @@ async def log_recipe(recipe_id: int, req: LogRecipeRequest, user_id: int = Depen
     return {"status": "logged", "food_log_id": food_log_id}
 
 
+async def _match_recipe_against_pantry(conn, items: list[dict], user_id: int) -> dict:
+    """
+    Shared matching logic for "can I make this?" (can_make_recipe) AND
+    "make it" (make_recipe) — isolated here so the two can never
+    silently disagree about what counts as available. Matches recipe
+    items to pantry items by (source, source_id); see can_make_recipe's
+    docstring for the full matching rules (countable/single quantity
+    checks, bulk presence-only, unmatchable freehand items).
+    """
+    pantry_rows = await conn.fetch(
+        "SELECT * FROM pantry_items WHERE user_id = $1 AND is_finished = FALSE", user_id
+    )
+    pantry_by_source = {(p["source"], p["source_id"]): p for p in pantry_rows if p["source"] and p["source_id"]}
+
+    have, missing, unmatchable = [], [], []
+    for item in items:
+        key = (item["source"], item["source_id"])
+        if not item["source"] or not item["source_id"]:
+            unmatchable.append({"food_name": item["food_name"]})
+            continue
+
+        pantry_item = pantry_by_source.get(key)
+        if pantry_item is None:
+            missing.append({"food_name": item["food_name"]})
+            continue
+
+        requested = item.get("amount_multiple")
+        entry = {
+            "food_name": item["food_name"], "pantry_item_id": pantry_item["id"],
+            "tracking_mode": pantry_item["tracking_mode"], "requested_servings": requested,
+        }
+        if pantry_item["tracking_mode"] == "countable" and requested is not None:
+            if pantry_item["remaining_servings"] is not None and requested > pantry_item["remaining_servings"]:
+                entry["sufficient"] = False
+                entry["remaining_servings"] = pantry_item["remaining_servings"]
+                missing.append(entry)
+                continue
+        have.append(entry)
+
+    return {"have": have, "missing": missing, "unmatchable": unmatchable}
+
+
 @router.get("/{recipe_id}/can-make")
 async def can_make_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
     """
@@ -285,40 +327,113 @@ async def can_make_recipe(recipe_id: int, user_id: int = Depends(get_current_use
         recipe, items = await _get_recipe_with_items(conn, recipe_id, user_id)
         if recipe is None:
             raise HTTPException(status_code=404, detail="Recipe not found")
-
-        pantry_rows = await conn.fetch(
-            "SELECT * FROM pantry_items WHERE user_id = $1 AND is_finished = FALSE", user_id
-        )
-
-    pantry_by_source = {(p["source"], p["source_id"]): p for p in pantry_rows if p["source"] and p["source_id"]}
-
-    have, missing, unmatchable = [], [], []
-    for item in items:
-        key = (item["source"], item["source_id"])
-        if not item["source"] or not item["source_id"]:
-            unmatchable.append({"food_name": item["food_name"]})
-            continue
-
-        pantry_item = pantry_by_source.get(key)
-        if pantry_item is None:
-            missing.append({"food_name": item["food_name"]})
-            continue
-
-        requested = item.get("amount_multiple")
-        entry = {"food_name": item["food_name"], "pantry_item_id": pantry_item["id"], "tracking_mode": pantry_item["tracking_mode"]}
-        if pantry_item["tracking_mode"] == "countable" and requested is not None:
-            if pantry_item["remaining_servings"] is not None and requested > pantry_item["remaining_servings"]:
-                entry["sufficient"] = False
-                entry["remaining_servings"] = pantry_item["remaining_servings"]
-                missing.append(entry)
-                continue
-        have.append(entry)
+        match = await _match_recipe_against_pantry(conn, items, user_id)
 
     return {
         "recipe_id": recipe_id,
         "recipe_name": recipe["name"],
-        "can_make": len(missing) == 0 and len(unmatchable) == 0,
-        "have": have,
-        "missing": missing,
-        "unmatchable": unmatchable,
+        "can_make": len(match["missing"]) == 0 and len(match["unmatchable"]) == 0,
+        **match,
+    }
+
+
+@router.post("/{recipe_id}/make")
+async def make_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
+    """
+    "Make it" — the pantry-consuming counterpart to can-make/log. Per
+    explicit user request: making a recipe does NOT log it straight to
+    the diary (a cooked batch usually isn't eaten all at once). Instead,
+    in one transaction:
+      1. Re-runs the same can-make matching this recipe's /can-make uses
+         (via _match_recipe_against_pantry) and 400s with the same
+         have/missing/unmatchable detail if anything's missing — makes
+         it impossible to decrement pantry items the check itself would
+         have flagged as insufficient.
+      2. Decrements/removes each matched pantry item by its requested
+         amount, using the EXACT SAME per-tracking_mode logic
+         routers/pantry.py's /consume already uses (countable: decrement
+         or delete at <=0; single: always delete; bulk: presence-only,
+         never decremented — matches can-make's own bulk handling).
+      3. Adds ONE new pantry item for the finished batch itself:
+         source='recipe', source_id=<this recipe>, tracking_mode=
+         'countable', remaining_servings=servings_per_batch, with
+         per-serving nutrition (via _recipe_per_serving_nutrition,
+         shared with food.py's recipe-as-search-result path so the two
+         can't disagree on what "1 serving" of this recipe means).
+
+    This means a made recipe becomes a normal pantry item afterward —
+    reachable through the exact same /pantry list, consume, and remove
+    flows every other pantry item already has, not a special case.
+    """
+    from ..food_entry_contract import _nutrients_to_rows
+    from .food import _recipe_per_serving_nutrition
+    import json
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            recipe, items = await _get_recipe_with_items(conn, recipe_id, user_id)
+            if recipe is None:
+                raise HTTPException(status_code=404, detail="Recipe not found")
+
+            match = await _match_recipe_against_pantry(conn, items, user_id)
+            if match["missing"] or match["unmatchable"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "Cannot make this recipe — missing or unmatchable ingredients",
+                        **match,
+                    },
+                )
+
+            decremented, removed = [], []
+            for entry in match["have"]:
+                pantry_item = await conn.fetchrow(
+                    "SELECT * FROM pantry_items WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                    entry["pantry_item_id"], user_id,
+                )
+                if pantry_item is None:
+                    continue  # already gone (e.g. duplicate recipe items referencing the same pantry row)
+
+                if pantry_item["tracking_mode"] == "single":
+                    await conn.execute("DELETE FROM pantry_items WHERE id = $1", pantry_item["id"])
+                    removed.append(pantry_item["id"])
+                elif pantry_item["tracking_mode"] == "countable" and entry["requested_servings"] is not None:
+                    new_remaining = pantry_item["remaining_servings"] - entry["requested_servings"]
+                    if new_remaining <= 0:
+                        await conn.execute("DELETE FROM pantry_items WHERE id = $1", pantry_item["id"])
+                        removed.append(pantry_item["id"])
+                    else:
+                        await conn.execute(
+                            "UPDATE pantry_items SET remaining_servings = $1, updated_at = now() WHERE id = $2",
+                            new_remaining, pantry_item["id"],
+                        )
+                        decremented.append(pantry_item["id"])
+                # bulk: presence-only, never decremented -- matches
+                # can-make's own bulk handling (no quantity concept).
+
+            per_serving_macros, per_serving_nutrients = _recipe_per_serving_nutrition(recipe, items)
+            pantry_item_id = await conn.fetchval(
+                """INSERT INTO pantry_items (user_id, food_name, source, source_id, serving_size,
+                       serving_unit, tracking_mode, remaining_servings,
+                       calories, protein, carbs, fat, fiber, nutrients_json)
+                   VALUES ($1, $2, 'recipe', $3, 1, 'serving', 'countable', $4, $5, $6, $7, $8, $9, $10)
+                   RETURNING id""",
+                user_id, recipe["name"], str(recipe_id), recipe["servings_per_batch"],
+                per_serving_macros["calories"], per_serving_macros["protein"], per_serving_macros["carbs"],
+                per_serving_macros["fat"], per_serving_macros["fiber"], json.dumps(per_serving_nutrients),
+            )
+            rows = _nutrients_to_rows(pantry_item_id, per_serving_nutrients)
+            if rows:
+                await conn.executemany(
+                    "INSERT INTO pantry_item_nutrients (pantry_item_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
+                    rows,
+                )
+
+    return {
+        "status": "made",
+        "pantry_item_id": pantry_item_id,
+        "servings_added": recipe["servings_per_batch"],
+        "ingredients_decremented": decremented,
+        "ingredients_removed": removed,
     }

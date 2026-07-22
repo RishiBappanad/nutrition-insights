@@ -13,10 +13,12 @@ from pydantic import BaseModel, field_validator
 
 from ..routers.auth import get_current_user
 from ..db import get_pool
+from ..nutrient_groups import IMPORTANT_TO_ME_STARTER_PRESETS, VITAMIN_GROUP, MINERAL_GROUP
 
 router = APIRouter()
 
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+VALID_NUTRIENT_NAMES = set(VITAMIN_GROUP) | set(MINERAL_GROUP)
 
 # Every color-coded element across the app that a user can currently see,
 # with a documented default matching what was hardcoded before this
@@ -57,6 +59,7 @@ class PreferencesRequest(BaseModel):
     sufficiency_threshold_pct: Optional[float] = None
     unit_system: Optional[str] = None
     macro_chart_style: Optional[str] = None
+    important_nutrients: Optional[list[str]] = None
 
     @field_validator("colors")
     @classmethod
@@ -89,6 +92,16 @@ class PreferencesRequest(BaseModel):
             raise ValueError(f"macro_chart_style must be one of {sorted(VALID_MACRO_CHART_STYLES)}")
         return v
 
+    @field_validator("important_nutrients")
+    @classmethod
+    def _validate_important_nutrients(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        if v is None:
+            return v
+        unknown = [n for n in v if n not in VALID_NUTRIENT_NAMES]
+        if unknown:
+            raise ValueError(f"unknown nutrient name(s): {unknown}. Must be one of the tracked DRI nutrients.")
+        return v
+
 
 @router.get("")
 async def get_preferences(user_id: int = Depends(get_current_user)):
@@ -104,13 +117,27 @@ async def get_preferences(user_id: int = Depends(get_current_user)):
     threshold = row["sufficiency_threshold_pct"] if row and row["sufficiency_threshold_pct"] is not None else DEFAULT_SUFFICIENCY_THRESHOLD_PCT
     unit_system = row["unit_system"] if row and row["unit_system"] else DEFAULT_UNIT_SYSTEM
     macro_chart_style = row["macro_chart_style"] if row and row["macro_chart_style"] else DEFAULT_MACRO_CHART_STYLE
+    important_nutrients = _resolve_important_nutrients(row)
 
     return {
         "colors": colors,
         "sufficiency_threshold_pct": threshold,
         "unit_system": unit_system,
         "macro_chart_style": macro_chart_style,
+        "important_nutrients": important_nutrients,
     }
+
+
+def _resolve_important_nutrients(row) -> list:
+    """NULL/absent means 'never customized' -- falls back to the first
+    starter preset (not an empty list), so the card has something
+    meaningful to show before a user ever visits settings. A user who
+    explicitly saves an EMPTY list gets exactly that (an intentional
+    'nothing pinned' state) -- only a genuinely absent value falls back,
+    not an empty stored one."""
+    if row is not None and row["important_nutrients_json"] is not None:
+        return json.loads(row["important_nutrients_json"])
+    return next(iter(IMPORTANT_TO_ME_STARTER_PRESETS.values()))
 
 
 @router.put("")
@@ -138,16 +165,21 @@ async def set_preferences(req: PreferencesRequest, user_id: int = Depends(get_cu
         if macro_chart_style is None and existing:
             macro_chart_style = existing["macro_chart_style"]
 
+        important_nutrients_json = existing["important_nutrients_json"] if existing else None
+        if req.important_nutrients is not None:
+            important_nutrients_json = json.dumps(req.important_nutrients)
+
         await conn.execute(
-            """INSERT INTO user_preferences (user_id, colors_json, sufficiency_threshold_pct, unit_system, macro_chart_style, updated_at)
-               VALUES ($1, $2, $3, $4, $5, now())
+            """INSERT INTO user_preferences (user_id, colors_json, sufficiency_threshold_pct, unit_system, macro_chart_style, important_nutrients_json, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, now())
                ON CONFLICT (user_id) DO UPDATE SET
                    colors_json = EXCLUDED.colors_json,
                    sufficiency_threshold_pct = EXCLUDED.sufficiency_threshold_pct,
                    unit_system = EXCLUDED.unit_system,
                    macro_chart_style = EXCLUDED.macro_chart_style,
+                   important_nutrients_json = EXCLUDED.important_nutrients_json,
                    updated_at = now()""",
-            user_id, json.dumps(merged_colors), threshold, unit_system, macro_chart_style,
+            user_id, json.dumps(merged_colors), threshold, unit_system, macro_chart_style, important_nutrients_json,
         )
 
     return {
@@ -155,6 +187,7 @@ async def set_preferences(req: PreferencesRequest, user_id: int = Depends(get_cu
         "sufficiency_threshold_pct": threshold or DEFAULT_SUFFICIENCY_THRESHOLD_PCT,
         "unit_system": unit_system or DEFAULT_UNIT_SYSTEM,
         "macro_chart_style": macro_chart_style or DEFAULT_MACRO_CHART_STYLE,
+        "important_nutrients": json.loads(important_nutrients_json) if important_nutrients_json else next(iter(IMPORTANT_TO_ME_STARTER_PRESETS.values())),
     }
 
 
@@ -169,4 +202,5 @@ async def reset_preferences(user_id: int = Depends(get_current_user)):
         "sufficiency_threshold_pct": DEFAULT_SUFFICIENCY_THRESHOLD_PCT,
         "unit_system": DEFAULT_UNIT_SYSTEM,
         "macro_chart_style": DEFAULT_MACRO_CHART_STYLE,
+        "important_nutrients": next(iter(IMPORTANT_TO_ME_STARTER_PRESETS.values())),
     }

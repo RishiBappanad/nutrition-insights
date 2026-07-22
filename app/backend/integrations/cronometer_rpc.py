@@ -8,6 +8,7 @@ eliminating the need for browser automation.
 import csv
 import re
 import logging
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -39,9 +40,25 @@ API_V3_BASE = "https://cronometer.com/api/v3"
 # start failing, the fix is re-capturing a fresh permutation from a live
 # session's request headers (x-gwt-permutation), not guessing.
 GWT_PERMUTATION = "8119D24F8CC7814B83B62DD87A7C62D8"
-GWT_HEADER = "F25561B47C31168F0ED80B768B647985"
 GWT_CONTENT_TYPE = "text/x-gwt-rpc; charset=UTF-8"
 GWT_MODULE_BASE = "https://cronometer.com/cronometer/"
+
+# GWT_HEADER used to be a SEPARATE stale constant from GWT_PERMUTATION --
+# a real, independent bug found while verifying add_exercise() against
+# fresh captures: GWT_PERMUTATION (used only in the x-gwt-permutation
+# HTTP header) had already been corrected to the live value
+# (8119D24F8CC7814B83B62DD87A7C62D8), but GWT_HEADER (embedded inline in
+# several payload BODIES: authenticate, generateAuthorizationToken,
+# search_food, findMyFoods, log_diary_entry) was still the OLD value
+# (F25561B47C31168F0ED80B768B647985) -- confirmed stale by comparing
+# against real 2026-07-21 captures, which show the current permutation
+# hash inline in the payload body too, not just the header. The two were
+# never meant to diverge (GWT sends the same permutation value in both
+# places for the same client build) -- this was a partial fix that only
+# updated one of the two occurrences. Fixed by making GWT_HEADER an
+# alias for GWT_PERMUTATION so there's one source of truth going
+# forward; whichever needs re-capturing next time, both update together.
+GWT_HEADER = GWT_PERMUTATION
 
 GWT_AUTHENTICATE = (
     "7|0|5|https://cronometer.com/cronometer/|"
@@ -368,10 +385,289 @@ class CronometerRPCClient:
             logger.error(f"Failed to log diary entry: {resp.text}")
         return success
 
+    # addExercise wire format -- CONFIRMED via 3 controlled write captures:
+    # 2 varying ONLY duration/calories for a real catalog activity
+    # ("Martial Arts, Moderate", activityId 1157), and a 3rd logging a
+    # genuinely novel, never-before-logged CUSTOM activity ("Custom
+    # Exercise", no catalog match) -- CROSS-VALIDATED against 14 real
+    # historical records returned by getRecentExercises (same
+    # com.cronometer.shared.exercise.Exercise class, response-side).
+    # This meets the same bar log_diary_entry's fields were confirmed to
+    # (isolate one variable at a time across real captures) -- unlike
+    # addFood/editFood, which remain deliberately unimplemented because
+    # no amount of captures gathered so far isolated their nested
+    # Food->List<Ingredient> fields this cleanly.
+    #
+    # The custom-activity capture was the key unlock: comparing it
+    # against the catalog-activity captures showed activity_id AND the
+    # intensity-code field both drop to 0 for a custom entry, while
+    # met_coefficient stayed IDENTICAL (140.99988486671424) across ALL
+    # THREE captures -- proving met_coefficient is NOT tied to the
+    # specific activity at all, it's a per-USER constant (almost
+    # certainly derived from the logged-in user's own body weight/
+    # profile on Cronometer's side, which didn't change between
+    # captures). This means every exercise can be logged as a "custom"
+    # entry (activity_id=0, intensity=0) using a caller-supplied
+    # activity_name string and a caller-supplied calories_burned value
+    # Cronometer will accept and store as-is -- no activity catalog
+    # lookup needed at all, which sidesteps the exact problem that made
+    # this look intractable at first (no findActivities-derived
+    # activity_id/met_coefficient resolution required for the common
+    # case of a TrackStack-native manual log being pushed to Cronometer).
+    #
+    # Field-by-position (0-indexed within the trailing value block):
+    #   0:  activity_id -- 0 for a custom/no-catalog-match activity
+    #       (confirmed via the "Custom Exercise" capture); a real
+    #       catalog id (e.g. 1157, 1138, 1139, 1290 -- all confirmed via
+    #       getRecentExercises/findActivities) for a matched one.
+    #   1:  intensity/type code -- 0 for custom (confirmed); varies per
+    #       catalog activity+intensity combo otherwise (was 50 for
+    #       "Martial Arts, Moderate" -- NOT assumed to generalize to
+    #       other catalog activities, since this client only ever
+    #       exercises the activity_id=0 custom path).
+    #   2:  constant 0
+    #   3:  calories_burned, NEGATED (exercise burn is a negative delta)
+    #   4:  constant 9 (unconfirmed what it represents; identical across
+    #       all 3 write captures)
+    #   5:  day-of-month
+    #   6:  month
+    #   7:  year
+    #   8:  shortId (a short opaque per-entry string Cronometer
+    #       generates client-side, e.g. "A" -- NOT confirmed whether the
+    #       server requires a specific format/uniqueness; using a fixed
+    #       short random-looking token per call, matching the real
+    #       captures' shape)
+    #   9,10: constant 0, 0
+    #   11: duration_minutes
+    #   12: constant 10 (write-side type/action discriminator --
+    #       differs from the response-side value 4 for the same field
+    #       position, consistent with a "this is a NEW entry" marker
+    #       rather than user data)
+    #   13: constant 0
+    #   14: constant 1 (write-side discriminator, differs from
+    #       response-side 2 -- same reasoning as position 12)
+    #   15,16: constant 0, 0
+    #   17: userId (confirmed identical to getRecentExercises' userId
+    #       field, and identical to self.user_id used elsewhere)
+    #   18: metCoef -- a per-USER floating constant (see above; NOT
+    #       per-activity, confirmed via the custom-activity capture).
+    #       Defaults to the one real captured value below; re-capture if
+    #       calls start failing for a different account, same caveat as
+    #       GWT_PERMUTATION.
+    #   19: repeats the userId value again (confirmed identical to
+    #       position 17 in every capture -- kept as a literal repeat,
+    #       not derived, since nothing demonstrates it's ever different)
+    #
+    # DEFAULT_MET_COEFFICIENT is captured from ONE real account -- it is
+    # NOT verified to be the same for every Cronometer user (it plausibly
+    # varies with the account's own weight/profile, per the reasoning
+    # above). Callers logging to a DIFFERENT account than the one this
+    # was captured from should supply their own recent value (e.g. read
+    # back from that account's own getRecentExercises) rather than trust
+    # this default blindly.
+    DEFAULT_MET_COEFFICIENT = 140.99988486671424
+
+    def add_exercise(
+        self,
+        activity_name: str,
+        duration_minutes: float,
+        calories_burned: float,
+        activity_id: int = 0,
+        met_coefficient: Optional[float] = None,
+        day: Optional[str] = None,
+    ) -> bool:
+        """
+        Log one exercise/activity entry to the diary via addExercise.
+        Confirmed working format (see the field-by-field breakdown
+        above) -- a REAL WRITE to the user's live Cronometer account,
+        no dry-run mode at this layer, same caveat as log_diary_entry.
+
+        Defaults to logging as a CUSTOM activity (activity_id=0), which
+        is fully general -- works for any activity_name, no catalog
+        lookup required, and is the confirmed-safe path (verified via a
+        real capture of a genuinely novel custom activity). Pass a real
+        `activity_id` (e.g. from a prior getRecentExercises/
+        findActivities lookup for THIS account) if you want the entry
+        to associate with Cronometer's own activity catalog instead —
+        untested for activity ids that weren't part of this account's
+        own history, so treat that path as lower-confidence than the
+        default custom path.
+
+        Args:
+            activity_name: display name shown in Cronometer's diary
+                (e.g. "Running", "Custom Exercise") -- sent as a real
+                wire field for the custom path, confirmed via capture.
+            duration_minutes: length of the activity in minutes.
+            calories_burned: calories burned, as a positive number (this
+                method negates it internally to match the wire format).
+            activity_id: Cronometer's numeric catalog id, or 0 (default)
+                for a custom/no-catalog-match entry.
+            met_coefficient: per-user floating constant (see
+                DEFAULT_MET_COEFFICIENT above) — defaults to the one
+                real captured value if not supplied.
+            day: "YYYY-MM-DD", defaults to today.
+
+        Returns:
+            True on success.
+        """
+        if not self.nonce or not self.user_id:
+            raise ValueError("client must be logged in before logging an exercise entry")
+        if duration_minutes <= 0:
+            raise ValueError("duration_minutes must be positive")
+        if calories_burned < 0:
+            raise ValueError("calories_burned must not be negative (this method negates it internally)")
+
+        if met_coefficient is None:
+            met_coefficient = self.DEFAULT_MET_COEFFICIENT
+        if day is None:
+            day = datetime.now().strftime("%Y-%m-%d")
+        year, month, dom = (int(p) for p in day.split("-"))
+        short_id = uuid.uuid4().hex[:5]
+        intensity_code = 0 if activity_id == 0 else 50
+
+        headers = {
+            "Content-Type": GWT_CONTENT_TYPE,
+            "x-gwt-module-base": GWT_MODULE_BASE,
+            "x-gwt-permutation": GWT_PERMUTATION,
+        }
+        payload = (
+            "7|0|10|https://cronometer.com/cronometer/|"
+            f"{GWT_HEADER}|com.cronometer.shared.rpc.CronometerService|addExercise|"
+            "java.lang.String/2004016611|com.cronometer.shared.exercise.Exercise/2894167537|I|"
+            f"{self.nonce}|"
+            "com.cronometer.shared.entries.models.Day/782579793|"
+            f"{activity_name}|1|2|3|4|3|5|6|7|8|"
+            f"{activity_id}|{intensity_code}|0|{-abs(calories_burned)}|9|{dom}|{month}|{year}|{short_id}|0|0|"
+            f"{duration_minutes}|10|0|1|0|0|{self.user_id}|{met_coefficient}|{self.user_id}|"
+        )
+        resp = self.session.post(GWT_BASE_URL, headers=headers, data=payload, timeout=30)
+        resp.raise_for_status()
+        success = resp.text.startswith("//OK")
+        if success:
+            logger.info(f"Logged exercise {activity_name!r} (id {activity_id}) x{duration_minutes}min on {day}")
+        else:
+            logger.error(f"Failed to log exercise entry: {resp.text}")
+        return success
+
+    # getRecentExercises response format -- CONFIRMED via one real
+    # captured response containing 14 real historical exercise records.
+    # The response is GWT-RPC's array-of-objects encoding: a flat value
+    # array (20 values per record: activityId at position 4 within each
+    # 20-wide chunk, anchored on this account's userId appearing at a
+    # FIXED position 1 within each chunk -- confirmed by locating every
+    # occurrence of the userId value and checking the gaps between them
+    # were all exactly 20), followed by a trailing GWT string table and
+    # a couple of small metadata ints. The per-record field layout below
+    # is the SAME Exercise class as add_exercise()'s write path, so this
+    # reuses that confirmed mapping rather than a second independent
+    # guess. See add_exercise()'s field-by-field comment for the fields
+    # NOT decoded here either (this parser only extracts what's needed
+    # to re-log an entry via add_exercise() -- met_coefficient,
+    # activity_id, duration, calories, and the date -- not every field).
+    def get_recent_exercises(self) -> list[Dict[str, Any]]:
+        """
+        Fetch the user's recent exercise history via getRecentExercises.
+        Returns a list of dicts: {activity_id, met_coefficient,
+        duration_minutes, calories_burned (positive), date
+        ("YYYY-MM-DD")} -- one per historical entry.
+
+        KNOWN GAP, not silently papered over: activity NAME is not
+        reliably resolvable from this response. The trailing GWT string
+        table in a real captured 14-record response contained only ONE
+        actual activity-name string ("Martial Arts, Moderate") despite
+        14 distinct records with different activity_ids (1146, 1341,
+        1231, 1176, 1160, 1213, 1345, 1138, 1320, 1342, 1319, 1183, 1256,
+        1157) -- confirming names are NOT embedded per-record in this
+        response for most rows (the one exception is coincidental to
+        that specific capture's context, not a general per-record
+        field). A caller wanting a display name for a given activity_id
+        would need a separate id->name lookup (e.g. findActivities,
+        which DOES map names to ids for catalog activities -- but has
+        its own unresolved field-layout ambiguity, see the module-level
+        comment above _parse_recent_exercises_response) or would need to
+        treat the entry as nameless/generic. This method returns
+        activity_id but deliberately does NOT return a fabricated or
+        guessed name field.
+
+        Also NOTE: this endpoint returned exactly 14 records for a real
+        account with history going back further than that -- it appears
+        to be a LIMITED/recent-window endpoint, not a full historical
+        export. For pulling a longer history, use export_exercises()'s
+        CSV export instead (date-range based, same convention as
+        export_servings() for the food diary) -- this method is best
+        suited for the write-side "get a met_coefficient/activity_id I
+        can reuse" lookup, not bulk historical sync.
+        """
+        if not self.nonce or not self.user_id:
+            raise ValueError("client must be logged in before fetching exercise history")
+        headers = {
+            "Content-Type": GWT_CONTENT_TYPE,
+            "x-gwt-module-base": GWT_MODULE_BASE,
+            "x-gwt-permutation": GWT_PERMUTATION,
+        }
+        payload = (
+            "7|0|6|https://cronometer.com/cronometer/|"
+            f"{GWT_HEADER}|com.cronometer.shared.rpc.CronometerService|getRecentExercises|"
+            f"java.lang.String/2004016611|{self.nonce}|1|2|3|4|1|5|6|"
+        )
+        resp = self.session.post(GWT_BASE_URL, headers=headers, data=payload, timeout=30)
+        resp.raise_for_status()
+        if not resp.text.startswith("//OK"):
+            logger.error(f"Failed to fetch recent exercises: {resp.text}")
+            return []
+        return self._parse_recent_exercises_response(resp.text)
+
+    def _parse_recent_exercises_response(self, raw: str) -> list[Dict[str, Any]]:
+        """Split off //OK[ ... ] and parse the flat value array into
+        structured records (20 raw values per record, anchored on
+        self.user_id at a fixed position within each chunk -- confirmed
+        via a real 14-record response). Isolated as its own method so
+        the parsing logic (not the HTTP call) is what a unit test
+        exercises against real captured response text.
+
+        Does NOT attempt to resolve activity names -- see
+        get_recent_exercises()'s docstring for why that's a known,
+        deliberate gap rather than a guess."""
+        body = raw[len("//OK["):-1] if raw.startswith("//OK[") and raw.endswith("]") else raw[4:]
+        table_start = body.find('[')
+        numeric_part = body[:table_start].rstrip(',')
+        values = []
+        for tok in numeric_part.split(','):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if tok.startswith('"') and tok.endswith('"'):
+                values.append(tok[1:-1])
+                continue
+            try:
+                values.append(int(tok))
+            except ValueError:
+                values.append(float(tok))
+
+        anchor = int(self.user_id)
+        anchors = [i for i, v in enumerate(values) if v == anchor]
+        records = []
+        for a in anchors:
+            start = a - 1  # userId confirmed at position 1 within each 20-wide chunk
+            if start < 0 or start + 20 > len(values):
+                continue
+            chunk = values[start:start + 20]
+            met_coefficient = chunk[0]
+            duration_minutes = chunk[7]
+            year, month, dom = chunk[11], chunk[12], chunk[13]
+            calories_burned = -chunk[15]
+            activity_id = chunk[18]
+            records.append({
+                "activity_id": activity_id,
+                "met_coefficient": met_coefficient,
+                "duration_minutes": duration_minutes,
+                "calories_burned": calories_burned,
+                "date": f"{year:04d}-{month:02d}-{dom:02d}",
+            })
+        return records
+
     def export(self, export_type: str, start_date: str, end_date: str) -> str:
         """
-        Export data from Cronometer.
-        
         Args:
             export_type: Type of export ('servings', 'dailySummary', 'exercises', 'biometrics', 'notes')
             start_date: Start date in YYYY-MM-DD format
@@ -463,6 +759,95 @@ def parse_servings_csv(raw_csv: str) -> list[Dict[str, Any]]:
     rows = []
     for row in reader:
         parsed = {k: _try_parse_number(v) for k, v in row.items()}
+        rows.append(parsed)
+    return rows
+
+
+# Exercises CSV column names -- CONFIRMED against a real exported file
+# from this account (exercises (2).csv, 15 real rows spanning
+# 2026-07-15 to 2026-07-21, including real device-synced entries like
+# "Active Energy Balance (Apple Health)" and "Traditional Strength
+# Training (Apple Health)" alongside manually-logged ones like "Martial
+# Arts" and "Custom Exercise"). Real header: Day,Group,Exercise,Minutes,
+# Calories Burned -- an extra `Group` column exists (always
+# "Uncategorized" in the real sample) that isn't used by this parser but
+# is preserved under its raw key like every other column.
+#
+# IMPORTANT, confirmed via the real file: "Calories Burned" is NEGATIVE
+# in the CSV itself (e.g. -402.21, -245.07) -- exercise calorie burn is
+# stored as a negative delta in Cronometer's own export, matching the
+# same negative-delta convention already confirmed on the GWT-RPC write
+# side (add_exercise() negates a positive input internally). This parser
+# negates it back to positive so callers get calories_burned as a
+# positive number consistently, matching ExerciseLogContract's own
+# convention (see food_entry_contract.py) and add_exercise()'s input
+# convention -- getting this sign wrong here would have silently stored
+# every synced exercise entry with negative calories, which is exactly
+# the kind of thing this project's tenets say to verify rather than
+# assume, and was caught precisely because a real file was checked
+# instead of trusting the initial corroborated-but-unconfirmed guess.
+EXERCISE_CSV_CALORIES_COLUMN_CANDIDATES = [
+    "Calories Burned",
+    "Calories Burned (kcal)",
+    "Energy (kcal)",
+    "kcal",
+]
+
+
+def parse_exercises_csv(raw_csv: str) -> list[Dict[str, Any]]:
+    """
+    Parse the exercises export CSV into a list of dicts with normalized
+    keys: {date, activity_name, duration_minutes, calories_burned}, plus
+    every original column preserved under its raw CSV header too (same
+    "parse everything, keep the source data too" approach
+    parse_servings_csv already uses) -- so a caller can inspect the raw
+    row if the normalized fields don't cover something needed later.
+
+    Raises ValueError if the CSV's header doesn't contain a recognizable
+    'Day'/'Exercise'/'Minutes' column, or none of
+    EXERCISE_CSV_CALORIES_COLUMN_CANDIDATES matches -- surfacing a
+    genuinely wrong assumption immediately (e.g. Cronometer renaming a
+    column) rather than silently producing empty/zeroed records. The
+    core column names (Day/Exercise/Minutes/Calories Burned) are
+    confirmed against a real exported file from this account -- see the
+    comment above EXERCISE_CSV_CALORIES_COLUMN_CANDIDATES.
+    """
+    reader = csv.DictReader(raw_csv.splitlines())
+    if reader.fieldnames is None:
+        return []
+
+    fieldnames = set(reader.fieldnames)
+    missing = [c for c in ("Day", "Exercise", "Minutes") if c not in fieldnames]
+    if missing:
+        raise ValueError(
+            f"exercises CSV is missing expected column(s) {missing} -- header was "
+            f"{reader.fieldnames!r}. This means the real export format differs from what "
+            f"was previously confirmed against a real file and needs re-verifying, not "
+            f"silently guessed further."
+        )
+    calories_col = next((c for c in EXERCISE_CSV_CALORIES_COLUMN_CANDIDATES if c in fieldnames), None)
+    if calories_col is None:
+        raise ValueError(
+            f"exercises CSV has no recognizable calories-burned column -- header was "
+            f"{reader.fieldnames!r}, checked candidates {EXERCISE_CSV_CALORIES_COLUMN_CANDIDATES!r}."
+        )
+
+    rows = []
+    for row in reader:
+        parsed = {k: _try_parse_number(v) for k, v in row.items()}
+        parsed["date"] = row.get("Day")
+        parsed["activity_name"] = row.get("Exercise")
+        parsed["duration_minutes"] = _try_parse_number(row.get("Minutes"))
+        raw_calories = _try_parse_number(row.get(calories_col))
+        # Confirmed via a real exported file: Cronometer stores this
+        # NEGATIVE (a burn delta) -- negate back to positive so callers
+        # get a consistent, positive calories_burned regardless of
+        # source (matches ExerciseLogContract's and add_exercise()'s
+        # convention). abs() rather than a plain negation in case a
+        # future export ever has a stray positive value for some other
+        # reason -- either way "burned calories" should read as
+        # positive.
+        parsed["calories_burned"] = abs(raw_calories) if isinstance(raw_calories, (int, float)) else raw_calories
         rows.append(parsed)
     return rows
 

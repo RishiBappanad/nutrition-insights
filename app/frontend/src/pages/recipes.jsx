@@ -3,6 +3,7 @@ import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import { Plus, Trash2, Save, CheckCircle, Search, ArrowLeft, ChefHat, X } from 'lucide-react'
+import { todayIso } from '@/lib/dates'
 
 const MACRO_NUTRIENT_NAMES = {
   calories: { name: 'Energy', unit: 'KCAL' },
@@ -99,9 +100,11 @@ function RecipeDetail({ recipeId, onBack, onEdit }) {
   const [loading, setLoading] = useState(true)
   const [canMake, setCanMake] = useState(null)
   const [checkingCanMake, setCheckingCanMake] = useState(false)
+  const [making, setMaking] = useState(false)
+  const [makeStatus, setMakeStatus] = useState('')
   const [logServings, setLogServings] = useState(1)
   const [logMeal, setLogMeal] = useState('Lunch')
-  const [logDate, setLogDate] = useState(new Date().toISOString().slice(0, 10))
+  const [logDate, setLogDate] = useState(todayIso())
   const [logging, setLogging] = useState(false)
   const [status, setStatus] = useState('')
 
@@ -117,6 +120,22 @@ function RecipeDetail({ recipeId, onBack, onEdit }) {
     const res = await api(`/recipes/${recipeId}/can-make`)
     setCanMake(await res.json())
     setCheckingCanMake(false)
+  }
+
+  async function handleMake() {
+    setMaking(true)
+    setMakeStatus('')
+    const res = await api(`/recipes/${recipeId}/make`, { method: 'POST' })
+    setMaking(false)
+    if (res.ok) {
+      const data = await res.json()
+      setMakeStatus(`made:${data.servings_added}`)
+      setCanMake(null) // pantry state changed -- force a fresh check if they look again
+    } else {
+      const data = await res.json().catch(() => ({}))
+      const detail = data.detail
+      setMakeStatus(typeof detail === 'object' ? detail.message : detail || `Failed (${res.status})`)
+    }
   }
 
   async function handleLog() {
@@ -213,7 +232,7 @@ function RecipeDetail({ recipeId, onBack, onEdit }) {
                 {checkingCanMake ? 'Checking...' : 'Check Pantry'}
               </button>
             ) : (
-              <div className="space-y-2">
+              <div className="space-y-3">
                 <p className={cn('text-sm font-medium', canMake.can_make ? 'text-emerald-500' : 'text-amber-500')}>
                   {canMake.can_make ? 'You have everything!' : 'Missing some ingredients'}
                 </p>
@@ -226,6 +245,31 @@ function RecipeDetail({ recipeId, onBack, onEdit }) {
                   <div className="text-xs text-muted-foreground">
                     Can't check: {canMake.unmatchable.map((m) => m.food_name).join(', ')} (no pantry match)
                   </div>
+                )}
+                {canMake.can_make && (
+                  <div className="pt-1">
+                    <button
+                      onClick={handleMake}
+                      disabled={making}
+                      className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                    >
+                      <ChefHat className="h-4 w-4" />
+                      {making ? 'Making...' : 'Make It'}
+                    </button>
+                    <p className="text-xs text-muted-foreground mt-1.5">
+                      Decrements the ingredients used, then adds the finished batch ({recipe.servings_per_batch} servings) to
+                      your pantry — it won't be logged to your diary until you consume it from there.
+                    </p>
+                  </div>
+                )}
+                {makeStatus.startsWith('made:') && (
+                  <p className="text-sm text-emerald-500 flex items-center gap-1">
+                    <CheckCircle className="h-4 w-4" />
+                    Added {makeStatus.split(':')[1]} servings to your pantry
+                  </p>
+                )}
+                {makeStatus && !makeStatus.startsWith('made:') && (
+                  <p className="text-sm text-destructive">{makeStatus}</p>
                 )}
               </div>
             )}

@@ -201,6 +201,100 @@ def _servings_row_to_food_log_entry(row: dict) -> "FoodLogEntryContract":
     )
 
 
+async def _sync_exercise_entries(cronometer_files: dict, user_id: int) -> int:
+    """
+    Parse the exercises export, convert each row to an
+    ExerciseLogContract (app/food_entry_contract.py), and write it via
+    log_exercise_entry() — the SAME shared write path POST /exercise
+    uses. Same decoupling rationale as _sync_diary_entries.
+
+    UNLIKE _sync_diary_entries, this IS duplicate-safe on resync: the
+    exercises CSV has no stable per-row id either, but
+    log_exercise_entry() dedupes on (user_id, source, source_id) when
+    source_id is present -- so this builds a deterministic composite
+    source_id (date + activity_name + duration + calories) per row via
+    _exercise_row_source_id() below. Re-syncing the same historical range
+    re-derives the SAME source_id for an unchanged row and dedupes
+    correctly, while two genuinely different real entries on the same
+    day (different activity, or the same activity logged twice with
+    different duration/calories) still get distinct source_ids and both
+    import. This deliberately does NOT repeat the known duplicate-import
+    limitation _sync_diary_entries still has -- exercise sync was built
+    after that gap was already identified, so it avoids the same mistake
+    from the start rather than inheriting it.
+
+    Returns the number of entries imported (dedup-skipped rows are not
+    counted as newly imported).
+    """
+    from ..food_entry_contract import log_exercise_entry
+    from integrations.cronometer_rpc import parse_exercises_csv
+
+    exercises_path = cronometer_files.get("exercises")
+    if not exercises_path:
+        return 0
+
+    with open(exercises_path) as f:
+        raw_csv = f.read()
+
+    try:
+        rows = parse_exercises_csv(raw_csv)
+    except ValueError:
+        # A real schema mismatch (see parse_exercises_csv's own
+        # validation) -- surfaced to the caller as "0 imported" rather
+        # than crashing the whole /sync/cronometer call, since exercise
+        # sync failing shouldn't block the food diary / BMR / biometrics
+        # parts of the same sync from completing. The underlying error
+        # is still logged server-side for investigation.
+        import logging
+        logging.getLogger(__name__).exception("Failed to parse exercises CSV during sync")
+        return 0
+
+    count = 0
+    for row in rows:
+        entry = _exercise_row_to_contract(row)
+        if entry is None:
+            continue
+        _entry_id, was_created = await log_exercise_entry(user_id, entry)
+        if was_created:
+            count += 1
+    return count
+
+
+def _exercise_row_source_id(date: str, activity_name: str, duration_minutes, calories_burned) -> str:
+    """Deterministic composite key for one exercises-CSV row -- same
+    inputs always produce the same source_id, so log_exercise_entry()'s
+    dedupe (see its own docstring) correctly recognizes a re-synced row
+    as already-imported. Isolated as its own function so this logic is
+    directly unit-testable without needing a DB connection or an
+    async/event-loop context (see tests/test_exercise_sync_parsing.py)."""
+    import hashlib
+    composite = f"{date}|{activity_name}|{duration_minutes}|{calories_burned}"
+    return hashlib.sha256(composite.encode()).hexdigest()[:16]
+
+
+def _exercise_row_to_contract(row: dict):
+    """Convert one parsed exercises-CSV row (see parse_exercises_csv) into
+    an ExerciseLogContract, or None if the row is missing required
+    fields (date/activity_name) and should be skipped. Isolated from
+    _sync_exercise_entries so this pure conversion logic is directly
+    unit-testable without a DB connection."""
+    from ..food_entry_contract import ExerciseLogContract
+
+    if not row.get("date") or not row.get("activity_name"):
+        return None
+    source_id = _exercise_row_source_id(
+        row["date"], row["activity_name"], row.get("duration_minutes"), row.get("calories_burned"),
+    )
+    return ExerciseLogContract(
+        date=str(row["date"]),
+        activity_name=str(row["activity_name"]),
+        duration_minutes=row.get("duration_minutes"),
+        calories_burned=float(row.get("calories_burned") or 0),
+        source="Cronometer",
+        source_id=source_id,
+    )
+
+
 async def _sync_diary_entries(cronometer_files: dict, user_id: int) -> int:
     """
     Parse the servings export, convert each row to a FoodLogEntryContract
@@ -284,6 +378,7 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
             _filter_biometrics(results["biometrics"])
         tdee_days_updated = await _update_tdee_log(results, user_id)
         diary_entries_imported = await _sync_diary_entries(results, user_id)
+        exercise_entries_imported = await _sync_exercise_entries(results, user_id)
 
         # Populate Postgres with nutrition data
         from ..user_db import upsert_daily_nutrition
@@ -326,7 +421,12 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
                     if "Weight" in row["Metric"] and "Apple Health" not in row["Metric"]:
                         await upsert_daily_nutrition(user_id, row["Day"], {"Weight (lbs)": float(row["Amount"])})
 
-        return {"status": "ok", "tdee_days_updated": tdee_days_updated, "diary_entries_imported": diary_entries_imported}
+        return {
+            "status": "ok",
+            "tdee_days_updated": tdee_days_updated,
+            "diary_entries_imported": diary_entries_imported,
+            "exercise_entries_imported": exercise_entries_imported,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
