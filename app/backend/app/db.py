@@ -343,9 +343,14 @@ async def init_db():
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
                 name TEXT NOT NULL,
                 servings_per_batch DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                source TEXT,
+                source_id TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
+
+            ALTER TABLE recipes ADD COLUMN IF NOT EXISTS source TEXT;
+            ALTER TABLE recipes ADD COLUMN IF NOT EXISTS source_id TEXT;
 
             -- One row per ingredient in a recipe. source/source_id mirrors
             -- food_log's convention (USDA/CNF/custom) — a recipe ingredient

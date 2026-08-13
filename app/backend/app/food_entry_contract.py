@@ -75,6 +75,8 @@ class RecipeImportContract(BaseModel):
     recipes/recipe_items rows directly."""
     name: str
     servings_per_batch: float = 1.0
+    source: Optional[str] = None
+    source_id: Optional[str] = None
     items: list[RecipeItemContract] = []
 
 
@@ -160,16 +162,10 @@ async def log_food_entry(user_id: int, entry: FoodLogEntryContract) -> int:
 async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
     """
     Write one RecipeImportContract into recipes + recipe_items +
-    recipe_item_nutrients — the same insert logic POST /recipes runs
-    (see routers/recipes.py::create_recipe and its _save_items helper).
+    recipe_item_nutrients. Supports deduplication if source and source_id
+    are provided (updating existing recipe items rather than creating duplicates).
 
-    A source with its own recipe concept (a future Cronometer recipe
-    importer, once addFood's field-order schema is actually decoded —
-    see nutrition-diary-design.md for why that's deferred, not built
-    blind) converts to this model and calls this function, rather than
-    writing recipes/recipe_items rows directly.
-
-    Returns the new recipe's id.
+    Returns the recipe's id.
     """
     if recipe.servings_per_batch <= 0:
         raise ValueError("servings_per_batch must be positive")
@@ -177,10 +173,25 @@ async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            recipe_id = await conn.fetchval(
-                "INSERT INTO recipes (user_id, name, servings_per_batch) VALUES ($1, $2, $3) RETURNING id",
-                user_id, recipe.name, recipe.servings_per_batch,
-            )
+            recipe_id = None
+            if recipe.source and recipe.source_id:
+                recipe_id = await conn.fetchval(
+                    "SELECT id FROM recipes WHERE user_id = $1 AND source = $2 AND source_id = $3",
+                    user_id, recipe.source, recipe.source_id,
+                )
+
+            if recipe_id is not None:
+                await conn.execute(
+                    "UPDATE recipes SET name = $1, servings_per_batch = $2, updated_at = now() WHERE id = $3",
+                    recipe.name, recipe.servings_per_batch, recipe_id,
+                )
+                await conn.execute("DELETE FROM recipe_items WHERE recipe_id = $1", recipe_id)
+            else:
+                recipe_id = await conn.fetchval(
+                    "INSERT INTO recipes (user_id, name, servings_per_batch, source, source_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                    user_id, recipe.name, recipe.servings_per_batch, recipe.source, recipe.source_id,
+                )
+
             for item in recipe.items:
                 item_id = await conn.fetchval(
                     """INSERT INTO recipe_items (recipe_id, food_name, source, source_id, amount_grams, amount_multiple,

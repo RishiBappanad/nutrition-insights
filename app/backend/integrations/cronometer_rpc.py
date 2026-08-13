@@ -287,12 +287,7 @@ class CronometerRPCClient:
         """
         List the user's own custom foods, recipes, and meals via the
         findMyFoods GWT RPC method (confirmed via a real captured
-        request/response). Returns the raw GWT-RPC response text — the
-        response encoding for this call hasn't been fully decoded yet
-        (unlike updateDiary's request encoding, which was reverse-
-        engineered from multiple varied captures); callers needing
-        structured data should decode further once a real response
-        payload has been captured and verified, not guessed.
+        request/response). Returns the raw GWT-RPC response text.
         """
         if not self.nonce or not self.user_id:
             raise ValueError("client must be logged in before listing foods")
@@ -309,6 +304,127 @@ class CronometerRPCClient:
         resp = self.session.post(GWT_BASE_URL, headers=headers, data=payload, timeout=30)
         resp.raise_for_status()
         return resp.text
+
+    def parse_find_my_foods(self, raw_gwt: str) -> list[Dict[str, Any]]:
+        """
+        Parse raw GWT-RPC response from findMyFoods into structured list of
+        {'food_id': int, 'name': str}.
+        """
+        body = raw_gwt[len("//OK["):-1] if raw_gwt.startswith("//OK[") and raw_gwt.endswith("]") else raw_gwt
+        if body.startswith("//OK"):
+            body = body[4:]
+        
+        table_start = body.rfind('[')
+        if table_start == -1:
+            return []
+        
+        # String table at end
+        str_table_raw = body[table_start:]
+        import json
+        try:
+            strings = json.loads(str_table_raw)
+        except Exception:
+            strings = []
+
+        # Find all large integers (food_ids, typically > 10000)
+        numeric_part = body[:table_start]
+        tokens = [t.strip() for t in numeric_part.split(',') if t.strip()]
+        
+        food_ids = []
+        for t in tokens:
+            try:
+                val = int(t)
+                if val > 100000:
+                    food_ids.append(val)
+            except ValueError:
+                pass
+
+        results = []
+        # Pair food_ids with string names in reverse order of seq_idx
+        for idx, fid in enumerate(food_ids):
+            if idx < len(strings):
+                name = strings[idx]
+                if name and isinstance(name, str):
+                    results.append({"food_id": fid, "name": name})
+        return results
+
+    def get_food(self, food_id: int) -> Dict[str, Any]:
+        """
+        Fetch details for a specific food or recipe from Cronometer by food_id via getFood.
+        Returns dict with: name, is_recipe, ingredients, nutrients
+        """
+        if not self.user_id:
+            raise ValueError("client must be logged in before getting food")
+        headers = {
+            "Content-Type": GWT_CONTENT_TYPE,
+            "x-gwt-module-base": GWT_MODULE_BASE,
+            "x-gwt-permutation": GWT_PERMUTATION,
+        }
+        payload = (
+            "7|0|5|https://cronometer.com/cronometer/|"
+            f"{GWT_HEADER}|com.cronometer.shared.rpc.CronometerService|getFood|"
+            f"I|{food_id}|1|2|3|4|1|5|"
+        )
+        resp = self.session.post(GWT_BASE_URL, headers=headers, data=payload, timeout=30)
+        resp.raise_for_status()
+        raw = resp.text
+
+        # Extract name from string table
+        body = raw[len("//OK["):-1] if raw.startswith("//OK[") and raw.endswith("]") else raw
+        if body.startswith("//OK"):
+            body = body[4:]
+        
+        table_start = body.rfind('[')
+        name = f"Food #{food_id}"
+        if table_start != -1:
+            try:
+                import json
+                strings = json.loads(body[table_start:])
+                if strings and isinstance(strings[0], str):
+                    name = strings[0]
+            except Exception:
+                pass
+
+        # Parse numeric tokens for ingredients and nutrients
+        numeric_part = body[:table_start] if table_start != -1 else body
+        tokens = [t.strip() for t in numeric_part.split(',') if t.strip()]
+        
+        # Check if recipe (contains ingredient markers)
+        ingredients = []
+        is_recipe = False
+        
+        # Scan for ingredients: [tag, 0, id, code, target_food_id, amount_grams, 4]
+        for i in range(len(tokens) - 6):
+            try:
+                tag = int(tokens[i+6])
+                if tag == 4:  # Ingredient tag
+                    target_id = int(tokens[i+4])
+                    amount = float(tokens[i+5])
+                    if target_id > 1000:
+                        ingredients.append({"food_id": target_id, "amount_grams": amount})
+                        is_recipe = True
+            except (ValueError, IndexError):
+                pass
+
+        # Extract nutrients (GWT nutrient IDs: 208=calories, 203=protein, 204=fat, 205=carbs, 291=fiber)
+        NUTRIENT_ID_MAP = {208: "calories", 203: "protein", 204: "fat", 205: "carbs", 291: "fiber"}
+        nutrients = {}
+        for i in range(len(tokens) - 2):
+            try:
+                nid = int(tokens[i])
+                if nid in NUTRIENT_ID_MAP:
+                    val = float(tokens[i+1])
+                    nutrients[NUTRIENT_ID_MAP[nid]] = abs(val)
+            except (ValueError, IndexError):
+                pass
+
+        return {
+            "food_id": food_id,
+            "name": name,
+            "is_recipe": is_recipe,
+            "ingredients": ingredients,
+            "nutrients": nutrients,
+        }
 
     def log_diary_entry(self, food_id: int, measure_id: int, meal: str, quantity: float,
                          day: Optional[str] = None) -> bool:

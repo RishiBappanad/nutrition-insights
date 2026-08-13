@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
-import { Plus, Trash2, Save, CheckCircle, Search, ArrowLeft, ChefHat, X } from 'lucide-react'
+import { Plus, Trash2, Save, CheckCircle, Search, ArrowLeft, ChefHat, X, DownloadCloud, Loader2 } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
 
 const MACRO_NUTRIENT_NAMES = {
@@ -31,6 +31,14 @@ export default function Recipes() {
   const [loading, setLoading] = useState(true)
   const [activeId, setActiveId] = useState(null)
 
+  // Cronometer Recipe Import State
+  const [showCronoModal, setShowCronoModal] = useState(false)
+  const [cronoRecipes, setCronoRecipes] = useState([])
+  const [cronoLoading, setCronoLoading] = useState(false)
+  const [cronoError, setCronoError] = useState(null)
+  const [importingId, setImportingId] = useState(null)
+  const [importedIds, setImportedIds] = useState(new Set())
+
   function refresh() {
     setLoading(true)
     api('/recipes')
@@ -40,6 +48,45 @@ export default function Recipes() {
   }
 
   useEffect(refresh, [])
+
+  function fetchCronometerRecipes() {
+    setCronoLoading(true)
+    setCronoError(null)
+    api('/sync/cronometer/recipes')
+      .then(async (res) => {
+        if (!res.ok) {
+          const err = await res.json()
+          throw new Error(err.detail || 'Failed to fetch Cronometer recipes')
+        }
+        return res.json()
+      })
+      .then((data) => {
+        const list = data.recipes || []
+        setCronoRecipes(list)
+        const alreadyImported = list.filter((r) => r.is_imported).map((r) => r.food_id)
+        setImportedIds((prev) => new Set([...prev, ...alreadyImported]))
+      })
+      .catch((err) => setCronoError(err.message))
+      .finally(() => setCronoLoading(false))
+  }
+
+  function handleImport(foodId) {
+    setImportingId(foodId)
+    api(`/sync/cronometer/recipes/${foodId}/import`, { method: 'POST' })
+      .then(async (res) => {
+        if (!res.ok) {
+          const err = await res.json()
+          throw new Error(err.detail || 'Failed to import recipe')
+        }
+        return res.json()
+      })
+      .then(() => {
+        setImportedIds((prev) => new Set([...prev, foodId]))
+        refresh()
+      })
+      .catch((err) => setCronoError(err.message))
+      .finally(() => setImportingId(null))
+  }
 
   if (view === 'edit') {
     return <RecipeEditor recipeId={activeId} onDone={() => { setView('list'); refresh() }} onCancel={() => setView('list')} />
@@ -57,14 +104,116 @@ export default function Recipes() {
             Aggregate ingredients into a batch, log a serving to your diary
           </p>
         </div>
-        <button
-          onClick={() => { setActiveId(null); setView('edit') }}
-          className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
-        >
-          <Plus className="h-4 w-4" />
-          New Recipe
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              setShowCronoModal(true)
+              fetchCronometerRecipes()
+            }}
+            className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-border bg-background text-sm font-medium hover:bg-muted transition-colors"
+          >
+            <DownloadCloud className="h-4 w-4 text-muted-foreground" />
+            Import from Cronometer
+          </button>
+          <button
+            onClick={() => { setActiveId(null); setView('edit') }}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
+          >
+            <Plus className="h-4 w-4" />
+            New Recipe
+          </button>
+        </div>
       </div>
+
+      {showCronoModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="w-full max-w-lg rounded-lg border border-border bg-background p-6 shadow-lg space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">Cronometer Custom Recipes</h2>
+                <p className="text-xs text-muted-foreground mt-0.5">Select a recipe to resolve ingredients and import into TrackStack</p>
+              </div>
+              <button
+                onClick={() => setShowCronoModal(false)}
+                className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {cronoError && (
+              <div className="p-3 text-xs rounded bg-destructive/10 text-destructive border border-destructive/20">
+                {cronoError}
+              </div>
+            )}
+
+            {cronoLoading ? (
+              <div className="py-8 flex flex-col items-center justify-center gap-2 text-muted-foreground text-sm">
+                <Loader2 className="h-5 w-5 animate-spin" />
+                <span>Connecting to Cronometer &amp; resolving custom recipes...</span>
+              </div>
+            ) : cronoRecipes.length === 0 ? (
+              <div className="py-8 text-center text-sm text-muted-foreground">
+                No custom recipes found in your Cronometer account.
+              </div>
+            ) : (
+              <div className="max-h-80 overflow-y-auto space-y-2 pr-1">
+                {cronoRecipes.map((r) => {
+                  const isImported = importedIds.has(r.food_id)
+                  const isImporting = importingId === r.food_id
+
+                  return (
+                    <div
+                      key={r.food_id}
+                      className="p-3 rounded-md border border-border flex items-center justify-between gap-3 hover:bg-muted/50 transition-colors"
+                    >
+                      <div>
+                        <p className="text-sm font-medium text-foreground">{r.name}</p>
+                        <p className="text-xs text-muted-foreground">{r.ingredient_count} ingredient{r.ingredient_count === 1 ? '' : 's'}</p>
+                      </div>
+
+                      {isImported ? (
+                        <div className="flex items-center gap-2">
+                          <span className="inline-flex items-center gap-1 text-xs text-emerald-500 font-medium">
+                            <CheckCircle className="h-4 w-4" />
+                            Imported
+                          </span>
+                          <button
+                            disabled={isImporting}
+                            onClick={() => handleImport(r.food_id)}
+                            className="px-2.5 py-1 text-xs font-medium rounded border border-border hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                            title="Re-import / refresh recipe ingredients from Cronometer"
+                          >
+                            {isImporting ? 'Syncing...' : 'Re-sync'}
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          disabled={isImporting}
+                          onClick={() => handleImport(r.food_id)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                        >
+                          {isImporting && <Loader2 className="h-3 w-3 animate-spin" />}
+                          {isImporting ? 'Importing...' : 'Import'}
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
+            <div className="flex justify-end pt-2">
+              <button
+                onClick={() => setShowCronoModal(false)}
+                className="px-4 py-2 text-sm rounded-md border border-border hover:bg-muted transition-colors"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {loading ? (
         <p className="text-sm text-muted-foreground">Loading...</p>

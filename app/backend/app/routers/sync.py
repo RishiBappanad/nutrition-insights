@@ -548,3 +548,128 @@ async def sync_all(user_id: int = Depends(get_current_user)):
         results["hevy"] = {"error": str(e)}
 
     return results
+
+
+@router.get("/cronometer/recipes")
+async def list_cronometer_recipes(user_id: int = Depends(get_current_user)):
+    """List candidate custom recipes from Cronometer for import into TrackStack, with is_imported status."""
+    creds = await _get_user_creds(user_id)
+    if not creds["cronometer_username"] or not creds["cronometer_password"]:
+        raise HTTPException(status_code=400, detail="Cronometer credentials not set")
+
+    from integrations.cronometer_rpc import CronometerRPCClient
+    from ..db import get_pool
+
+    try:
+        # Get existing imported recipe source_ids for this user
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT source_id FROM recipes WHERE user_id = $1 AND source = 'Cronometer'", user_id)
+            imported_set = {r["source_id"] for r in rows if r["source_id"]}
+
+        client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
+        client.login()
+        raw_gwt = client.list_my_foods()
+        foods = client.parse_find_my_foods(raw_gwt)
+        
+        candidates = []
+        for item in foods:
+            food_id = item.get("food_id")
+            name = item.get("name")
+            if not food_id or not name:
+                continue
+            try:
+                food_detail = client.get_food(food_id)
+                if food_detail and food_detail.get("is_recipe"):
+                    ing_count = len(food_detail.get("ingredients", []))
+                    if ing_count >= 1:
+                        candidates.append({
+                            "food_id": food_id,
+                            "name": name,
+                            "ingredient_count": ing_count,
+                            "is_imported": str(food_id) in imported_set,
+                        })
+            except Exception:
+                pass
+        return {"status": "ok", "recipes": candidates}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/cronometer/recipes/{food_id}/import")
+async def import_cronometer_recipe(food_id: int, user_id: int = Depends(get_current_user)):
+    """Resolve a single Cronometer recipe's ingredients and import into TrackStack."""
+    creds = await _get_user_creds(user_id)
+    if not creds["cronometer_username"] or not creds["cronometer_password"]:
+        raise HTTPException(status_code=400, detail="Cronometer credentials not set")
+
+    from integrations.cronometer_rpc import CronometerRPCClient
+    from ..food_entry_contract import RecipeImportContract, RecipeItemContract, import_recipe
+
+    try:
+        client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
+        client.login()
+        recipe_info = client.get_food(food_id)
+        if not recipe_info:
+            raise HTTPException(status_code=404, detail="Recipe not found on Cronometer")
+
+        recipe_name = recipe_info.get("name") or f"Cronometer Recipe #{food_id}"
+        ingredients = recipe_info.get("ingredients", [])
+
+        items = []
+        for ing in ingredients:
+            ing_id = ing["food_id"]
+            amount_g = ing.get("amount_grams", 100.0)
+            try:
+                ing_info = client.get_food(ing_id)
+                ing_name = ing_info.get("name") or f"Ingredient #{ing_id}"
+                nutrients = ing_info.get("nutrients", {})
+                scale = amount_g / 100.0 if amount_g else 1.0
+
+                cal = round(nutrients.get("calories", 0) * scale, 1)
+                prot = round(nutrients.get("protein", 0) * scale, 1)
+                carb = round(nutrients.get("carbs", 0) * scale, 1)
+                fat = round(nutrients.get("fat", 0) * scale, 1)
+                fib = round(nutrients.get("fiber", 0) * scale, 1)
+
+                items.append(RecipeItemContract(
+                    food_name=ing_name,
+                    source="Cronometer",
+                    source_id=str(ing_id),
+                    amount_grams=amount_g,
+                    amount_multiple=1.0,
+                    calories=cal,
+                    protein=prot,
+                    carbs=carb,
+                    fat=fat,
+                    fiber=fib,
+                    nutrients={k: round(v * scale, 2) for k, v in nutrients.items() if k not in ("calories", "protein", "carbs", "fat", "fiber")},
+                ))
+            except Exception:
+                items.append(RecipeItemContract(
+                    food_name=f"Ingredient #{ing_id}",
+                    source="Cronometer",
+                    source_id=str(ing_id),
+                    amount_grams=amount_g,
+                ))
+
+        contract = RecipeImportContract(
+            name=recipe_name,
+            servings_per_batch=1.0,
+            source="Cronometer",
+            source_id=str(food_id),
+            items=items,
+        )
+
+        recipe_id = await import_recipe(user_id, contract)
+        return {
+            "status": "ok",
+            "recipe_id": recipe_id,
+            "name": recipe_name,
+            "ingredients_imported": len(items),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
