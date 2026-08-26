@@ -106,7 +106,6 @@ async def init_db():
                 protein DOUBLE PRECISION DEFAULT 0,
                 carbs DOUBLE PRECISION DEFAULT 0,
                 fat DOUBLE PRECISION DEFAULT 0,
-                fiber DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT
             );
 
@@ -235,8 +234,9 @@ async def init_db():
             -- the row outright). Links to the same food database food_log
             -- uses (source/source_id) so a pantry item never duplicates a
             -- food's canonical definition elsewhere -- but it DOES store
-            -- its own nutrition data (calories/protein/carbs/fat/fiber +
-            -- pantry_item_nutrients below), PER serving_size/serving_unit,
+            -- its own nutrition data (calories/protein/carbs/fat +
+            -- pantry_item_nutrients below, which carries fiber and every
+            -- other non-macro nutrient), PER serving_size/serving_unit,
             -- the same "reference amount + scale by count" convention
             -- custom_foods uses. This was NOT true originally (a pantry
             -- item stored zero nutrition, relying on the caller to
@@ -261,7 +261,6 @@ async def init_db():
                 protein DOUBLE PRECISION DEFAULT 0,
                 carbs DOUBLE PRECISION DEFAULT 0,
                 fat DOUBLE PRECISION DEFAULT 0,
-                fiber DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT,
                 added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -275,7 +274,6 @@ async def init_db():
             ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS protein DOUBLE PRECISION DEFAULT 0;
             ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS carbs DOUBLE PRECISION DEFAULT 0;
             ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS fat DOUBLE PRECISION DEFAULT 0;
-            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS fiber DOUBLE PRECISION DEFAULT 0;
             ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS nutrients_json TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_pantry_items_user ON pantry_items(user_id);
@@ -315,7 +313,6 @@ async def init_db():
                 protein DOUBLE PRECISION DEFAULT 0,
                 carbs DOUBLE PRECISION DEFAULT 0,
                 fat DOUBLE PRECISION DEFAULT 0,
-                fiber DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -369,7 +366,6 @@ async def init_db():
                 protein DOUBLE PRECISION DEFAULT 0,
                 carbs DOUBLE PRECISION DEFAULT 0,
                 fat DOUBLE PRECISION DEFAULT 0,
-                fiber DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT
             );
 
@@ -406,7 +402,6 @@ async def init_db():
                 protein DOUBLE PRECISION DEFAULT 0,
                 carbs DOUBLE PRECISION DEFAULT 0,
                 fat DOUBLE PRECISION DEFAULT 0,
-                fiber DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT
             );
 
@@ -506,6 +501,70 @@ async def init_db():
             );
 
             CREATE INDEX IF NOT EXISTS idx_exercise_log_user_date ON exercise_log(user_id, date);
+
+            -- One-time migration: fiber used to be a 5th denormalized
+            -- macro column on food_log/pantry_items/custom_foods/
+            -- recipe_items/meal_items, alongside calories/protein/carbs/
+            -- fat. Standardized away per explicit user request — fiber is
+            -- a micronutrient, not one of the 3 true macros, and belongs
+            -- in the per-nutrient child tables under "Fiber, total
+            -- dietary" like every other nutrient, not as its own sibling
+            -- column. Each block backfills any row whose fiber value
+            -- isn't already represented in that nutrient (many rows
+            -- already have it there too, from being logged interactively
+            -- — ON CONFLICT DO NOTHING skips those safely) before
+            -- dropping the now-redundant column. Idempotent: safe to run
+            -- on every startup — DROP COLUMN IF EXISTS is a no-op once
+            -- the column is gone, and the backfill SELECT returns nothing
+            -- once the source column no longer exists on a given run
+            -- (guarded by IF EXISTS wrapping each pair below).
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'food_log' AND column_name = 'fiber') THEN
+                    INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit)
+                    SELECT id, 'Fiber, total dietary', fiber, 'G' FROM food_log
+                    WHERE fiber IS NOT NULL AND fiber != 0
+                    ON CONFLICT (food_log_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE food_log DROP COLUMN fiber;
+                END IF;
+
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'pantry_items' AND column_name = 'fiber') THEN
+                    INSERT INTO pantry_item_nutrients (pantry_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Fiber, total dietary', fiber, 'G' FROM pantry_items
+                    WHERE fiber IS NOT NULL AND fiber != 0
+                    ON CONFLICT (pantry_item_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE pantry_items DROP COLUMN fiber;
+                END IF;
+
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'custom_foods' AND column_name = 'fiber') THEN
+                    INSERT INTO custom_food_nutrients (custom_food_id, nutrient_name, value, unit)
+                    SELECT id, 'Fiber, total dietary', fiber, 'G' FROM custom_foods
+                    WHERE fiber IS NOT NULL AND fiber != 0
+                    ON CONFLICT (custom_food_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE custom_foods DROP COLUMN fiber;
+                END IF;
+
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'recipe_items' AND column_name = 'fiber') THEN
+                    INSERT INTO recipe_item_nutrients (recipe_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Fiber, total dietary', fiber, 'G' FROM recipe_items
+                    WHERE fiber IS NOT NULL AND fiber != 0
+                    ON CONFLICT (recipe_item_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE recipe_items DROP COLUMN fiber;
+                END IF;
+
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'meal_items' AND column_name = 'fiber') THEN
+                    INSERT INTO meal_item_nutrients (meal_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Fiber, total dietary', fiber, 'G' FROM meal_items
+                    WHERE fiber IS NOT NULL AND fiber != 0
+                    ON CONFLICT (meal_item_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE meal_items DROP COLUMN fiber;
+                END IF;
+            END $$;
         """)
 
 

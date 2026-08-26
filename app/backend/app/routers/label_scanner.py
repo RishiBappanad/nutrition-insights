@@ -47,8 +47,8 @@ Return ONLY valid JSON with this exact schema, no other text:
   "protein": number or null (grams),
   "carbs": number or null (grams, Total Carbohydrate),
   "fat": number or null (grams, Total Fat),
-  "fiber": number or null (grams, Dietary Fiber),
   "nutrients": {
+    "Fiber, total dietary": {"value": number, "unit": "G"},
     "Sodium, Na": {"value": number, "unit": "mg"},
     "Sugars, total": {"value": number, "unit": "g"}
   }
@@ -56,6 +56,8 @@ Return ONLY valid JSON with this exact schema, no other text:
 
 Rules:
 - Only include nutrients actually visible on the label in the "nutrients" object
+- Dietary Fiber goes in "nutrients" as "Fiber, total dietary" — it is NOT one \
+of the 4 top-level macro fields (calories/protein/carbs/fat)
 - Use standard USDA-style nutrient names where recognizable (e.g. "Sodium, Na", \
 "Iron, Fe", "Calcium, Ca", "Potassium, K", "Vitamin C, total ascorbic acid", \
 "Vitamin D (D2 + D3)") so this matches the naming convention used elsewhere \
@@ -63,7 +65,7 @@ in this app's nutrient tracking — if unsure of the exact convention name, \
 use the label's own wording instead of guessing a USDA name incorrectly.
 - All values should be plain numbers (no units in the number fields)
 - If a field isn't visible or legible, use null — do NOT hallucinate values
-- calories/protein/carbs/fat/fiber refer to the amount for ONE reference serving \
+- calories/protein/carbs/fat refer to the amount for ONE reference serving \
 (reference_amount of reference_unit), not per-container"""
 
 
@@ -79,7 +81,8 @@ class LabelScanResult(BaseModel):
     protein: Optional[float] = None
     carbs: Optional[float] = None
     fat: Optional[float] = None
-    fiber: Optional[float] = None
+    # Fiber is not a top-level field — it's returned in nutrients under
+    # "Fiber, total dietary" like every other non-macro nutrient.
     nutrients: dict = {}
     error: Optional[str] = None
 
@@ -159,6 +162,17 @@ def extract_label_with_gemini(image_bytes: bytes, mime_type: str) -> LabelScanRe
             except (TypeError, ValueError):
                 continue
 
+    # Defensive fallback: the prompt asks Gemini to put fiber inside
+    # `nutrients`, but its output isn't schema-enforced — if it still
+    # returns a stray top-level "fiber" despite the prompt, fold it in
+    # rather than silently dropping it.
+    legacy_fiber = parsed.get("fiber")
+    if legacy_fiber is not None and "Fiber, total dietary" not in nutrients:
+        try:
+            nutrients["Fiber, total dietary"] = {"value": float(legacy_fiber), "unit": "G"}
+        except (TypeError, ValueError):
+            pass
+
     confidence = _confidence_score(parsed)
     return LabelScanResult(
         status="success" if confidence >= 0.5 else "partial",
@@ -172,7 +186,6 @@ def extract_label_with_gemini(image_bytes: bytes, mime_type: str) -> LabelScanRe
         protein=parsed.get("protein"),
         carbs=parsed.get("carbs"),
         fat=parsed.get("fat"),
-        fiber=parsed.get("fiber"),
         nutrients=nutrients,
     )
 

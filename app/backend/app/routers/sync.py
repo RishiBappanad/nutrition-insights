@@ -1,11 +1,14 @@
 import csv
 import sys
 import asyncio
+import logging
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from ..routers.auth import get_current_user
 from ..routers.data import user_data_dir
 from ..db import get_pool, decrypt
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -101,18 +104,20 @@ async def _update_tdee_log(cronometer_files: dict, user_id: int) -> int:
 # already-authenticated CSV export, not something requiring further
 # reverse-engineering.
 #
-# Column name -> (food_log column, is_macro) for the 5 hardcoded macro
-# fields; every other numeric column in the CSV becomes a
-# food_log_nutrients row instead. Cronometer's CSV header uses "Âµg" for
-# micrograms (a UTF-8/Latin-1 mojibake artifact in their own export, not
-# something this code introduces) — matched literally since that's what
-# real exports contain, confirmed against an actual downloaded file.
+# Column name -> (food_log column, is_macro) for the 4 hardcoded macro
+# fields; every other numeric column in the CSV (including "Fiber (g)")
+# becomes a food_log_nutrients row instead, under its raw CSV column name
+# — same as every other Cronometer-sourced nutrient (fiber is not treated
+# specially here; it's not a macro field on FoodLogEntryContract).
+# Cronometer's CSV header uses "Âµg" for micrograms (a UTF-8/Latin-1
+# mojibake artifact in their own export, not something this code
+# introduces) — matched literally since that's what real exports contain,
+# confirmed against an actual downloaded file.
 _SERVINGS_MACRO_COLUMNS = {
     "Energy (kcal)": "calories",
     "Protein (g)": "protein",
     "Carbs (g)": "carbs",
     "Fat (g)": "fat",
-    "Fiber (g)": "fiber",
 }
 # Columns that are metadata, not nutrients — skipped when building the
 # food_log_nutrients rows so they don't show up as bogus "nutrients."
@@ -365,6 +370,7 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Cronometer credentials not set")
 
     from integrations.cronometer_rpc import CronometerRPCClient
+    from integrations.cronometer_web import CronometerWebScraper
     from datetime import datetime
 
     data_dir = str(user_data_dir(user_id))
@@ -373,6 +379,18 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
         client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
         client.login()
         results = client.export_all_to_files("2026-04-06", datetime.now().strftime("%Y-%m-%d"), output_dir=data_dir)
+    except Exception as rpc_error:
+        # If RPC export fails (e.g., 403), try web scraper as fallback
+        logger.warning(f"Cronometer RPC export failed: {rpc_error}. Trying web scraper fallback...")
+        try:
+            with CronometerWebScraper(headless=True) as scraper:
+                if scraper.login(creds["cronometer_username"], creds["cronometer_password"]):
+                    results = scraper.export_all("2026-04-06", datetime.now().strftime("%Y-%m-%d"), output_dir=data_dir)
+                else:
+                    raise HTTPException(status_code=401, detail="Cronometer web login failed")
+        except Exception as web_error:
+            logger.error(f"Cronometer web scraper also failed: {web_error}")
+            raise HTTPException(status_code=502, detail=f"Cronometer export unavailable (RPC: {rpc_error}; Web: {web_error})")
 
         if results.get("biometrics"):
             _filter_biometrics(results["biometrics"])
@@ -630,7 +648,19 @@ async def import_cronometer_recipe(food_id: int, user_id: int = Depends(get_curr
                 prot = round(nutrients.get("protein", 0) * scale, 1)
                 carb = round(nutrients.get("carbs", 0) * scale, 1)
                 fat = round(nutrients.get("fat", 0) * scale, 1)
-                fib = round(nutrients.get("fiber", 0) * scale, 1)
+
+                # Fiber is not a macro field on RecipeItemContract — it's
+                # folded into `nutrients` under "Fiber, total dietary"
+                # (the same canonical name used everywhere else in the
+                # app), like every other non-macro nutrient.
+                item_nutrients = {
+                    k: {"value": round(v * scale, 2), "unit": "G"}
+                    for k, v in nutrients.items() if k not in ("calories", "protein", "carbs", "fat", "fiber")
+                }
+                if "fiber" in nutrients:
+                    item_nutrients["Fiber, total dietary"] = {
+                        "value": round(nutrients["fiber"] * scale, 2), "unit": "G",
+                    }
 
                 items.append(RecipeItemContract(
                     food_name=ing_name,
@@ -642,8 +672,7 @@ async def import_cronometer_recipe(food_id: int, user_id: int = Depends(get_curr
                     protein=prot,
                     carbs=carb,
                     fat=fat,
-                    fiber=fib,
-                    nutrients={k: round(v * scale, 2) for k, v in nutrients.items() if k not in ("calories", "protein", "carbs", "fat", "fiber")},
+                    nutrients=item_nutrients,
                 ))
             except Exception:
                 items.append(RecipeItemContract(

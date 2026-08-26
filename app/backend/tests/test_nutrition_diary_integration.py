@@ -81,7 +81,6 @@ class TestFoodLogNutrients:
             "protein": 1.3,
             "carbs": 27,
             "fat": 0.4,
-            "fiber": 3.1,
             "nutrients": BANANA_NUTRIENTS,
         }
         r = client.post("/food/log", headers=auth(user_token), json=entry)
@@ -447,7 +446,7 @@ class TestPantryConsumeFlow:
     def test_consume_countable_item_decrements_and_logs_food(self, client, user_token):
         r = client.post("/pantry", headers=auth(user_token), json={
             "food_name": "Consume Test Crackers", "tracking_mode": "countable", "remaining_servings": 5,
-            "calories": 60, "protein": 1, "carbs": 10, "fat": 2, "fiber": 0.5,
+            "calories": 60, "protein": 1, "carbs": 10, "fat": 2,
             "nutrients": {"Sodium, Na": {"value": 100, "unit": "mg"}},
         })
         item_id = r.json()["id"]
@@ -476,18 +475,30 @@ class TestPantryConsumeFlow:
     def test_pantry_item_stores_nutrition_at_add_time(self, client, user_token):
         """Per explicit user request: pantry must carry nutrition
         alongside the food/expiration data it already tracks — added
-        via the same POST /pantry contract, not a separate endpoint."""
+        via the same POST /pantry contract, not a separate endpoint.
+        Fiber is not a macro column on pantry_items — it's carried in
+        `nutrients` under "Fiber, total dietary" like every other
+        non-macro nutrient, and (since GET /pantry's list response
+        doesn't surface nutrients) is only verifiable by consuming the
+        item and checking the resulting food_log entry."""
         r = client.post("/pantry", headers=auth(user_token), json={
             "food_name": "Nutrition Carrying Item", "tracking_mode": "single",
-            "calories": 250, "protein": 10, "carbs": 30, "fat": 8, "fiber": 3,
-            "nutrients": {"Potassium, K": {"value": 400, "unit": "mg"}},
+            "calories": 250, "protein": 10, "carbs": 30, "fat": 8,
+            "nutrients": {"Potassium, K": {"value": 400, "unit": "mg"}, "Fiber, total dietary": {"value": 3, "unit": "G"}},
         })
         item_id = r.json()["id"]
         r2 = client.get("/pantry", headers=auth(user_token))
         item = [i for i in r2.json()["items"] if i["id"] == item_id][0]
         assert item["calories"] == 250
         assert item["protein"] == 10
-        assert item["fiber"] == 3
+
+        r3 = client.post(f"/pantry/{item_id}/consume", headers=auth(user_token), json={
+            "servings": 1, "date": TEST_DATE, "meal": "Snack",
+        })
+        assert r3.status_code == 200
+        entries = [e for e in client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token)).json()["entries"]
+                   if e["food_name"] == "Nutrition Carrying Item"]
+        assert entries[0]["nutrients"]["Fiber, total dietary"]["value"] == 3
 
     def test_consume_countable_item_to_exactly_zero_removes_it(self, client, user_token):
         r = client.post("/pantry", headers=auth(user_token), json={

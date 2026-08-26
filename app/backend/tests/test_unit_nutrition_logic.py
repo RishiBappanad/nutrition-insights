@@ -213,9 +213,9 @@ class TestPortionScaling:
         """The exact scenario from the user's ask: 100g -> 100 kcal,
         200g should give 200 kcal and all macros doubled."""
         from app.portion_scaling import scale_macros
-        macros = {"calories": 100, "protein": 5, "carbs": 20, "fat": 2, "fiber": 3}
+        macros = {"calories": 100, "protein": 5, "carbs": 20, "fat": 2}
         scaled = scale_macros(macros, factor=2.0)
-        assert scaled == {"calories": 200.0, "protein": 10.0, "carbs": 40.0, "fat": 4.0, "fiber": 6.0}
+        assert scaled == {"calories": 200.0, "protein": 10.0, "carbs": 40.0, "fat": 4.0}
 
     def test_scale_nutrients_scales_every_entry_uniformly(self):
         from app.portion_scaling import scale_nutrients
@@ -249,7 +249,7 @@ class TestPortionScaling:
         give exactly 200 calories, matching the user's stated example."""
         from app.portion_scaling import scale_food_entry
         result = scale_food_entry(
-            macros={"calories": 100, "protein": 2, "carbs": 20, "fat": 1, "fiber": 2},
+            macros={"calories": 100, "protein": 2, "carbs": 20, "fat": 1},
             nutrients={"Sodium, Na": {"value": 5, "unit": "mg"}},
             mode="grams", from_grams=100, to_grams=200,
         )
@@ -260,7 +260,7 @@ class TestPortionScaling:
     def test_scale_food_entry_multiple_mode_end_to_end(self):
         from app.portion_scaling import scale_food_entry
         result = scale_food_entry(
-            macros={"calories": 50, "protein": 1, "carbs": 10, "fat": 0.5, "fiber": 1},
+            macros={"calories": 50, "protein": 1, "carbs": 10, "fat": 0.5},
             nutrients={},
             mode="multiple", servings_requested=3,
         )
@@ -281,7 +281,7 @@ class TestPortionScaling:
 
     def test_factor_of_one_is_a_no_op(self):
         from app.portion_scaling import scale_macros
-        macros = {"calories": 87, "protein": 3, "carbs": 15, "fat": 1, "fiber": 2}
+        macros = {"calories": 87, "protein": 3, "carbs": 15, "fat": 1}
         assert scale_macros(macros, factor=1.0) == {k: float(v) for k, v in macros.items()}
 
 
@@ -353,8 +353,8 @@ class TestLabelScannerGeminiResponseParsing:
         {
             "food_name": "Protein Bar", "brand": "TestBrand",
             "reference_amount": 1, "reference_unit": "bar", "reference_grams": 60,
-            "calories": 200, "protein": 20, "carbs": 22, "fat": 7, "fiber": 3,
-            "nutrients": {"Sodium, Na": {"value": 180, "unit": "mg"}}
+            "calories": 200, "protein": 20, "carbs": 22, "fat": 7,
+            "nutrients": {"Sodium, Na": {"value": 180, "unit": "mg"}, "Fiber, total dietary": {"value": 3, "unit": "G"}}
         }
         ```"""
         self._mock_gemini_response(monkeypatch, response_json)
@@ -364,6 +364,20 @@ class TestLabelScannerGeminiResponseParsing:
         assert result.food_name == "Protein Bar"
         assert result.calories == 200
         assert result.nutrients["Sodium, Na"]["value"] == 180
+        assert result.nutrients["Fiber, total dietary"]["value"] == 3
+
+    def test_legacy_top_level_fiber_folded_into_nutrients(self, monkeypatch):
+        """Gemini's output isn't schema-enforced -- if it ignores the
+        prompt and still returns a stray top-level "fiber" (the old
+        shape), it must be folded into `nutrients` rather than silently
+        dropped (there is no top-level `fiber` field on LabelScanResult
+        anymore)."""
+        response_json = '{"food_name": "Old Shape Bar", "calories": 100, "fiber": 4, "nutrients": {}}'
+        self._mock_gemini_response(monkeypatch, response_json)
+        from app.routers.label_scanner import extract_label_with_gemini
+        result = extract_label_with_gemini(b"fake-bytes", "image/jpeg")
+        assert result.nutrients["Fiber, total dietary"] == {"value": 4.0, "unit": "G"}
+        assert not hasattr(result, "fiber")
 
     def test_low_confidence_extraction_returns_partial(self, monkeypatch):
         self._mock_gemini_response(monkeypatch, '{"food_name": "Unclear Item"}')
@@ -656,7 +670,12 @@ class TestServingsRowToFoodLogEntry:
         assert entry.protein == 30.14
         assert entry.carbs == 1.37
         assert entry.fat == 4.40
-        assert entry.fiber == 0.02
+        # Fiber is not a macro field on FoodLogEntryContract — "Fiber (g)"
+        # falls through to the generic nutrients loop like any other
+        # Cronometer CSV column, keeping its raw column name/unit (same
+        # as every other Cronometer-sourced nutrient).
+        assert entry.nutrients["Fiber (g)"] == {"value": 0.02, "unit": "g"}
+        assert not hasattr(entry, "fiber")
         assert entry.serving_size == 12.0
         assert entry.serving_unit == "nugget"
 
@@ -772,10 +791,12 @@ class TestFoodEntryContractModels:
         entry = FoodLogEntryContract(
             date="2026-01-01", meal="Lunch", food_name="Chicken", source="Cronometer",
             source_id=None, serving_size=100, serving_unit="g", calories=200, protein=30,
-            carbs=0, fat=5, fiber=0, nutrients={"Sodium, Na": {"value": 50, "unit": "mg"}},
+            carbs=0, fat=5,
+            nutrients={"Sodium, Na": {"value": 50, "unit": "mg"}, "Fiber, total dietary": {"value": 0, "unit": "G"}},
         )
         assert entry.source == "Cronometer"
         assert entry.nutrients["Sodium, Na"]["value"] == 50
+        assert not hasattr(entry, "fiber")
 
     def test_recipe_import_contract_defaults(self):
         from app.food_entry_contract import RecipeImportContract

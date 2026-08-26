@@ -10,16 +10,17 @@ const SEARCH_DEBOUNCE_MS = 400
 
 // USDA FoodData Central reports macros as regular nutrient entries, not
 // separate fields — these are the exact nutrient names USDA uses
-// (confirmed against a live API response), mapped to the 5 hardcoded
+// (confirmed against a live API response), mapped to the 4 hardcoded
 // food_log macro columns. "Energy" appears twice per food (kJ and kcal)
 // — must match on unit, not just name, or this silently grabs the wrong
-// one and multiplies calories by ~4.
+// one and multiplies calories by ~4. Fiber is deliberately NOT here — it
+// is not a macro column; it's sent/read entirely via the `nutrients` map
+// (key "Fiber, total dietary"), never extracted as a separate field.
 const MACRO_NUTRIENT_NAMES = {
   calories: { name: 'Energy', unit: 'KCAL' },
   protein: { name: 'Protein' },
   carbs: { name: 'Carbohydrate, by difference' },
   fat: { name: 'Total lipid (fat)' },
-  fiber: { name: 'Fiber, total dietary' },
 }
 
 function extractMacro(nutrients, key) {
@@ -163,7 +164,9 @@ export default function FoodLog() {
         protein: extractMacro(result.nutrients, 'protein'),
         carbs: extractMacro(result.nutrients, 'carbs'),
         fat: extractMacro(result.nutrients, 'fat'),
-        fiber: extractMacro(result.nutrients, 'fiber'),
+        // Fiber is not a top-level field — it's already inside
+        // `nutrients` below (as "Fiber, total dietary"), same as every
+        // other non-macro nutrient.
         nutrients: result.nutrients,
         scale_to: isRecipe
           ? { mode: 'multiple', servings_requested: targetGrams }

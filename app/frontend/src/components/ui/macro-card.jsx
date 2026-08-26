@@ -10,8 +10,9 @@ import { PieChart as PieChartIcon, BarChart3 } from 'lucide-react'
 // diverge between backend and frontend.
 const KCAL_PER_GRAM = { protein: 4, carbs: 4, fat: 9 }
 
-// Alcohol isn't one of the 3 macro columns on food_log (calories/protein/
-// carbs/fat/fiber) — it comes through as a regular USDA/CNF nutrient
+// Alcohol isn't one of the 3 macro columns on food_log (protein/carbs/
+// fat — calories is a derived total, fiber is a regular nutrient, not a
+// macro column) — it comes through as a regular USDA/CNF nutrient
 // ("Alcohol, ethyl", grams) in food_log_nutrients, the same way any other
 // micronutrient does. 7 kcal/g is the standard Atwater factor (matches
 // Cronometer's own handling — alcohol shows as its own breakdown category

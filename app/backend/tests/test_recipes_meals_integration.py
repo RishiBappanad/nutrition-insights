@@ -55,7 +55,7 @@ class TestCustomFoods:
         r = client.post("/custom-foods", headers=auth(user_token), json={
             "food_name": "Homemade Granola",
             "reference_amount": 1, "reference_unit": "cup", "reference_grams": 120,
-            "calories": 450, "protein": 10, "carbs": 60, "fat": 18, "fiber": 6,
+            "calories": 450, "protein": 10, "carbs": 60, "fat": 18,
             "nutrients": {"Iron, Fe": {"value": 2.5, "unit": "mg"}},
         })
         assert r.status_code == 200
@@ -119,12 +119,12 @@ class TestCustomFoods:
 
 LASAGNA_ITEMS = [
     {"food_name": "Ground Beef", "source": "USDA", "source_id": "23557", "amount_grams": 500,
-     "calories": 1000, "protein": 100, "carbs": 0, "fat": 65, "fiber": 0,
+     "calories": 1000, "protein": 100, "carbs": 0, "fat": 65,
      "nutrients": {"Iron, Fe": {"value": 13, "unit": "mg"}}},
     {"food_name": "Pasta Sheets", "source": "USDA", "source_id": "168917", "amount_grams": 250,
-     "calories": 900, "protein": 30, "carbs": 180, "fat": 5, "fiber": 8,
+     "calories": 900, "protein": 30, "carbs": 180, "fat": 5,
      "nutrients": {"Iron, Fe": {"value": 3, "unit": "mg"}}},
-    {"food_name": "Salt", "amount_multiple": 1, "calories": 0, "protein": 0, "carbs": 0, "fat": 0, "fiber": 0},
+    {"food_name": "Salt", "amount_multiple": 1, "calories": 0, "protein": 0, "carbs": 0, "fat": 0},
 ]
 
 
@@ -169,14 +169,14 @@ class TestRecipes:
     def test_update_recipe_replaces_items(self, client, user_token):
         r = client.post("/recipes", headers=auth(user_token), json={
             "name": "Simple Soup", "servings_per_batch": 2,
-            "items": [{"food_name": "Broth", "calories": 20, "protein": 1, "carbs": 2, "fat": 0, "fiber": 0}],
+            "items": [{"food_name": "Broth", "calories": 20, "protein": 1, "carbs": 2, "fat": 0}],
         })
         recipe_id = r.json()["id"]
 
         r2 = client.put(f"/recipes/{recipe_id}", headers=auth(user_token), json={
             "name": "Simple Soup", "servings_per_batch": 4,
-            "items": [{"food_name": "Broth", "calories": 20, "protein": 1, "carbs": 2, "fat": 0, "fiber": 0},
-                      {"food_name": "Noodles", "calories": 200, "protein": 6, "carbs": 40, "fat": 1, "fiber": 2}],
+            "items": [{"food_name": "Broth", "calories": 20, "protein": 1, "carbs": 2, "fat": 0},
+                      {"food_name": "Noodles", "calories": 200, "protein": 6, "carbs": 40, "fat": 1}],
         })
         assert r2.status_code == 200
 
@@ -195,7 +195,7 @@ class TestRecipes:
     def test_log_recipe_serving_creates_scaled_food_log_entry(self, client, user_token):
         r = client.post("/recipes", headers=auth(user_token), json={
             "name": "Log Test Chili", "servings_per_batch": 4,
-            "items": [{"food_name": "Beans", "calories": 400, "protein": 24, "carbs": 72, "fat": 4, "fiber": 24,
+            "items": [{"food_name": "Beans", "calories": 400, "protein": 24, "carbs": 72, "fat": 4,
                        "nutrients": {"Potassium, K": {"value": 1200, "unit": "mg"}}}],
         })
         recipe_id = r.json()["id"]
@@ -215,7 +215,7 @@ class TestRecipes:
     def test_log_recipe_multiple_servings_scales_proportionally(self, client, user_token):
         r = client.post("/recipes", headers=auth(user_token), json={
             "name": "Double Serving Test", "servings_per_batch": 4,
-            "items": [{"food_name": "Rice", "calories": 800, "protein": 16, "carbs": 176, "fat": 2, "fiber": 4}],
+            "items": [{"food_name": "Rice", "calories": 800, "protein": 16, "carbs": 176, "fat": 2}],
         })
         recipe_id = r.json()["id"]
 
@@ -413,7 +413,7 @@ class TestMakeRecipe:
             "name": "Bread Loaf", "servings_per_batch": 4,
             "items": [{
                 "food_name": "Flour", "source": "USDA", "source_id": "make-flour-1", "amount_multiple": 2,
-                "calories": 100, "protein": 3, "carbs": 20, "fat": 1, "fiber": 1,
+                "calories": 100, "protein": 3, "carbs": 20, "fat": 1,
             }],
         })
         recipe_id = r.json()["id"]
@@ -488,8 +488,8 @@ class TestMakeRecipe:
 # ── Meals ─────────────────────────────────────────────────────────────────────
 
 BREAKFAST_ITEMS = [
-    {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10, "fiber": 0},
-    {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1, "fiber": 1,
+    {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10},
+    {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1,
      "nutrients": {"Sodium, Na": {"value": 150, "unit": "mg"}}},
 ]
 
@@ -527,7 +527,7 @@ class TestMeals:
         meal_id = r.json()["id"]
         r2 = client.put(f"/meals/{meal_id}", headers=auth(user_token), json={
             "name": "Edited Meal Name",
-            "items": [{"food_name": "New Item", "calories": 50, "protein": 1, "carbs": 5, "fat": 1, "fiber": 0}],
+            "items": [{"food_name": "New Item", "calories": 50, "protein": 1, "carbs": 5, "fat": 1}],
         })
         assert r2.status_code == 200
         r3 = client.get(f"/meals/{meal_id}", headers=auth(user_token))
@@ -716,7 +716,7 @@ class TestRecipeAsFoodReference:
     def test_recipe_appears_in_food_search_results(self, client, user_token):
         r = client.post("/recipes", headers=auth(user_token), json={
             "name": "Searchable Test Recipe", "servings_per_batch": 2,
-            "items": [{"food_name": "Rice", "calories": 400, "protein": 8, "carbs": 88, "fat": 2, "fiber": 2}],
+            "items": [{"food_name": "Rice", "calories": 400, "protein": 8, "carbs": 88, "fat": 2}],
         })
         recipe_id = r.json()["id"]
 
@@ -730,7 +730,7 @@ class TestRecipeAsFoodReference:
     def test_recipe_search_result_shows_per_serving_not_batch_totals(self, client, user_token):
         client.post("/recipes", headers=auth(user_token), json={
             "name": "Per Serving Check Recipe", "servings_per_batch": 4,
-            "items": [{"food_name": "Beans", "calories": 800, "protein": 40, "carbs": 120, "fat": 8, "fiber": 40}],
+            "items": [{"food_name": "Beans", "calories": 800, "protein": 40, "carbs": 120, "fat": 8}],
         })
         r = client.get("/food/search?q=Per+Serving+Check+Recipe", headers=auth(user_token))
         result = next(res for res in r.json()["results"] if res["source"] == "recipe")
@@ -739,7 +739,7 @@ class TestRecipeAsFoodReference:
     def test_recipe_search_result_can_be_logged_to_diary(self, client, user_token):
         r = client.post("/recipes", headers=auth(user_token), json={
             "name": "Loggable Recipe", "servings_per_batch": 1,
-            "items": [{"food_name": "Oats", "calories": 150, "protein": 5, "carbs": 27, "fat": 3, "fiber": 4}],
+            "items": [{"food_name": "Oats", "calories": 150, "protein": 5, "carbs": 27, "fat": 3}],
         })
         r2 = client.get("/food/search?q=Loggable+Recipe", headers=auth(user_token))
         result = next(res for res in r2.json()["results"] if res["source"] == "recipe")
@@ -751,7 +751,8 @@ class TestRecipeAsFoodReference:
             "protein": result["nutrients"]["Protein"]["value"],
             "carbs": result["nutrients"]["Carbohydrate, by difference"]["value"],
             "fat": result["nutrients"]["Total lipid (fat)"]["value"],
-            "fiber": result["nutrients"]["Fiber, total dietary"]["value"],
+            # Fiber is not a top-level field — it's already inside
+            # `nutrients` below (as "Fiber, total dietary").
             "nutrients": result["nutrients"],
         })
         assert r3.status_code == 200
@@ -797,8 +798,8 @@ class TestMealAsFoodReference:
         r = client.post("/meals", headers=auth(user_token), json={
             "name": "Searchable Test Meal",
             "items": [
-                {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10, "fiber": 0},
-                {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1, "fiber": 1},
+                {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10},
+                {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1},
             ],
         })
         meal_id = r.json()["id"]
@@ -815,8 +816,8 @@ class TestMealAsFoodReference:
         client.post("/meals", headers=auth(user_token), json={
             "name": "Summed Total Meal",
             "items": [
-                {"food_name": "A", "calories": 100, "protein": 5, "carbs": 10, "fat": 2, "fiber": 1},
-                {"food_name": "B", "calories": 200, "protein": 10, "carbs": 20, "fat": 4, "fiber": 2},
+                {"food_name": "A", "calories": 100, "protein": 5, "carbs": 10, "fat": 2},
+                {"food_name": "B", "calories": 200, "protein": 10, "carbs": 20, "fat": 4},
             ],
         })
         r = client.get("/food/search?q=Summed+Total+Meal", headers=auth(user_token))
@@ -826,7 +827,7 @@ class TestMealAsFoodReference:
     def test_meal_search_result_can_be_logged_via_meals_endpoint(self, client, user_token):
         r = client.post("/meals", headers=auth(user_token), json={
             "name": "Loggable Meal",
-            "items": [{"food_name": "Oats", "calories": 150, "protein": 5, "carbs": 27, "fat": 3, "fiber": 4}],
+            "items": [{"food_name": "Oats", "calories": 150, "protein": 5, "carbs": 27, "fat": 3}],
         })
         r2 = client.get("/food/search?q=Loggable+Meal", headers=auth(user_token))
         result = next(res for res in r2.json()["results"] if res["source"] == "meal")
@@ -854,8 +855,8 @@ class TestMealAsFoodReference:
         r = client.post("/meals", headers=auth(user_token), json={
             "name": "Default Exploded Meal",
             "items": [
-                {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10, "fiber": 0},
-                {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1, "fiber": 1},
+                {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10},
+                {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1},
             ],
         })
         meal_id = r.json()["id"]
@@ -867,8 +868,8 @@ class TestMealAsFoodReference:
         r = client.post("/meals", headers=auth(user_token), json={
             "name": "Explodable Meal",
             "items": [
-                {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10, "fiber": 0},
-                {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1, "fiber": 1,
+                {"food_name": "Eggs", "calories": 140, "protein": 12, "carbs": 1, "fat": 10},
+                {"food_name": "Toast", "calories": 80, "protein": 3, "carbs": 15, "fat": 1,
                  "nutrients": {"Sodium, Na": {"value": 150, "unit": "mg"}}},
             ],
         })
@@ -952,7 +953,7 @@ class TestMealAsFoodReference:
         them later."""
         r = client.post("/meals", headers=auth(user_token), json={
             "name": "Pantry Meal",
-            "items": [{"food_name": "Cereal", "calories": 120, "protein": 3, "carbs": 24, "fat": 1, "fiber": 2}],
+            "items": [{"food_name": "Cereal", "calories": 120, "protein": 3, "carbs": 24, "fat": 1}],
         })
         r2 = client.get("/food/search?q=Pantry+Meal", headers=auth(user_token))
         result = next(res for res in r2.json()["results"] if res["source"] == "meal")
@@ -966,7 +967,10 @@ class TestMealAsFoodReference:
             "protein": result["nutrients"]["Protein"]["value"],
             "carbs": result["nutrients"]["Carbohydrate, by difference"]["value"],
             "fat": result["nutrients"]["Total lipid (fat)"]["value"],
-            "fiber": result["nutrients"]["Fiber, total dietary"]["value"],
+            # Fiber (and every other non-macro nutrient) is passed
+            # through via `nutrients`, matching this test's own docstring
+            # — not extracted as a separate top-level field.
+            "nutrients": result["nutrients"],
         })
         assert r3.status_code == 200
         pantry_item_id = r3.json()["id"]
@@ -987,6 +991,7 @@ class TestMealAsFoodReference:
         logged = next(e for e in r6.json()["entries"] if e["food_name"] == "Pantry Meal")
         assert logged["source"] == "meal"
         assert logged["calories"] == 120
+        assert logged["nutrients"]["Fiber, total dietary"]["value"] == 2
 
     def test_include_own_false_excludes_meals_from_search(self, client, user_token):
         client.post("/meals", headers=auth(user_token), json={"name": "Excludable Meal XYZ", "items": []})
@@ -1107,7 +1112,7 @@ class TestLabelScannerEndpoint:
         r = client.post("/custom-foods", headers=auth(user_token), json={
             "food_name": "Scanned Granola Bar", "brand": "TestBrand",
             "reference_amount": 1, "reference_unit": "bar", "reference_grams": 60,
-            "calories": 200, "protein": 20, "carbs": 22, "fat": 7, "fiber": 3,
+            "calories": 200, "protein": 20, "carbs": 22, "fat": 7,
             "nutrients": {"Sodium, Na": {"value": 180, "unit": "mg"}},
         })
         assert r.status_code == 200

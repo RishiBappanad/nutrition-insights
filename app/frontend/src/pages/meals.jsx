@@ -4,12 +4,14 @@ import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Plus, Save, CheckCircle, ArrowLeft, Layers, X } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
 
+// Fiber is deliberately NOT here — it is not a macro field on a meal
+// item; it's sent/read entirely via the `nutrients` map (key "Fiber,
+// total dietary"), never extracted as a separate field.
 const MACRO_NUTRIENT_NAMES = {
   calories: { name: 'Energy', unit: 'KCAL' },
   protein: { name: 'Protein' },
   carbs: { name: 'Carbohydrate, by difference' },
   fat: { name: 'Total lipid (fat)' },
-  fiber: { name: 'Fiber, total dietary' },
 }
 
 function extractMacro(nutrients, key) {
@@ -233,7 +235,7 @@ function MealEditor({ mealId, onDone, onCancel }) {
         setItems(d.items.map((i) => ({
           food_name: i.food_name, source: i.source, source_id: i.source_id,
           serving_size: i.serving_size, serving_unit: i.serving_unit,
-          calories: i.calories, protein: i.protein, carbs: i.carbs, fat: i.fat, fiber: i.fiber,
+          calories: i.calories, protein: i.protein, carbs: i.carbs, fat: i.fat,
           nutrients: i.nutrients,
         })))
       })
@@ -264,7 +266,6 @@ function MealEditor({ mealId, onDone, onCancel }) {
       protein: extractMacro(result.nutrients, 'protein'),
       carbs: extractMacro(result.nutrients, 'carbs'),
       fat: extractMacro(result.nutrients, 'fat'),
-      fiber: extractMacro(result.nutrients, 'fiber'),
       nutrients: result.nutrients,
     })
     setItems([...items])

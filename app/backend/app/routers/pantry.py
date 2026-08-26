@@ -45,7 +45,8 @@ class PantryItemRequest(BaseModel):
     protein: float = 0
     carbs: float = 0
     fat: float = 0
-    fiber: float = 0
+    # Fiber is not a top-level field — it belongs in nutrients under
+    # "Fiber, total dietary" like every other non-macro nutrient.
     nutrients: dict = {}
 
 
@@ -93,12 +94,12 @@ async def add_pantry_item(req: PantryItemRequest, user_id: int = Depends(get_cur
             item_id = await conn.fetchval(
                 """INSERT INTO pantry_items (user_id, food_name, source, source_id, serving_size,
                        serving_unit, tracking_mode, remaining_servings, expiration_date,
-                       calories, protein, carbs, fat, fiber, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                       calories, protein, carbs, fat, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                    RETURNING id""",
                 user_id, req.food_name, req.source, req.source_id, req.serving_size,
                 req.serving_unit, req.tracking_mode, remaining, req.expiration_date,
-                req.calories, req.protein, req.carbs, req.fat, req.fiber, json.dumps(req.nutrients),
+                req.calories, req.protein, req.carbs, req.fat, json.dumps(req.nutrients),
             )
             rows = nutrients_to_rows(item_id, req.nutrients)
             if rows:
@@ -239,20 +240,24 @@ async def consume_pantry_item(item_id: int, req: ConsumeRequest, user_id: int = 
             factor = multiple_based_factor(req.servings)
             macros = scale_macros(
                 {"calories": item["calories"], "protein": item["protein"], "carbs": item["carbs"],
-                 "fat": item["fat"], "fiber": item["fiber"]},
+                 "fat": item["fat"]},
                 factor,
             )
+            # Fiber ("Fiber, total dietary") scales as part of the stored
+            # nutrients dict below, not as a macro — it was stored there
+            # at add-time (add_pantry_item), same as every other
+            # non-macro nutrient.
             stored_nutrients = json.loads(item["nutrients_json"]) if item["nutrients_json"] else {}
             nutrients = scale_nutrients(stored_nutrients, factor)
 
             food_log_id = await conn.fetchval(
                 """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       serving_size, serving_unit, calories, protein, carbs, fat, fiber, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                       serving_size, serving_unit, calories, protein, carbs, fat, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                    RETURNING id""",
                 user_id, req.date, req.meal, item["food_name"], item["source"], item["source_id"],
                 req.servings, item["serving_unit"], macros["calories"], macros["protein"], macros["carbs"],
-                macros["fat"], macros["fiber"], json.dumps(nutrients),
+                macros["fat"], json.dumps(nutrients),
             )
             rows = nutrients_to_rows(food_log_id, nutrients)
             if rows:
@@ -344,7 +349,6 @@ def _row_to_item(r) -> dict:
         "protein": r["protein"],
         "carbs": r["carbs"],
         "fat": r["fat"],
-        "fiber": r["fiber"],
         "added_at": r["added_at"].isoformat(),
         "updated_at": r["updated_at"].isoformat(),
     }

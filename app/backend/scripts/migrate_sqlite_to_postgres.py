@@ -161,13 +161,20 @@ async def migrate_user_data(pool, user_id: int, dry_run: bool, known_user_ids: s
             )
             if existing:
                 continue
+            # NOTE: the source SQLite food_log still has a `fiber` column
+            # (this is historical source data, untouched by the Postgres
+            # schema's fiber-column removal) — its value is intentionally
+            # not migrated to a destination column since food_log no
+            # longer has one; nutrients_json below is copied verbatim and
+            # is expected to already carry "Fiber, total dietary" for rows
+            # logged interactively, same as the live app's behavior.
             await pg.execute(
                 """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       serving_size, serving_unit, calories, protein, carbs, fat, fiber, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)""",
+                       serving_size, serving_unit, calories, protein, carbs, fat, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)""",
                 user_id, r["date"], r["meal"], r["food_name"], r["source"], r["source_id"],
                 r["serving_size"], r["serving_unit"], r["calories"], r["protein"],
-                r["carbs"], r["fat"], r["fiber"], r["nutrients_json"],
+                r["carbs"], r["fat"], r["nutrients_json"],
             )
 
 
