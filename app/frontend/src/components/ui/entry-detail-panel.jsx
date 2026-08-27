@@ -3,15 +3,18 @@ import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { X, Trash2, Layers } from 'lucide-react'
 
-// Protein/carbs/fat are not fields on a food_log entry — calories is the
-// only one with its own column (TrackStack's "amount" for this tracker).
-// Read out of entry.nutrients by standard USDA name, same as everywhere
-// else in this app, and excluded from the "Full Nutrient Breakdown" list
-// below since they're already shown as their own summary tiles.
+// Protein/carbs/fat/alcohol are not fields on a food_log entry — calories
+// is the only one with its own column (TrackStack's "amount" for this
+// tracker). Read out of entry.nutrients by standard USDA name, same as
+// everywhere else in this app, and excluded from the "Full Nutrient
+// Breakdown" list below since they're already shown as their own summary
+// tiles (macro-card.jsx shows alcohol as its own segment too, under the
+// same 'Alcohol, ethyl' name, when logged).
 const MACRO_NUTRIENT_NAMES = {
   protein: 'Protein',
   carbs: 'Carbohydrate, by difference',
   fat: 'Total lipid (fat)',
+  alcohol: 'Alcohol, ethyl',
 }
 
 /**
@@ -32,9 +35,13 @@ export function EntryDetailPanel({ entry, onClose, onChanged }) {
   const [error, setError] = useState('')
 
   const macroNames = new Set(Object.values(MACRO_NUTRIENT_NAMES))
+  // Not re-sorted here — the backend (nutrient_groups.order_nutrients)
+  // already returns entry.nutrients in TrackStack's canonical display
+  // order (macros' sub-nutrients, then General, then Vitamins, then
+  // Minerals, then anything unclassified), so this list should render in
+  // whatever order it arrives in.
   const nutrients = Object.entries(entry.nutrients || {})
     .filter(([name]) => !macroNames.has(name))
-    .sort(([a], [b]) => a.localeCompare(b))
   const isMeal = entry.source === 'meal'
 
   async function handleExplode() {

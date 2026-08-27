@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
 from ..db import get_pool
+from ..nutrient_groups import order_nutrients
 
 router = APIRouter()
 
@@ -124,7 +125,7 @@ async def _get_meal_with_items(conn, meal_id: int, user_id: int):
             "serving_size": r["serving_size"],
             "serving_unit": r["serving_unit"],
             "calories": r["calories"],
-            "nutrients": nutrients_by_item.get(r["id"], {}),
+            "nutrients": order_nutrients(nutrients_by_item.get(r["id"], {})),
         })
     return meal, items
 

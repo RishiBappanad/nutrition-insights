@@ -257,8 +257,10 @@ export default function FoodLog() {
                 </button>
               </div>
               <div className="space-y-1 max-h-48 overflow-y-auto">
+                {/* Not re-sorted — GET /food/search already returns
+                    nutrients in TrackStack's canonical display order
+                    (nutrient_groups.order_nutrients). */}
                 {Object.entries(previewing.nutrients || {})
-                  .sort(([a], [b]) => a.localeCompare(b))
                   .map(([name, info]) => (
                     <div key={name} className="flex items-center justify-between text-xs">
                       <span className="text-foreground">{name}</span>

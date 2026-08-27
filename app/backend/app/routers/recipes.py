@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from ..routers.auth import get_current_user
 from ..db import get_pool
 from ..portion_scaling import scale_macros, scale_nutrients
+from ..nutrient_groups import order_nutrients
 
 router = APIRouter()
 
@@ -141,7 +142,7 @@ async def _get_recipe_with_items(conn, recipe_id: int, user_id: int):
             "amount_grams": r["amount_grams"],
             "amount_multiple": r["amount_multiple"],
             "calories": r["calories"],
-            "nutrients": nutrients_by_item.get(r["id"], {}),
+            "nutrients": order_nutrients(nutrients_by_item.get(r["id"], {})),
         })
     return recipe, items
 
@@ -159,7 +160,7 @@ def _aggregate_batch_totals(items: list[dict]) -> dict:
         for name, info in item.get("nutrients", {}).items():
             bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
             bucket["value"] += info["value"]
-    return {"macros": macros, "nutrients": nutrients}
+    return {"macros": macros, "nutrients": order_nutrients(nutrients)}
 
 
 @router.get("/{recipe_id}")

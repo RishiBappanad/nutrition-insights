@@ -4,6 +4,7 @@ from ..routers.auth import get_current_user
 from ..db import get_pool
 from ..portion_scaling import scale_food_entry
 from ..food_entry_contract import FoodLogEntryContract, log_food_entry, _nutrients_to_rows as nutrients_to_rows
+from ..nutrient_groups import order_nutrients
 
 router = APIRouter()
 
@@ -52,6 +53,10 @@ async def search_food(
     if include_own:
         results.extend(await _search_user_recipes(user_id, q))
         results.extend(await _search_user_meals(user_id, q))
+
+    for r in results:
+        if "nutrients" in r:
+            r["nutrients"] = order_nutrients(r["nutrients"])
 
     return {"results": results}
 
@@ -322,7 +327,7 @@ async def get_food_log(
     entries = []
     nutrient_totals: dict[str, dict] = {}
     for r in rows:
-        entry_nutrients = nutrients_by_entry.get(r["id"], {})
+        entry_nutrients = order_nutrients(nutrients_by_entry.get(r["id"], {}))
         entries.append({
             "id": r["id"],
             "date": r["date"],
@@ -342,7 +347,7 @@ async def get_food_log(
         "calories": sum(e["calories"] for e in entries),
     }
 
-    return {"entries": entries, "totals": totals, "nutrient_totals": nutrient_totals}
+    return {"entries": entries, "totals": totals, "nutrient_totals": order_nutrients(nutrient_totals)}
 
 
 @router.delete("/log/{entry_id}")

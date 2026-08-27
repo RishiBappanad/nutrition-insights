@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
 from ..db import get_pool
+from ..nutrient_groups import order_nutrients
 
 router = APIRouter()
 
@@ -95,7 +96,7 @@ async def get_custom_food(food_id: int, user_id: int = Depends(get_current_user)
             "SELECT nutrient_name, value, unit FROM custom_food_nutrients WHERE custom_food_id = $1", food_id
         )
     result = _row_to_food(row)
-    result["nutrients"] = {n["nutrient_name"]: {"value": n["value"], "unit": n["unit"]} for n in nutrient_rows}
+    result["nutrients"] = order_nutrients({n["nutrient_name"]: {"value": n["value"], "unit": n["unit"]} for n in nutrient_rows})
     return result
 
 
