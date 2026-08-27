@@ -23,12 +23,9 @@ class CustomFoodRequest(BaseModel):
     reference_amount: float = 1.0
     reference_unit: str = "serving"
     reference_grams: Optional[float] = None  # None if this food has no known gram weight
+    # `calories` is the sole top-level numeric field. Protein/carbs/fat/
+    # fiber belong in nutrients under their standard USDA names.
     calories: float = 0
-    protein: float = 0
-    carbs: float = 0
-    fat: float = 0
-    # Fiber is not a top-level field — it belongs in nutrients under
-    # "Fiber, total dietary" like every other non-macro nutrient.
     nutrients: dict = {}
 
 
@@ -60,12 +57,11 @@ async def create_custom_food(req: CustomFoodRequest, user_id: int = Depends(get_
         async with conn.transaction():
             food_id = await conn.fetchval(
                 """INSERT INTO custom_foods (user_id, food_name, brand, reference_amount, reference_unit,
-                       reference_grams, calories, protein, carbs, fat, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                       reference_grams, calories, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                    RETURNING id""",
                 user_id, req.food_name, req.brand, req.reference_amount, req.reference_unit,
-                req.reference_grams, req.calories, req.protein, req.carbs, req.fat,
-                json.dumps(req.nutrients),
+                req.reference_grams, req.calories, json.dumps(req.nutrients),
             )
             rows = _nutrients_to_rows(food_id, req.nutrients)
             if rows:
@@ -116,11 +112,11 @@ async def update_custom_food(food_id: int, req: CustomFoodRequest, user_id: int 
 
             await conn.execute(
                 """UPDATE custom_foods SET food_name=$1, brand=$2, reference_amount=$3, reference_unit=$4,
-                       reference_grams=$5, calories=$6, protein=$7, carbs=$8, fat=$9,
-                       nutrients_json=$10, updated_at=now()
-                   WHERE id = $11""",
+                       reference_grams=$5, calories=$6,
+                       nutrients_json=$7, updated_at=now()
+                   WHERE id = $8""",
                 req.food_name, req.brand, req.reference_amount, req.reference_unit, req.reference_grams,
-                req.calories, req.protein, req.carbs, req.fat, json.dumps(req.nutrients), food_id,
+                req.calories, json.dumps(req.nutrients), food_id,
             )
             await conn.execute("DELETE FROM custom_food_nutrients WHERE custom_food_id = $1", food_id)
             rows = _nutrients_to_rows(food_id, req.nutrients)
@@ -149,7 +145,4 @@ def _row_to_food(r) -> dict:
         "reference_unit": r["reference_unit"],
         "reference_grams": r["reference_grams"],
         "calories": r["calories"],
-        "protein": r["protein"],
-        "carbs": r["carbs"],
-        "fat": r["fat"],
     }

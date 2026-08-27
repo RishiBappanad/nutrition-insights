@@ -7,14 +7,11 @@ import { cn } from '@/lib/utils'
 import { Plus, Trash2, CheckCheck, AlertTriangle, X, Refrigerator, Share2, ChefHat, ChevronDown, ChevronRight } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
 
-// Fiber is deliberately NOT here — it is not a macro field on a pantry
-// item; it's sent/read entirely via the `nutrients` map (key "Fiber,
-// total dietary"), never extracted as a separate field.
+// Protein/carbs/fat/fiber are deliberately NOT here — none of them are
+// macro fields on a pantry item; they're sent/read entirely via the
+// `nutrients` map, never extracted as separate fields.
 const MACRO_NUTRIENT_NAMES = {
   calories: { name: 'Energy', unit: 'KCAL' },
-  protein: { name: 'Protein' },
-  carbs: { name: 'Carbohydrate, by difference' },
-  fat: { name: 'Total lipid (fat)' },
 }
 
 function extractMacro(nutrients, key) {
@@ -556,9 +553,6 @@ function AddItemForm({ onDone, onCancel }) {
     setServingUnit(r.serving_unit || 'g')
     setNutrition({
       calories: extractMacro(r.nutrients, 'calories'),
-      protein: extractMacro(r.nutrients, 'protein'),
-      carbs: extractMacro(r.nutrients, 'carbs'),
-      fat: extractMacro(r.nutrients, 'fat'),
       nutrients: r.nutrients,
     })
     setQuery('')
@@ -587,9 +581,6 @@ function AddItemForm({ onDone, onCancel }) {
         remaining_servings: trackingMode === 'countable' ? Number(remainingServings) : null,
         expiration_date: expirationDate || null,
         calories: nutrition?.calories || 0,
-        protein: nutrition?.protein || 0,
-        carbs: nutrition?.carbs || 0,
-        fat: nutrition?.fat || 0,
         nutrients: nutrition?.nutrients || {},
       }),
     })

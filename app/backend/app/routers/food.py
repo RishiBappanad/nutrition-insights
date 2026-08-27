@@ -84,17 +84,15 @@ async def _search_user_recipes(user_id: int, query: str) -> list[dict]:
             "brand": "",
             "category": "Recipe",
             "nutrients": {
-                # per_serving_nutrients already carries "Fiber, total
-                # dietary" (scaled like any other nutrient) — only the 4
-                # true macros need to be overlaid in the standard USDA
-                # nutrient-map shape below, so downstream extractMacro()-
-                # style helpers on the frontend work identically for a
-                # recipe result as for a plain food result.
+                # per_serving_nutrients already carries "Protein",
+                # "Carbohydrate, by difference", "Total lipid (fat)", and
+                # "Fiber, total dietary" (scaled like any other nutrient,
+                # since none of them are top-level macro fields on a
+                # recipe item anymore) — only Energy (calories) needs to
+                # be overlaid, since that's the one field with its own
+                # dedicated top-level column.
                 **per_serving_nutrients,
                 "Energy": {"value": round(per_serving_macros["calories"]), "unit": "KCAL"},
-                "Protein": {"value": round(per_serving_macros["protein"], 2), "unit": "G"},
-                "Carbohydrate, by difference": {"value": round(per_serving_macros["carbs"], 2), "unit": "G"},
-                "Total lipid (fat)": {"value": round(per_serving_macros["fat"], 2), "unit": "G"},
             },
             "serving_size": 1,
             "serving_unit": "serving",
@@ -144,14 +142,13 @@ async def _search_user_meals(user_id: int, query: str) -> list[dict]:
         async with pool.acquire() as conn:
             meal, items = await _get_meal_with_items(conn, row["id"], user_id)
 
-        macros = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
+        macros = {"calories": 0.0}
         nutrients: dict = {}
         for item in items:
-            for k in macros:
-                macros[k] += item.get(k, 0) or 0
-            # Fiber ("Fiber, total dietary") is summed here along with
-            # every other non-macro nutrient — it is not a separate macro
-            # field on a meal item.
+            macros["calories"] += item.get("calories", 0) or 0
+            # Protein/carbs/fat/fiber are summed here along with every
+            # other non-macro nutrient — calories is the only field with
+            # its own dedicated column on a meal item.
             for name, info in item.get("nutrients", {}).items():
                 bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
                 bucket["value"] += info["value"]
@@ -165,9 +162,6 @@ async def _search_user_meals(user_id: int, query: str) -> list[dict]:
             "nutrients": {
                 **nutrients,
                 "Energy": {"value": round(macros["calories"]), "unit": "KCAL"},
-                "Protein": {"value": round(macros["protein"], 2), "unit": "G"},
-                "Carbohydrate, by difference": {"value": round(macros["carbs"], 2), "unit": "G"},
-                "Total lipid (fat)": {"value": round(macros["fat"], 2), "unit": "G"},
             },
             "serving_size": 1,
             "serving_unit": "meal",
@@ -195,37 +189,42 @@ async def log_food(
         "serving_size": 1.0,
         "serving_unit": "medium (118g)",
         "calories": 105,
-        "protein": 1.3,
-        "carbs": 27,
-        "fat": 0.4,
-        "nutrients": {"Fiber, total dietary": {"value": 3.1, "unit": "G"}, "Sodium, Na": {"value": 1.2, "unit": "mg"}, ...},
+        "nutrients": {
+            "Protein": {"value": 1.3, "unit": "G"},
+            "Carbohydrate, by difference": {"value": 27, "unit": "G"},
+            "Total lipid (fat)": {"value": 0.4, "unit": "G"},
+            "Fiber, total dietary": {"value": 3.1, "unit": "G"},
+            "Sodium, Na": {"value": 1.2, "unit": "mg"}, ...
+        },
         "scale_to": {"mode": "grams", "from_grams": 118, "to_grams": 250}
     }
 
-    Fiber is NOT a top-level field — it's a micronutrient, not one of the
-    3 true macros (protein/carbs/fat), so it belongs in `nutrients` under
-    "Fiber, total dietary" like every other nutrient. A legacy top-level
-    `fiber` value is still accepted for one release for backwards
-    compatibility with older frontend builds — it's folded into
-    `nutrients["Fiber, total dietary"]` if that key isn't already present.
+    `calories` is the sole top-level numeric field (TrackStack's "amount"
+    for this tracker, per the Event Contract). Protein/carbs/fat/fiber
+    are NOT top-level fields — they're micronutrients-in-spirit here (no
+    field is "more of a macro" than another except calories), so they
+    belong in `nutrients` under their standard USDA names ("Protein",
+    "Carbohydrate, by difference", "Total lipid (fat)", "Fiber, total
+    dietary") like every other nutrient. Legacy top-level `protein`/
+    `carbs`/`fat`/`fiber` values are still accepted for one release for
+    backwards compatibility with older frontend builds — each is folded
+    into its corresponding `nutrients` key if that key isn't already
+    present.
 
     `nutrients` (if present) is persisted structurally into
     food_log_nutrients (one row per nutrient), not just kept as an
     unread JSON blob — this is what lets /nutrition/progress compute
     per-nutrient daily totals with SQL instead of parsing JSON per row.
-    Entries without a `calories`/`protein`/etc. key in `nutrients` still
-    get those 4 macro columns populated from the top-level fields for
-    backwards compatibility with the existing dashboard totals.
 
     `scale_to` is optional. If present, the backend scales `calories`/
-    `protein`/`carbs`/`fat`/`nutrients` (fiber scales as part of
-    `nutrients`) by the requested amount before storing — the caller
-    sends the food's reference (unscaled) values plus the target amount,
-    not pre-scaled numbers, so the actual multiplication happens in one
-    place (portion_scaling.py) instead of being reimplemented by every
-    caller (or, before this existed, not implemented at all). If
-    `scale_to` is omitted, the request body's top-level fields are stored
-    exactly as given — unchanged behavior for existing callers.
+    `nutrients` (protein/carbs/fat/fiber scale as part of `nutrients`) by
+    the requested amount before storing — the caller sends the food's
+    reference (unscaled) values plus the target amount, not pre-scaled
+    numbers, so the actual multiplication happens in one place
+    (portion_scaling.py) instead of being reimplemented by every caller
+    (or, before this existed, not implemented at all). If `scale_to` is
+    omitted, the request body's top-level fields are stored exactly as
+    given — unchanged behavior for existing callers.
       - mode="grams": {"from_grams": 118, "to_grams": 250} — for foods
         with a real gram-based reference (USDA/CNF's serving_size, when
         it's a weight).
@@ -239,15 +238,19 @@ async def log_food(
     insert logic.
     """
     nutrients: dict = dict(entry.get("nutrients") or {})
-    legacy_fiber = entry.get("fiber")
-    if legacy_fiber is not None and "Fiber, total dietary" not in nutrients:
-        nutrients["Fiber, total dietary"] = {"value": legacy_fiber, "unit": "G"}
+    _LEGACY_MACRO_KEYS = {
+        "protein": ("Protein", "G"),
+        "carbs": ("Carbohydrate, by difference", "G"),
+        "fat": ("Total lipid (fat)", "G"),
+        "fiber": ("Fiber, total dietary", "G"),
+    }
+    for legacy_key, (nutrient_name, unit) in _LEGACY_MACRO_KEYS.items():
+        legacy_value = entry.get(legacy_key)
+        if legacy_value is not None and nutrient_name not in nutrients:
+            nutrients[nutrient_name] = {"value": legacy_value, "unit": unit}
 
     macros = {
         "calories": entry.get("calories", 0),
-        "protein": entry.get("protein", 0),
-        "carbs": entry.get("carbs", 0),
-        "fat": entry.get("fat", 0),
     }
 
     scale_to = entry.get("scale_to")
@@ -275,9 +278,6 @@ async def log_food(
         serving_size=entry.get("serving_size", 1.0),
         serving_unit=entry.get("serving_unit", "serving"),
         calories=macros["calories"],
-        protein=macros["protein"],
-        carbs=macros["carbs"],
-        fat=macros["fat"],
         nutrients=nutrients,
     )
     food_log_id = await log_food_entry(user_id, contract_entry)
@@ -291,10 +291,12 @@ async def get_food_log(
 ):
     """Get all food entries for a given date, including each entry's full
     per-nutrient breakdown (from food_log_nutrients) and day-level totals
-    for every nutrient that appears on at least one entry — not just the
-    4 hardcoded macro columns. Fiber ("Fiber, total dietary") is one of
-    the entries in `nutrients`/`nutrient_totals`, not a 5th macro column —
-    there is no dedicated `fiber` field in `entries`/`totals` below."""
+    for every nutrient that appears on at least one entry. `calories` is
+    the only macro-like field with its own dedicated column — protein,
+    carbs, fat, and fiber are entries in `nutrients`/`nutrient_totals`
+    (under "Protein", "Carbohydrate, by difference", "Total lipid (fat)",
+    "Fiber, total dietary") like every other nutrient, not their own
+    fields in `entries`/`totals` below."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -330,9 +332,6 @@ async def get_food_log(
             "serving_size": r["serving_size"],
             "serving_unit": r["serving_unit"],
             "calories": r["calories"],
-            "protein": r["protein"],
-            "carbs": r["carbs"],
-            "fat": r["fat"],
             "nutrients": entry_nutrients,
         })
         for name, info in entry_nutrients.items():
@@ -341,9 +340,6 @@ async def get_food_log(
 
     totals = {
         "calories": sum(e["calories"] for e in entries),
-        "protein": sum(e["protein"] for e in entries),
-        "carbs": sum(e["carbs"] for e in entries),
-        "fat": sum(e["fat"] for e in entries),
     }
 
     return {"entries": entries, "totals": totals, "nutrient_totals": nutrient_totals}

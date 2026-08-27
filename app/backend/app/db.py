@@ -103,9 +103,6 @@ async def init_db():
                 serving_size DOUBLE PRECISION DEFAULT 1.0,
                 serving_unit TEXT DEFAULT 'serving',
                 calories DOUBLE PRECISION DEFAULT 0,
-                protein DOUBLE PRECISION DEFAULT 0,
-                carbs DOUBLE PRECISION DEFAULT 0,
-                fat DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT
             );
 
@@ -234,9 +231,10 @@ async def init_db():
             -- the row outright). Links to the same food database food_log
             -- uses (source/source_id) so a pantry item never duplicates a
             -- food's canonical definition elsewhere -- but it DOES store
-            -- its own nutrition data (calories/protein/carbs/fat +
-            -- pantry_item_nutrients below, which carries fiber and every
-            -- other non-macro nutrient), PER serving_size/serving_unit,
+            -- its own nutrition data (calories +
+            -- pantry_item_nutrients below, which carries protein/carbs/
+            -- fat/fiber and every other non-macro nutrient), PER
+            -- serving_size/serving_unit,
             -- the same "reference amount + scale by count" convention
             -- custom_foods uses. This was NOT true originally (a pantry
             -- item stored zero nutrition, relying on the caller to
@@ -258,9 +256,6 @@ async def init_db():
                 is_finished BOOLEAN NOT NULL DEFAULT FALSE,
                 expiration_date TEXT,
                 calories DOUBLE PRECISION DEFAULT 0,
-                protein DOUBLE PRECISION DEFAULT 0,
-                carbs DOUBLE PRECISION DEFAULT 0,
-                fat DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT,
                 added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -271,9 +266,6 @@ async def init_db():
             -- an already-existing table (learned the hard way earlier
             -- this project via the user_preferences columns bug).
             ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS calories DOUBLE PRECISION DEFAULT 0;
-            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS protein DOUBLE PRECISION DEFAULT 0;
-            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS carbs DOUBLE PRECISION DEFAULT 0;
-            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS fat DOUBLE PRECISION DEFAULT 0;
             ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS nutrients_json TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_pantry_items_user ON pantry_items(user_id);
@@ -310,9 +302,6 @@ async def init_db():
                 reference_unit TEXT NOT NULL DEFAULT 'serving',
                 reference_grams DOUBLE PRECISION,
                 calories DOUBLE PRECISION DEFAULT 0,
-                protein DOUBLE PRECISION DEFAULT 0,
-                carbs DOUBLE PRECISION DEFAULT 0,
-                fat DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -363,9 +352,6 @@ async def init_db():
                 amount_grams DOUBLE PRECISION,
                 amount_multiple DOUBLE PRECISION,
                 calories DOUBLE PRECISION DEFAULT 0,
-                protein DOUBLE PRECISION DEFAULT 0,
-                carbs DOUBLE PRECISION DEFAULT 0,
-                fat DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT
             );
 
@@ -399,9 +385,6 @@ async def init_db():
                 serving_size DOUBLE PRECISION DEFAULT 1.0,
                 serving_unit TEXT DEFAULT 'serving',
                 calories DOUBLE PRECISION DEFAULT 0,
-                protein DOUBLE PRECISION DEFAULT 0,
-                carbs DOUBLE PRECISION DEFAULT 0,
-                fat DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT
             );
 
@@ -563,6 +546,117 @@ async def init_db():
                     WHERE fiber IS NOT NULL AND fiber != 0
                     ON CONFLICT (meal_item_id, nutrient_name) DO NOTHING;
                     ALTER TABLE meal_items DROP COLUMN fiber;
+                END IF;
+            END $$;
+
+            -- One-time migration: protein/carbs/fat used to be 3 more
+            -- denormalized macro columns on food_log/pantry_items/
+            -- custom_foods/recipe_items/meal_items, alongside calories.
+            -- Standardized away per the TrackStack Event Contract
+            -- decision (2026-08-26, EVENT_CONTRACT_SPEC.md) — calories is
+            -- the sole top-level numeric field ("amount") for this
+            -- tracker; every other nutrient, including protein/carbs/
+            -- fat, lives in the per-nutrient child tables under its
+            -- standard USDA name ("Protein", "Carbohydrate, by
+            -- difference", "Total lipid (fat)") like fiber already does.
+            -- Same idempotent backfill-then-drop shape as the fiber
+            -- migration above, run separately (and after it) since this
+            -- decision was made in a later session on the same day.
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'food_log' AND column_name = 'protein') THEN
+                    INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit)
+                    SELECT id, 'Protein', protein, 'G' FROM food_log
+                    WHERE protein IS NOT NULL AND protein != 0
+                    ON CONFLICT (food_log_id, nutrient_name) DO NOTHING;
+                    INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit)
+                    SELECT id, 'Carbohydrate, by difference', carbs, 'G' FROM food_log
+                    WHERE carbs IS NOT NULL AND carbs != 0
+                    ON CONFLICT (food_log_id, nutrient_name) DO NOTHING;
+                    INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit)
+                    SELECT id, 'Total lipid (fat)', fat, 'G' FROM food_log
+                    WHERE fat IS NOT NULL AND fat != 0
+                    ON CONFLICT (food_log_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE food_log DROP COLUMN protein;
+                    ALTER TABLE food_log DROP COLUMN carbs;
+                    ALTER TABLE food_log DROP COLUMN fat;
+                END IF;
+
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'pantry_items' AND column_name = 'protein') THEN
+                    INSERT INTO pantry_item_nutrients (pantry_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Protein', protein, 'G' FROM pantry_items
+                    WHERE protein IS NOT NULL AND protein != 0
+                    ON CONFLICT (pantry_item_id, nutrient_name) DO NOTHING;
+                    INSERT INTO pantry_item_nutrients (pantry_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Carbohydrate, by difference', carbs, 'G' FROM pantry_items
+                    WHERE carbs IS NOT NULL AND carbs != 0
+                    ON CONFLICT (pantry_item_id, nutrient_name) DO NOTHING;
+                    INSERT INTO pantry_item_nutrients (pantry_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Total lipid (fat)', fat, 'G' FROM pantry_items
+                    WHERE fat IS NOT NULL AND fat != 0
+                    ON CONFLICT (pantry_item_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE pantry_items DROP COLUMN protein;
+                    ALTER TABLE pantry_items DROP COLUMN carbs;
+                    ALTER TABLE pantry_items DROP COLUMN fat;
+                END IF;
+
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'custom_foods' AND column_name = 'protein') THEN
+                    INSERT INTO custom_food_nutrients (custom_food_id, nutrient_name, value, unit)
+                    SELECT id, 'Protein', protein, 'G' FROM custom_foods
+                    WHERE protein IS NOT NULL AND protein != 0
+                    ON CONFLICT (custom_food_id, nutrient_name) DO NOTHING;
+                    INSERT INTO custom_food_nutrients (custom_food_id, nutrient_name, value, unit)
+                    SELECT id, 'Carbohydrate, by difference', carbs, 'G' FROM custom_foods
+                    WHERE carbs IS NOT NULL AND carbs != 0
+                    ON CONFLICT (custom_food_id, nutrient_name) DO NOTHING;
+                    INSERT INTO custom_food_nutrients (custom_food_id, nutrient_name, value, unit)
+                    SELECT id, 'Total lipid (fat)', fat, 'G' FROM custom_foods
+                    WHERE fat IS NOT NULL AND fat != 0
+                    ON CONFLICT (custom_food_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE custom_foods DROP COLUMN protein;
+                    ALTER TABLE custom_foods DROP COLUMN carbs;
+                    ALTER TABLE custom_foods DROP COLUMN fat;
+                END IF;
+
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'recipe_items' AND column_name = 'protein') THEN
+                    INSERT INTO recipe_item_nutrients (recipe_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Protein', protein, 'G' FROM recipe_items
+                    WHERE protein IS NOT NULL AND protein != 0
+                    ON CONFLICT (recipe_item_id, nutrient_name) DO NOTHING;
+                    INSERT INTO recipe_item_nutrients (recipe_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Carbohydrate, by difference', carbs, 'G' FROM recipe_items
+                    WHERE carbs IS NOT NULL AND carbs != 0
+                    ON CONFLICT (recipe_item_id, nutrient_name) DO NOTHING;
+                    INSERT INTO recipe_item_nutrients (recipe_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Total lipid (fat)', fat, 'G' FROM recipe_items
+                    WHERE fat IS NOT NULL AND fat != 0
+                    ON CONFLICT (recipe_item_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE recipe_items DROP COLUMN protein;
+                    ALTER TABLE recipe_items DROP COLUMN carbs;
+                    ALTER TABLE recipe_items DROP COLUMN fat;
+                END IF;
+
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'meal_items' AND column_name = 'protein') THEN
+                    INSERT INTO meal_item_nutrients (meal_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Protein', protein, 'G' FROM meal_items
+                    WHERE protein IS NOT NULL AND protein != 0
+                    ON CONFLICT (meal_item_id, nutrient_name) DO NOTHING;
+                    INSERT INTO meal_item_nutrients (meal_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Carbohydrate, by difference', carbs, 'G' FROM meal_items
+                    WHERE carbs IS NOT NULL AND carbs != 0
+                    ON CONFLICT (meal_item_id, nutrient_name) DO NOTHING;
+                    INSERT INTO meal_item_nutrients (meal_item_id, nutrient_name, value, unit)
+                    SELECT id, 'Total lipid (fat)', fat, 'G' FROM meal_items
+                    WHERE fat IS NOT NULL AND fat != 0
+                    ON CONFLICT (meal_item_id, nutrient_name) DO NOTHING;
+                    ALTER TABLE meal_items DROP COLUMN protein;
+                    ALTER TABLE meal_items DROP COLUMN carbs;
+                    ALTER TABLE meal_items DROP COLUMN fat;
                 END IF;
             END $$;
         """)

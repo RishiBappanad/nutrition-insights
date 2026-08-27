@@ -10,27 +10,36 @@ import { PieChart as PieChartIcon, BarChart3 } from 'lucide-react'
 // diverge between backend and frontend.
 const KCAL_PER_GRAM = { protein: 4, carbs: 4, fat: 9 }
 
-// Alcohol isn't one of the 3 macro columns on food_log (protein/carbs/
-// fat — calories is a derived total, fiber is a regular nutrient, not a
-// macro column) — it comes through as a regular USDA/CNF nutrient
-// ("Alcohol, ethyl", grams) in food_log_nutrients, the same way any other
-// micronutrient does. 7 kcal/g is the standard Atwater factor (matches
-// Cronometer's own handling — alcohol shows as its own breakdown category
-// in their daily report, not folded into any of the 3 macros). Shown as
-// a 4th pie segment only when actually present in the day's nutrient
-// totals — never fabricated or assumed to be 0 vs. "not tracked."
+// None of protein/carbs/fat/alcohol are macro COLUMNS on food_log —
+// calories is the sole top-level numeric field (TrackStack's "amount"
+// for this tracker). All four are regular entries in food_log_nutrients/
+// `nutrientTotals` (GET /food/log's `nutrient_totals`), read out here by
+// their standard USDA nutrient names — same treatment for all four, not
+// a special case for protein/carbs/fat vs. alcohol.
+const MACRO_NUTRIENT_NAMES = {
+  protein: 'Protein',
+  carbs: 'Carbohydrate, by difference',
+  fat: 'Total lipid (fat)',
+}
+
+// 7 kcal/g is the standard Atwater factor (matches Cronometer's own
+// handling — alcohol shows as its own breakdown category in their daily
+// report, not folded into any of the 3 macros). Shown as a 4th pie
+// segment only when actually present in the day's nutrient totals —
+// never fabricated or assumed to be 0 vs. "not tracked."
 const ALCOHOL_NUTRIENT_NAME = 'Alcohol, ethyl'
 const ALCOHOL_KCAL_PER_GRAM = 7
 
 /**
  * Daily macros as a pie chart (calories-from-each-macro), with a
  * calories/grams toggle for the legend values — matches Cronometer's
- * macro summary card. `totals` is the day's logged macro totals
- * (calories/protein/carbs/fat from GET /food/log), `target` is optional
- * (from GET /targets/macros) for a "X / Y" comparison under the chart.
- * `nutrientTotals` is GET /food/log's `nutrient_totals` — used only to
- * pull out alcohol grams, since alcohol isn't one of food_log's 5
- * hardcoded macro columns.
+ * macro summary card. `totals` is the day's logged calorie total
+ * (calories from GET /food/log — the only macro-like field with its own
+ * column), `target` is optional (from GET /targets/macros) for a
+ * "X / Y" comparison under the chart. `nutrientTotals` is GET /food/log's
+ * `nutrient_totals` — this is where protein/carbs/fat/alcohol grams all
+ * come from, since none of them are food_log's hardcoded macro column
+ * (calories is the only one).
  * `colors` is the user's configured segment colors (from usePreferences,
  * keys macro_protein/macro_carbs/macro_fat/macro_alcohol) — required,
  * not optional, so this component never silently falls back to its own
@@ -56,9 +65,9 @@ export function MacroCard({ totals, target, nutrientTotals, colors, chartStyle =
   const alcoholGrams = nutrientTotals?.[ALCOHOL_NUTRIENT_NAME]?.value ?? 0
 
   const macros = [
-    { key: 'protein', label: 'Protein', grams: totals?.protein ?? 0 },
-    { key: 'carbs', label: 'Carbs', grams: totals?.carbs ?? 0 },
-    { key: 'fat', label: 'Fat', grams: totals?.fat ?? 0 },
+    { key: 'protein', label: 'Protein', grams: nutrientTotals?.[MACRO_NUTRIENT_NAMES.protein]?.value ?? 0 },
+    { key: 'carbs', label: 'Carbs', grams: nutrientTotals?.[MACRO_NUTRIENT_NAMES.carbs]?.value ?? 0 },
+    { key: 'fat', label: 'Fat', grams: nutrientTotals?.[MACRO_NUTRIENT_NAMES.fat]?.value ?? 0 },
   ].map((m) => ({ ...m, calories: m.grams * KCAL_PER_GRAM[m.key] }))
 
   // Alcohol only appears as a segment/legend row when actually logged —

@@ -44,10 +44,10 @@ Return ONLY valid JSON with this exact schema, no other text:
   "reference_unit": "string or null (e.g. \\"cup\\", \\"piece\\", \\"g\\")",
   "reference_grams": number or null (the serving size in grams, if shown or derivable),
   "calories": number or null,
-  "protein": number or null (grams),
-  "carbs": number or null (grams, Total Carbohydrate),
-  "fat": number or null (grams, Total Fat),
   "nutrients": {
+    "Protein": {"value": number, "unit": "G"},
+    "Carbohydrate, by difference": {"value": number, "unit": "G"},
+    "Total lipid (fat)": {"value": number, "unit": "G"},
     "Fiber, total dietary": {"value": number, "unit": "G"},
     "Sodium, Na": {"value": number, "unit": "mg"},
     "Sugars, total": {"value": number, "unit": "g"}
@@ -56,8 +56,9 @@ Return ONLY valid JSON with this exact schema, no other text:
 
 Rules:
 - Only include nutrients actually visible on the label in the "nutrients" object
-- Dietary Fiber goes in "nutrients" as "Fiber, total dietary" — it is NOT one \
-of the 4 top-level macro fields (calories/protein/carbs/fat)
+- Protein, Total Carbohydrate, Total Fat, and Dietary Fiber all go in "nutrients" \
+(as "Protein", "Carbohydrate, by difference", "Total lipid (fat)", "Fiber, total \
+dietary" respectively) — calories is the ONLY top-level macro-like field
 - Use standard USDA-style nutrient names where recognizable (e.g. "Sodium, Na", \
 "Iron, Fe", "Calcium, Ca", "Potassium, K", "Vitamin C, total ascorbic acid", \
 "Vitamin D (D2 + D3)") so this matches the naming convention used elsewhere \
@@ -65,8 +66,8 @@ in this app's nutrient tracking — if unsure of the exact convention name, \
 use the label's own wording instead of guessing a USDA name incorrectly.
 - All values should be plain numbers (no units in the number fields)
 - If a field isn't visible or legible, use null — do NOT hallucinate values
-- calories/protein/carbs/fat refer to the amount for ONE reference serving \
-(reference_amount of reference_unit), not per-container"""
+- calories refers to the amount for ONE reference serving (reference_amount of \
+reference_unit), not per-container"""
 
 
 class LabelScanResult(BaseModel):
@@ -77,12 +78,9 @@ class LabelScanResult(BaseModel):
     reference_amount: Optional[float] = None
     reference_unit: Optional[str] = None
     reference_grams: Optional[float] = None
+    # `calories` is the sole top-level numeric field. Protein/carbs/fat/
+    # fiber are returned in nutrients under their standard USDA names.
     calories: Optional[float] = None
-    protein: Optional[float] = None
-    carbs: Optional[float] = None
-    fat: Optional[float] = None
-    # Fiber is not a top-level field — it's returned in nutrients under
-    # "Fiber, total dietary" like every other non-macro nutrient.
     nutrients: dict = {}
     error: Optional[str] = None
 
@@ -162,16 +160,24 @@ def extract_label_with_gemini(image_bytes: bytes, mime_type: str) -> LabelScanRe
             except (TypeError, ValueError):
                 continue
 
-    # Defensive fallback: the prompt asks Gemini to put fiber inside
-    # `nutrients`, but its output isn't schema-enforced — if it still
-    # returns a stray top-level "fiber" despite the prompt, fold it in
+    # Defensive fallback: the prompt asks Gemini to put protein/carbs/
+    # fat/fiber inside `nutrients`, but its output isn't schema-enforced
+    # — if it still returns any of them as a stray top-level field
+    # despite the prompt, fold each into its standard-named nutrient
     # rather than silently dropping it.
-    legacy_fiber = parsed.get("fiber")
-    if legacy_fiber is not None and "Fiber, total dietary" not in nutrients:
-        try:
-            nutrients["Fiber, total dietary"] = {"value": float(legacy_fiber), "unit": "G"}
-        except (TypeError, ValueError):
-            pass
+    _LEGACY_MACRO_KEYS = {
+        "protein": "Protein",
+        "carbs": "Carbohydrate, by difference",
+        "fat": "Total lipid (fat)",
+        "fiber": "Fiber, total dietary",
+    }
+    for legacy_key, nutrient_name in _LEGACY_MACRO_KEYS.items():
+        legacy_value = parsed.get(legacy_key)
+        if legacy_value is not None and nutrient_name not in nutrients:
+            try:
+                nutrients[nutrient_name] = {"value": float(legacy_value), "unit": "G"}
+            except (TypeError, ValueError):
+                pass
 
     confidence = _confidence_score(parsed)
     return LabelScanResult(
@@ -183,9 +189,6 @@ def extract_label_with_gemini(image_bytes: bytes, mime_type: str) -> LabelScanRe
         reference_unit=parsed.get("reference_unit"),
         reference_grams=parsed.get("reference_grams"),
         calories=parsed.get("calories"),
-        protein=parsed.get("protein"),
-        carbs=parsed.get("carbs"),
-        fat=parsed.get("fat"),
         nutrients=nutrients,
     )
 

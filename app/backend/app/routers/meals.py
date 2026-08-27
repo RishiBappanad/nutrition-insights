@@ -21,12 +21,9 @@ class MealItemRequest(BaseModel):
     source_id: Optional[str] = None
     serving_size: float = 1.0
     serving_unit: str = "serving"
+    # `calories` is the sole top-level numeric field. Protein/carbs/fat/
+    # fiber belong in nutrients under their standard USDA names.
     calories: float = 0
-    protein: float = 0
-    carbs: float = 0
-    fat: float = 0
-    # Fiber is not a top-level field — it belongs in nutrients under
-    # "Fiber, total dietary" like every other non-macro nutrient.
     nutrients: dict = {}
 
 
@@ -66,11 +63,11 @@ async def _save_items(conn, meal_id: int, items: list[MealItemRequest]):
     for item in items:
         item_id = await conn.fetchval(
             """INSERT INTO meal_items (meal_id, food_name, source, source_id, serving_size, serving_unit,
-                   calories, protein, carbs, fat, nutrients_json)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                   calories, nutrients_json)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                RETURNING id""",
             meal_id, item.food_name, item.source, item.source_id, item.serving_size, item.serving_unit,
-            item.calories, item.protein, item.carbs, item.fat, json.dumps(item.nutrients),
+            item.calories, json.dumps(item.nutrients),
         )
         rows = _item_nutrient_rows(item_id, item.nutrients)
         if rows:
@@ -127,9 +124,6 @@ async def _get_meal_with_items(conn, meal_id: int, user_id: int):
             "serving_size": r["serving_size"],
             "serving_unit": r["serving_unit"],
             "calories": r["calories"],
-            "protein": r["protein"],
-            "carbs": r["carbs"],
-            "fat": r["fat"],
             "nutrients": nutrients_by_item.get(r["id"], {}),
         })
     return meal, items
@@ -190,13 +184,12 @@ async def log_meal(meal_id: int, req: LogMealRequest, user_id: int = Depends(get
             raise HTTPException(status_code=404, detail="Meal not found")
 
         if req.combined:
-            macros = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
+            macros = {"calories": 0.0}
             nutrients: dict = {}
             for item in items:
-                for k in macros:
-                    macros[k] += item.get(k, 0) or 0
-                # Fiber ("Fiber, total dietary") is summed here along with
-                # every other non-macro nutrient.
+                macros["calories"] += item.get("calories", 0) or 0
+                # Protein/carbs/fat/fiber are summed here along with every
+                # other non-macro nutrient.
                 for name, info in item.get("nutrients", {}).items():
                     bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
                     bucket["value"] += info["value"]
@@ -204,12 +197,11 @@ async def log_meal(meal_id: int, req: LogMealRequest, user_id: int = Depends(get
             async with conn.transaction():
                 food_log_id = await conn.fetchval(
                     """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                           serving_size, serving_unit, calories, protein, carbs, fat, nutrients_json)
-                       VALUES ($1, $2, $3, $4, 'meal', $5, 1, 'meal', $6, $7, $8, $9, $10)
+                           serving_size, serving_unit, calories, nutrients_json)
+                       VALUES ($1, $2, $3, $4, 'meal', $5, 1, 'meal', $6, $7)
                        RETURNING id""",
                     user_id, req.date, req.meal, meal["name"], str(meal_id),
-                    macros["calories"], macros["protein"], macros["carbs"], macros["fat"],
-                    json.dumps(nutrients),
+                    macros["calories"], json.dumps(nutrients),
                 )
                 nutrient_rows = [(food_log_id, name, info["value"], info["unit"]) for name, info in nutrients.items()]
                 if nutrient_rows:
@@ -224,12 +216,11 @@ async def log_meal(meal_id: int, req: LogMealRequest, user_id: int = Depends(get
             for item in items:
                 food_log_id = await conn.fetchval(
                     """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                           serving_size, serving_unit, calories, protein, carbs, fat, nutrients_json)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                           serving_size, serving_unit, calories, nutrients_json)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                        RETURNING id""",
                     user_id, req.date, req.meal, item["food_name"], item["source"], item["source_id"],
-                    item["serving_size"], item["serving_unit"], item["calories"], item["protein"],
-                    item["carbs"], item["fat"], json.dumps(item["nutrients"]),
+                    item["serving_size"], item["serving_unit"], item["calories"], json.dumps(item["nutrients"]),
                 )
                 food_log_ids.append(food_log_id)
                 nutrient_rows = [
@@ -277,12 +268,11 @@ async def explode_meal_entry(meal_id: int, food_log_id: int, user_id: int = Depe
             for item in items:
                 new_id = await conn.fetchval(
                     """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                           serving_size, serving_unit, calories, protein, carbs, fat, nutrients_json)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                           serving_size, serving_unit, calories, nutrients_json)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                        RETURNING id""",
                     user_id, entry["date"], entry["meal"], item["food_name"], item["source"], item["source_id"],
-                    item["serving_size"], item["serving_unit"], item["calories"], item["protein"],
-                    item["carbs"], item["fat"], json.dumps(item["nutrients"]),
+                    item["serving_size"], item["serving_unit"], item["calories"], json.dumps(item["nutrients"]),
                 )
                 food_log_ids.append(new_id)
                 nutrient_rows = [

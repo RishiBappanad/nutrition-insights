@@ -9,18 +9,16 @@ const MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack']
 const SEARCH_DEBOUNCE_MS = 400
 
 // USDA FoodData Central reports macros as regular nutrient entries, not
-// separate fields — these are the exact nutrient names USDA uses
-// (confirmed against a live API response), mapped to the 4 hardcoded
-// food_log macro columns. "Energy" appears twice per food (kJ and kcal)
-// — must match on unit, not just name, or this silently grabs the wrong
-// one and multiplies calories by ~4. Fiber is deliberately NOT here — it
-// is not a macro column; it's sent/read entirely via the `nutrients` map
-// (key "Fiber, total dietary"), never extracted as a separate field.
+// separate fields — "Energy" is the exact nutrient name USDA uses
+// (confirmed against a live API response), mapped to the sole hardcoded
+// food_log macro column (calories — TrackStack's "amount" for this
+// tracker). "Energy" appears twice per food (kJ and kcal) — must match
+// on unit, not just name, or this silently grabs the wrong one and
+// multiplies calories by ~4. Protein/carbs/fat/fiber are deliberately
+// NOT here — none of them are macro columns; they're sent/read entirely
+// via the `nutrients` map, never extracted as separate fields.
 const MACRO_NUTRIENT_NAMES = {
   calories: { name: 'Energy', unit: 'KCAL' },
-  protein: { name: 'Protein' },
-  carbs: { name: 'Carbohydrate, by difference' },
-  fat: { name: 'Total lipid (fat)' },
 }
 
 function extractMacro(nutrients, key) {
@@ -161,12 +159,10 @@ export default function FoodLog() {
         serving_size: targetGrams,
         serving_unit: isRecipe ? 'serving' : 'g',
         calories: extractMacro(result.nutrients, 'calories'),
-        protein: extractMacro(result.nutrients, 'protein'),
-        carbs: extractMacro(result.nutrients, 'carbs'),
-        fat: extractMacro(result.nutrients, 'fat'),
-        // Fiber is not a top-level field — it's already inside
-        // `nutrients` below (as "Fiber, total dietary"), same as every
-        // other non-macro nutrient.
+        // Protein/carbs/fat/fiber are not top-level fields — they're
+        // already inside `nutrients` below (as "Protein", "Carbohydrate,
+        // by difference", "Total lipid (fat)", "Fiber, total dietary"),
+        // same as every other non-macro nutrient.
         nutrients: result.nutrients,
         scale_to: isRecipe
           ? { mode: 'multiple', servings_requested: targetGrams }

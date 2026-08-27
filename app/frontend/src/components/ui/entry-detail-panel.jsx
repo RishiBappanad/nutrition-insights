@@ -3,6 +3,17 @@ import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { X, Trash2, Layers } from 'lucide-react'
 
+// Protein/carbs/fat are not fields on a food_log entry — calories is the
+// only one with its own column (TrackStack's "amount" for this tracker).
+// Read out of entry.nutrients by standard USDA name, same as everywhere
+// else in this app, and excluded from the "Full Nutrient Breakdown" list
+// below since they're already shown as their own summary tiles.
+const MACRO_NUTRIENT_NAMES = {
+  protein: 'Protein',
+  carbs: 'Carbohydrate, by difference',
+  fat: 'Total lipid (fat)',
+}
+
 /**
  * Full nutrient breakdown for one already-logged diary entry — click a
  * row in MealSections to open this. Per explicit user request:
@@ -20,7 +31,10 @@ export function EntryDetailPanel({ entry, onClose, onChanged }) {
   const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState('')
 
-  const nutrients = Object.entries(entry.nutrients || {}).sort(([a], [b]) => a.localeCompare(b))
+  const macroNames = new Set(Object.values(MACRO_NUTRIENT_NAMES))
+  const nutrients = Object.entries(entry.nutrients || {})
+    .filter(([name]) => !macroNames.has(name))
+    .sort(([a], [b]) => a.localeCompare(b))
   const isMeal = entry.source === 'meal'
 
   async function handleExplode() {
@@ -71,9 +85,9 @@ export function EntryDetailPanel({ entry, onClose, onChanged }) {
             <div className="grid grid-cols-4 gap-2 text-center">
               {[
                 { label: 'Calories', value: Math.round(entry.calories || 0), suffix: '' },
-                { label: 'Protein', value: Math.round(entry.protein || 0), suffix: 'g' },
-                { label: 'Carbs', value: Math.round(entry.carbs || 0), suffix: 'g' },
-                { label: 'Fat', value: Math.round(entry.fat || 0), suffix: 'g' },
+                { label: 'Protein', value: Math.round(entry.nutrients?.[MACRO_NUTRIENT_NAMES.protein]?.value || 0), suffix: 'g' },
+                { label: 'Carbs', value: Math.round(entry.nutrients?.[MACRO_NUTRIENT_NAMES.carbs]?.value || 0), suffix: 'g' },
+                { label: 'Fat', value: Math.round(entry.nutrients?.[MACRO_NUTRIENT_NAMES.fat]?.value || 0), suffix: 'g' },
               ].map((m) => (
                 <div key={m.label} className="rounded-md bg-muted py-2">
                   <p className="text-sm font-mono font-semibold">{m.value}{m.suffix}</p>

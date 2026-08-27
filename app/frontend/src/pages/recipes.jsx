@@ -5,14 +5,11 @@ import { cn } from '@/lib/utils'
 import { Plus, Trash2, Save, CheckCircle, Search, ArrowLeft, ChefHat, X, DownloadCloud, Loader2 } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
 
-// Fiber is deliberately NOT here — it is not a macro field on a recipe
-// item; it's sent/read entirely via the `nutrients` map (key "Fiber,
-// total dietary"), never extracted as a separate field.
+// Protein/carbs/fat/fiber are deliberately NOT here — none of them are
+// macro fields on a recipe item; they're sent/read entirely via the
+// `nutrients` map, never extracted as separate fields.
 const MACRO_NUTRIENT_NAMES = {
   calories: { name: 'Energy', unit: 'KCAL' },
-  protein: { name: 'Protein' },
-  carbs: { name: 'Carbohydrate, by difference' },
-  fat: { name: 'Total lipid (fat)' },
 }
 
 function extractMacro(nutrients, key) {
@@ -495,7 +492,7 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
         setItems(d.items.map((i) => ({
           food_name: i.food_name, source: i.source, source_id: i.source_id,
           amount_grams: i.amount_grams, amount_multiple: i.amount_multiple,
-          calories: i.calories, protein: i.protein, carbs: i.carbs, fat: i.fat,
+          calories: i.calories,
           nutrients: i.nutrients,
         })))
       })
@@ -524,9 +521,6 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
       food_name: result.name, source: result.source, source_id: result.id,
       amount_grams: referenceGrams,
       calories: extractMacro(result.nutrients, 'calories'),
-      protein: extractMacro(result.nutrients, 'protein'),
-      carbs: extractMacro(result.nutrients, 'carbs'),
-      fat: extractMacro(result.nutrients, 'fat'),
       nutrients: result.nutrients,
     })
     setItems([...items])

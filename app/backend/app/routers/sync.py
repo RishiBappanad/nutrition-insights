@@ -104,20 +104,17 @@ async def _update_tdee_log(cronometer_files: dict, user_id: int) -> int:
 # already-authenticated CSV export, not something requiring further
 # reverse-engineering.
 #
-# Column name -> (food_log column, is_macro) for the 4 hardcoded macro
-# fields; every other numeric column in the CSV (including "Fiber (g)")
-# becomes a food_log_nutrients row instead, under its raw CSV column name
-# — same as every other Cronometer-sourced nutrient (fiber is not treated
-# specially here; it's not a macro field on FoodLogEntryContract).
-# Cronometer's CSV header uses "Âµg" for micrograms (a UTF-8/Latin-1
-# mojibake artifact in their own export, not something this code
-# introduces) — matched literally since that's what real exports contain,
-# confirmed against an actual downloaded file.
+# Column name -> food_log column, for the single hardcoded macro field
+# (calories — TrackStack's "amount" for this tracker). Every other
+# numeric column in the CSV (including "Protein (g)", "Carbs (g)",
+# "Fat (g)", "Fiber (g)") becomes a food_log_nutrients row instead, under
+# its raw CSV column name — none of them are macro fields on
+# FoodLogEntryContract. Cronometer's CSV header uses "Âµg" for micrograms
+# (a UTF-8/Latin-1 mojibake artifact in their own export, not something
+# this code introduces) — matched literally since that's what real
+# exports contain, confirmed against an actual downloaded file.
 _SERVINGS_MACRO_COLUMNS = {
     "Energy (kcal)": "calories",
-    "Protein (g)": "protein",
-    "Carbs (g)": "carbs",
-    "Fat (g)": "fat",
 }
 # Columns that are metadata, not nutrients — skipped when building the
 # food_log_nutrients rows so they don't show up as bogus "nutrients."
@@ -645,22 +642,29 @@ async def import_cronometer_recipe(food_id: int, user_id: int = Depends(get_curr
                 scale = amount_g / 100.0 if amount_g else 1.0
 
                 cal = round(nutrients.get("calories", 0) * scale, 1)
-                prot = round(nutrients.get("protein", 0) * scale, 1)
-                carb = round(nutrients.get("carbs", 0) * scale, 1)
-                fat = round(nutrients.get("fat", 0) * scale, 1)
 
-                # Fiber is not a macro field on RecipeItemContract — it's
-                # folded into `nutrients` under "Fiber, total dietary"
-                # (the same canonical name used everywhere else in the
-                # app), like every other non-macro nutrient.
+                # Protein/carbs/fat/fiber are not macro fields on
+                # RecipeItemContract — calories is the only field with
+                # its own dedicated column (TrackStack's "amount" for
+                # this tracker). Each is folded into `nutrients` under
+                # its standard USDA name, the same canonical names used
+                # everywhere else in the app, like every other non-macro
+                # nutrient.
+                _GWT_NUTRIENT_NAME_MAP = {
+                    "protein": "Protein",
+                    "carbs": "Carbohydrate, by difference",
+                    "fat": "Total lipid (fat)",
+                    "fiber": "Fiber, total dietary",
+                }
                 item_nutrients = {
                     k: {"value": round(v * scale, 2), "unit": "G"}
-                    for k, v in nutrients.items() if k not in ("calories", "protein", "carbs", "fat", "fiber")
+                    for k, v in nutrients.items() if k not in ("calories", *_GWT_NUTRIENT_NAME_MAP)
                 }
-                if "fiber" in nutrients:
-                    item_nutrients["Fiber, total dietary"] = {
-                        "value": round(nutrients["fiber"] * scale, 2), "unit": "G",
-                    }
+                for gwt_key, nutrient_name in _GWT_NUTRIENT_NAME_MAP.items():
+                    if gwt_key in nutrients:
+                        item_nutrients[nutrient_name] = {
+                            "value": round(nutrients[gwt_key] * scale, 2), "unit": "G",
+                        }
 
                 items.append(RecipeItemContract(
                     food_name=ing_name,
@@ -669,9 +673,6 @@ async def import_cronometer_recipe(food_id: int, user_id: int = Depends(get_curr
                     amount_grams=amount_g,
                     amount_multiple=1.0,
                     calories=cal,
-                    protein=prot,
-                    carbs=carb,
-                    fat=fat,
                     nutrients=item_nutrients,
                 ))
             except Exception:

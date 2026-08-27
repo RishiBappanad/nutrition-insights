@@ -45,18 +45,20 @@ def scale_nutrients(nutrients: dict, factor: float) -> dict:
 
 
 def scale_macros(macros: dict, factor: float) -> dict:
-    """Scale the 4 hardcoded macro fields (calories/protein/carbs/fat) by
-    `factor`. Kept separate from scale_nutrients since macros aren't a
-    {name: {value, unit}} dict — they're flat top-level fields on
+    """Scale the single top-level `calories` field by `factor`. Kept
+    separate from scale_nutrients since macros aren't a
+    {name: {value, unit}} dict — they're a flat top-level field on
     food_log/pantry_items, a different shape needing its own scaler.
-    Fiber is NOT a macro field here — it lives in `nutrients` (as "Fiber,
-    total dietary") like every other non-macro nutrient, and is scaled by
-    scale_nutrients instead."""
+    Protein/carbs/fat/fiber are NOT macro fields here — calories is the
+    sole top-level scalar (TrackStack's "amount" field for this tracker);
+    every other nutrient lives in `nutrients` (e.g. "Protein",
+    "Carbohydrate, by difference", "Total lipid (fat)", "Fiber, total
+    dietary") and is scaled by scale_nutrients instead."""
     if factor < 0:
         raise ValueError("scaling factor must not be negative")
     return {
         key: round(float(macros.get(key, 0) or 0) * factor, 4)
-        for key in ("calories", "protein", "carbs", "fat")
+        for key in ("calories",)
     }
 
 

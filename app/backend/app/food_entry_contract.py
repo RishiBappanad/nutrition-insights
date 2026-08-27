@@ -43,14 +43,14 @@ class FoodLogEntryContract(BaseModel):
     source_id: Optional[str] = None
     serving_size: float = 1.0
     serving_unit: str = "serving"
-    # Fiber is intentionally NOT a top-level field here — it's a
-    # micronutrient, not one of the 3 true macros (protein/carbs/fat), and
-    # is expected under nutrients["Fiber, total dietary"] like every other
-    # nutrient (sodium, potassium, vitamins, etc.).
+    # `calories` is the sole top-level numeric field — TrackStack's
+    # "amount" for this tracker (Event Contract decision, 2026-08-26).
+    # Protein/carbs/fat/fiber are NOT top-level fields here; they're
+    # expected under nutrients["Protein"]/["Carbohydrate, by difference"]/
+    # ["Total lipid (fat)"]/["Fiber, total dietary"] like every other
+    # nutrient (sodium, potassium, vitamins, etc.) — no field on this
+    # model is "more of a macro" than any other nutrient except calories.
     calories: float = 0
-    protein: float = 0
-    carbs: float = 0
-    fat: float = 0
     nutrients: dict = {}
 
 
@@ -63,9 +63,6 @@ class RecipeItemContract(BaseModel):
     amount_grams: Optional[float] = None
     amount_multiple: Optional[float] = None
     calories: float = 0
-    protein: float = 0
-    carbs: float = 0
-    fat: float = 0
     nutrients: dict = {}
 
 
@@ -143,12 +140,11 @@ async def log_food_entry(user_id: int, entry: FoodLogEntryContract) -> int:
         async with conn.transaction():
             food_log_id = await conn.fetchval(
                 """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       serving_size, serving_unit, calories, protein, carbs, fat, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                       serving_size, serving_unit, calories, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                    RETURNING id""",
                 user_id, entry.date, entry.meal, entry.food_name, entry.source, entry.source_id,
-                entry.serving_size, entry.serving_unit, entry.calories, entry.protein,
-                entry.carbs, entry.fat, json.dumps(entry.nutrients),
+                entry.serving_size, entry.serving_unit, entry.calories, json.dumps(entry.nutrients),
             )
             rows = _nutrients_to_rows(food_log_id, entry.nutrients)
             if rows:
@@ -197,11 +193,11 @@ async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
             for item in recipe.items:
                 item_id = await conn.fetchval(
                     """INSERT INTO recipe_items (recipe_id, food_name, source, source_id, amount_grams, amount_multiple,
-                           calories, protein, carbs, fat, nutrients_json)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                           calories, nutrients_json)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                        RETURNING id""",
                     recipe_id, item.food_name, item.source, item.source_id, item.amount_grams, item.amount_multiple,
-                    item.calories, item.protein, item.carbs, item.fat, json.dumps(item.nutrients),
+                    item.calories, json.dumps(item.nutrients),
                 )
                 rows = _nutrients_to_rows(item_id, item.nutrients)
                 if rows:

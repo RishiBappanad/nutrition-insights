@@ -40,13 +40,10 @@ class PantryItemRequest(BaseModel):
     # Nutrition PER serving_size/serving_unit (e.g. if serving_size=100,
     # serving_unit="g", these are the per-100g values) -- stored once at
     # add time so /consume and /remove never need the caller to resupply
-    # nutrition data.
+    # nutrition data. `calories` is the sole top-level numeric field;
+    # protein/carbs/fat/fiber belong in nutrients under their standard
+    # USDA names.
     calories: float = 0
-    protein: float = 0
-    carbs: float = 0
-    fat: float = 0
-    # Fiber is not a top-level field — it belongs in nutrients under
-    # "Fiber, total dietary" like every other non-macro nutrient.
     nutrients: dict = {}
 
 
@@ -94,12 +91,12 @@ async def add_pantry_item(req: PantryItemRequest, user_id: int = Depends(get_cur
             item_id = await conn.fetchval(
                 """INSERT INTO pantry_items (user_id, food_name, source, source_id, serving_size,
                        serving_unit, tracking_mode, remaining_servings, expiration_date,
-                       calories, protein, carbs, fat, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                       calories, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                    RETURNING id""",
                 user_id, req.food_name, req.source, req.source_id, req.serving_size,
                 req.serving_unit, req.tracking_mode, remaining, req.expiration_date,
-                req.calories, req.protein, req.carbs, req.fat, json.dumps(req.nutrients),
+                req.calories, json.dumps(req.nutrients),
             )
             rows = nutrients_to_rows(item_id, req.nutrients)
             if rows:
@@ -238,26 +235,21 @@ async def consume_pantry_item(item_id: int, req: ConsumeRequest, user_id: int = 
                     )
 
             factor = multiple_based_factor(req.servings)
-            macros = scale_macros(
-                {"calories": item["calories"], "protein": item["protein"], "carbs": item["carbs"],
-                 "fat": item["fat"]},
-                factor,
-            )
-            # Fiber ("Fiber, total dietary") scales as part of the stored
-            # nutrients dict below, not as a macro — it was stored there
-            # at add-time (add_pantry_item), same as every other
+            macros = scale_macros({"calories": item["calories"]}, factor)
+            # Protein/carbs/fat/fiber scale as part of the stored
+            # nutrients dict below, not as macros — they were stored
+            # there at add-time (add_pantry_item), same as every other
             # non-macro nutrient.
             stored_nutrients = json.loads(item["nutrients_json"]) if item["nutrients_json"] else {}
             nutrients = scale_nutrients(stored_nutrients, factor)
 
             food_log_id = await conn.fetchval(
                 """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       serving_size, serving_unit, calories, protein, carbs, fat, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                       serving_size, serving_unit, calories, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                    RETURNING id""",
                 user_id, req.date, req.meal, item["food_name"], item["source"], item["source_id"],
-                req.servings, item["serving_unit"], macros["calories"], macros["protein"], macros["carbs"],
-                macros["fat"], json.dumps(nutrients),
+                req.servings, item["serving_unit"], macros["calories"], json.dumps(nutrients),
             )
             rows = nutrients_to_rows(food_log_id, nutrients)
             if rows:
@@ -346,9 +338,6 @@ def _row_to_item(r) -> dict:
         "is_finished": r["is_finished"],
         "expiration_date": r["expiration_date"],
         "calories": r["calories"],
-        "protein": r["protein"],
-        "carbs": r["carbs"],
-        "fat": r["fat"],
         "added_at": r["added_at"].isoformat(),
         "updated_at": r["updated_at"].isoformat(),
     }

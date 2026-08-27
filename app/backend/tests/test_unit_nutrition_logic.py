@@ -211,11 +211,13 @@ class TestPortionScaling:
 
     def test_scale_macros_100g_to_200g_doubles_calories(self):
         """The exact scenario from the user's ask: 100g -> 100 kcal,
-        200g should give 200 kcal and all macros doubled."""
+        200g should give 200 kcal — calories is the only field
+        scale_macros touches now (protein/carbs/fat scale as part of
+        nutrients, via scale_nutrients, not scale_macros)."""
         from app.portion_scaling import scale_macros
-        macros = {"calories": 100, "protein": 5, "carbs": 20, "fat": 2}
+        macros = {"calories": 100}
         scaled = scale_macros(macros, factor=2.0)
-        assert scaled == {"calories": 200.0, "protein": 10.0, "carbs": 40.0, "fat": 4.0}
+        assert scaled == {"calories": 200.0}
 
     def test_scale_nutrients_scales_every_entry_uniformly(self):
         from app.portion_scaling import scale_nutrients
@@ -281,7 +283,7 @@ class TestPortionScaling:
 
     def test_factor_of_one_is_a_no_op(self):
         from app.portion_scaling import scale_macros
-        macros = {"calories": 87, "protein": 3, "carbs": 15, "fat": 1}
+        macros = {"calories": 87}
         assert scale_macros(macros, factor=1.0) == {k: float(v) for k, v in macros.items()}
 
 
@@ -667,14 +669,18 @@ class TestServingsRowToFoodLogEntry:
         assert entry.food_name == "Chick-fil-A, Grilled Nuggets"
         assert entry.source == "Cronometer"
         assert entry.calories == 174.39
-        assert entry.protein == 30.14
-        assert entry.carbs == 1.37
-        assert entry.fat == 4.40
-        # Fiber is not a macro field on FoodLogEntryContract — "Fiber (g)"
-        # falls through to the generic nutrients loop like any other
-        # Cronometer CSV column, keeping its raw column name/unit (same
-        # as every other Cronometer-sourced nutrient).
+        # Protein/carbs/fat/fiber are not macro fields on
+        # FoodLogEntryContract — "Protein (g)"/"Carbs (g)"/"Fat (g)"/
+        # "Fiber (g)" all fall through to the generic nutrients loop like
+        # any other Cronometer CSV column, keeping their raw column
+        # names/units (same as every other Cronometer-sourced nutrient).
+        assert entry.nutrients["Protein (g)"] == {"value": 30.14, "unit": "g"}
+        assert entry.nutrients["Carbs (g)"] == {"value": 1.37, "unit": "g"}
+        assert entry.nutrients["Fat (g)"] == {"value": 4.40, "unit": "g"}
         assert entry.nutrients["Fiber (g)"] == {"value": 0.02, "unit": "g"}
+        assert not hasattr(entry, "protein")
+        assert not hasattr(entry, "carbs")
+        assert not hasattr(entry, "fat")
         assert not hasattr(entry, "fiber")
         assert entry.serving_size == 12.0
         assert entry.serving_unit == "nugget"
@@ -706,7 +712,7 @@ class TestServingsRowToFoodLogEntry:
         row = {"Day": "2026-01-01", "Group": "Snack", "Food Name": "X", "Amount": "1"}
         entry = _servings_row_to_food_log_entry(row)
         assert entry.calories == 0.0
-        assert entry.protein == 0.0
+        assert entry.nutrients == {}
 
     def test_plural_snacks_group_normalizes_to_snack(self):
         """Real export data uses 'Snacks' (plural) -- confirmed against
@@ -790,12 +796,20 @@ class TestFoodEntryContractModels:
         from app.food_entry_contract import FoodLogEntryContract
         entry = FoodLogEntryContract(
             date="2026-01-01", meal="Lunch", food_name="Chicken", source="Cronometer",
-            source_id=None, serving_size=100, serving_unit="g", calories=200, protein=30,
-            carbs=0, fat=5,
-            nutrients={"Sodium, Na": {"value": 50, "unit": "mg"}, "Fiber, total dietary": {"value": 0, "unit": "G"}},
+            source_id=None, serving_size=100, serving_unit="g", calories=200,
+            nutrients={
+                "Sodium, Na": {"value": 50, "unit": "mg"},
+                "Protein": {"value": 30, "unit": "G"},
+                "Carbohydrate, by difference": {"value": 0, "unit": "G"},
+                "Total lipid (fat)": {"value": 5, "unit": "G"},
+                "Fiber, total dietary": {"value": 0, "unit": "G"},
+            },
         )
         assert entry.source == "Cronometer"
         assert entry.nutrients["Sodium, Na"]["value"] == 50
+        assert not hasattr(entry, "protein")
+        assert not hasattr(entry, "carbs")
+        assert not hasattr(entry, "fat")
         assert not hasattr(entry, "fiber")
 
     def test_recipe_import_contract_defaults(self):
