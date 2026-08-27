@@ -2,7 +2,7 @@ import csv
 from pathlib import Path
 from fastapi import APIRouter, Depends
 from ..routers.auth import get_current_user
-from ..user_db import query_nutrition, query_orm, get_nutrition_metrics, get_exercises, upsert_daily_nutrition, upsert_lift_orm
+from ..user_db import query_nutrition, query_orm, get_nutrition_metrics, get_exercises, upsert_daily_nutrition, upsert_lift_orm, get_metric_series
 from ..db import get_pool
 
 router = APIRouter()
@@ -184,6 +184,12 @@ async def get_lift_insights(
 
     lookback = max(1, min(3, lookback))
 
+    # Merged daily_nutrition + food_log series (see user_db.get_metric_series)
+    # -- same fix as GET /chart: daily_nutrition alone is only ever
+    # populated by an explicit Cronometer sync, so a manual-only logger
+    # would see every lift day correlate against nothing.
+    metric_series = await get_metric_series(user_id, nutrition_metric)
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         # Get ORM dates for this exercise
@@ -192,25 +198,22 @@ async def get_lift_insights(
             user_id, exercise,
         )
 
-        # For each lift day, get rolling avg of nutrition metric from prior days
-        from datetime import datetime, timedelta
-        results = []
-        for row in orm_rows:
-            lift_date = row["date"]
-            try:
-                dt = datetime.strptime(lift_date, "%Y-%m-%d")
-            except ValueError:
-                continue
+    # For each lift day, get rolling avg of nutrition metric from prior days
+    from datetime import datetime, timedelta
+    results = []
+    for row in orm_rows:
+        lift_date = row["date"]
+        try:
+            dt = datetime.strptime(lift_date, "%Y-%m-%d")
+        except ValueError:
+            continue
 
-            prior_dates = [(dt - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, lookback + 1)]
-            vals = await conn.fetch(
-                "SELECT value FROM daily_nutrition WHERE user_id = $1 AND metric = $2 AND date = ANY($3::text[])",
-                user_id, nutrition_metric, prior_dates,
-            )
+        prior_dates = [(dt - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, lookback + 1)]
+        vals = [metric_series[d] for d in prior_dates if d in metric_series]
 
-            if vals:
-                avg = round(sum(v["value"] for v in vals) / len(vals), 1)
-                results.append({"date": lift_date, "orm": row["orm"], "avg_metric": avg})
+        if vals:
+            avg = round(sum(vals) / len(vals), 1)
+            results.append({"date": lift_date, "orm": row["orm"], "avg_metric": avg})
 
     return {
         "exercises": exercises,

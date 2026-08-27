@@ -40,32 +40,91 @@ async def upsert_lift_orm(user_id: int, date: str, exercise: str, orm: float):
             )
 
 
+async def _daily_nutrition_series(conn, user_id: int, metric: str) -> dict:
+    rows = await conn.fetch(
+        "SELECT date, value FROM daily_nutrition WHERE user_id = $1 AND metric = $2",
+        user_id, metric,
+    )
+    return {r["date"]: r["value"] for r in rows}
+
+
+async def _food_log_series(conn, user_id: int, metric: str) -> dict:
+    """Aggregate manually-logged food into a {date: value} series for one
+    chartable nutrition metric. food_log/food_log_nutrients is the single
+    source of truth for "what was eaten" regardless of how it got logged
+    (manual entry, a recipe, or a Cronometer diary import) -- unlike
+    daily_nutrition, which only ever gets written by an explicit Cronometer
+    sync. Calories is food_log's own top-level column (the sole numeric
+    "amount" field per the Event Contract standardization); every other
+    nutrient lives in food_log_nutrients keyed by its USDA name."""
+    if metric == "Energy (kcal)":
+        rows = await conn.fetch(
+            "SELECT date, SUM(calories) AS total FROM food_log "
+            "WHERE user_id = $1 AND calories IS NOT NULL GROUP BY date",
+            user_id,
+        )
+    else:
+        rows = await conn.fetch(
+            """SELECT fl.date, SUM(fln.value) AS total
+               FROM food_log_nutrients fln
+               JOIN food_log fl ON fl.id = fln.food_log_id
+               WHERE fl.user_id = $1 AND fln.nutrient_name = $2
+               GROUP BY fl.date""",
+            user_id, metric,
+        )
+    return {r["date"]: r["total"] for r in rows}
+
+
+async def get_metric_series(user_id: int, metric: str) -> dict:
+    """Public, single-metric version of the daily_nutrition/food_log merge
+    in query_nutrition below, for callers (e.g. GET /data/lift-insights)
+    that need a plain {date: value} series rather than the chart
+    endpoint's {metric: [{date, value}]} shape or its rolling average."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        synced = await _daily_nutrition_series(conn, user_id, metric)
+        logged = await _food_log_series(conn, user_id, metric)
+    return {**logged, **synced}
+
+
 async def query_nutrition(user_id: int, metrics: list, lookback: int = 1) -> dict:
     """Query nutrition metrics with optional rolling average.
+
+    Merges two sources per (date, metric): daily_nutrition (populated only
+    by an explicit Cronometer sync) and a live aggregate over
+    food_log/food_log_nutrients (populated by every logging path -- manual
+    entry, recipes, and Cronometer diary import alike). daily_nutrition
+    wins where both have a value for the same date, so already-synced days
+    keep showing exactly what they show today; food_log fills in every
+    other day. Without this fallback, a user who only ever logs food
+    manually has an entirely empty daily_nutrition table and no chartable
+    metrics at all, no matter how much they've logged -- this was the root
+    cause of charts requiring a Cronometer sync to show anything.
+
+    Rolling average is computed here in Python (not SQL) since it now
+    windows over a merged, non-SQL-native series -- same semantics as the
+    original window function (average over however many rows are actually
+    present, not calendar days), just applied after the merge.
+
     Returns {metric: [{date, value}]}"""
     pool = await get_pool()
     result = {}
     async with pool.acquire() as conn:
         for metric in metrics:
+            synced = await _daily_nutrition_series(conn, user_id, metric)
+            logged = await _food_log_series(conn, user_id, metric)
+            merged = {**logged, **synced}
+            dates = sorted(merged)
+
             if lookback <= 1:
-                rows = await conn.fetch(
-                    "SELECT date, value FROM daily_nutrition WHERE user_id = $1 AND metric = $2 ORDER BY date",
-                    user_id, metric,
-                )
-                result[metric] = [{"date": r["date"], "value": round(r["value"], 1)} for r in rows]
+                result[metric] = [{"date": d, "value": round(merged[d], 1)} for d in dates]
             else:
-                rows = await conn.fetch(
-                    """SELECT date,
-                        AVG(value) OVER (
-                            ORDER BY date
-                            ROWS BETWEEN $1 PRECEDING AND CURRENT ROW
-                        ) as avg_value
-                    FROM daily_nutrition
-                    WHERE user_id = $2 AND metric = $3
-                    ORDER BY date""",
-                    lookback - 1, user_id, metric,
-                )
-                result[metric] = [{"date": r["date"], "value": round(r["avg_value"], 1)} for r in rows]
+                values = [merged[d] for d in dates]
+                series = []
+                for i, d in enumerate(dates):
+                    window = values[max(0, i - (lookback - 1)):i + 1]
+                    series.append({"date": d, "value": round(sum(window) / len(window), 1)})
+                result[metric] = series
     return result
 
 
@@ -107,13 +166,34 @@ async def get_exercises(user_id: int) -> list:
 
 
 async def get_nutrition_metrics(user_id: int) -> list:
+    """Every chartable nutrition metric name for this user: whatever
+    Cronometer sync has written to daily_nutrition, PLUS "Energy (kcal)"
+    and every nutrient name the user has ever logged via food_log directly
+    -- see query_nutrition's docstring for why both sources matter. Without
+    the food_log half, a user who has never synced Cronometer gets an
+    empty metric list and the chart page has nothing to select at all."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT DISTINCT metric FROM daily_nutrition WHERE user_id = $1 ORDER BY metric",
+        synced_rows = await conn.fetch(
+            "SELECT DISTINCT metric FROM daily_nutrition WHERE user_id = $1",
             user_id,
         )
-        return [r["metric"] for r in rows]
+        logged_rows = await conn.fetch(
+            """SELECT DISTINCT fln.nutrient_name AS metric
+               FROM food_log_nutrients fln
+               JOIN food_log fl ON fl.id = fln.food_log_id
+               WHERE fl.user_id = $1""",
+            user_id,
+        )
+        has_calories = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM food_log WHERE user_id = $1 AND calories IS NOT NULL)",
+            user_id,
+        )
+
+    metrics = {r["metric"] for r in synced_rows} | {r["metric"] for r in logged_rows}
+    if has_calories:
+        metrics.add("Energy (kcal)")
+    return sorted(metrics)
 
 
 async def upsert_tdee_log(user_id: int, date: str, weight_lbs: float = None,
