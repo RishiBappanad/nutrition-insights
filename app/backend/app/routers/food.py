@@ -3,8 +3,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from ..routers.auth import get_current_user
 from ..db import get_pool
 from ..portion_scaling import scale_food_entry
-from ..food_entry_contract import FoodLogEntryContract, log_food_entry, _nutrients_to_rows as nutrients_to_rows
+from ..food_entry_contract import FoodLogEntryContract, log_food_entry
 from ..nutrient_groups import order_nutrients
+from ..nutrient_facts import read_nutrients_bulk, delete_nutrient_facts
 
 router = APIRouter()
 
@@ -295,13 +296,13 @@ async def get_food_log(
     user_id: int = Depends(get_current_user),
 ):
     """Get all food entries for a given date, including each entry's full
-    per-nutrient breakdown (from food_log_nutrients) and day-level totals
-    for every nutrient that appears on at least one entry. `calories` is
-    the only macro-like field with its own dedicated column — protein,
-    carbs, fat, and fiber are entries in `nutrients`/`nutrient_totals`
-    (under "Protein", "Carbohydrate, by difference", "Total lipid (fat)",
-    "Fiber, total dietary") like every other nutrient, not their own
-    fields in `entries`/`totals` below."""
+    per-nutrient breakdown (from nutrient_facts, owner_type='food_log') and
+    day-level totals for every nutrient that appears on at least one
+    entry. `calories` is the only macro-like field with its own dedicated
+    column — protein, carbs, fat, and fiber are entries in
+    `nutrients`/`nutrient_totals` (under "Protein", "Carbohydrate, by
+    difference", "Total lipid (fat)", "Fiber, total dietary") like every
+    other nutrient, not their own fields in `entries`/`totals` below."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -309,25 +310,12 @@ async def get_food_log(
             user_id, date,
         )
         entry_ids = [r["id"] for r in rows]
-        nutrient_rows = []
-        if entry_ids:
-            nutrient_rows = await conn.fetch(
-                "SELECT food_log_id, nutrient_name, value, unit FROM food_log_nutrients "
-                "WHERE food_log_id = ANY($1::int[])",
-                entry_ids,
-            )
-
-    nutrients_by_entry: dict[int, dict] = {}
-    for nr in nutrient_rows:
-        nutrients_by_entry.setdefault(nr["food_log_id"], {})[nr["nutrient_name"]] = {
-            "value": nr["value"],
-            "unit": nr["unit"],
-        }
+        nutrients_by_entry = await read_nutrients_bulk(conn, "food_log", entry_ids)
 
     entries = []
     nutrient_totals: dict[str, dict] = {}
     for r in rows:
-        entry_nutrients = order_nutrients(nutrients_by_entry.get(r["id"], {}))
+        entry_nutrients = nutrients_by_entry.get(r["id"], {})
         entries.append({
             "id": r["id"],
             "date": r["date"],
@@ -356,10 +344,14 @@ async def delete_food_entry(
     user_id: int = Depends(get_current_user),
 ):
     """Delete a food log entry. Scoped to the current user so one user cannot
-    delete another user's entry by guessing an id."""
+    delete another user's entry by guessing an id. nutrient_facts has no FK
+    to cascade automatically (see app/nutrient_facts.py), so its rows for
+    this entry are deleted explicitly first."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM food_log WHERE id = $1 AND user_id = $2", entry_id, user_id
-        )
+        async with conn.transaction():
+            await delete_nutrient_facts(conn, "food_log", entry_id)
+            await conn.execute(
+                "DELETE FROM food_log WHERE id = $1 AND user_id = $2", entry_id, user_id
+            )
     return {"status": "deleted"}

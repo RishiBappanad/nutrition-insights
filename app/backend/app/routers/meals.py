@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
 from ..db import get_pool
-from ..nutrient_groups import order_nutrients
+from ..nutrient_facts import write_nutrients, read_nutrients_bulk, delete_nutrient_facts, delete_nutrient_facts_bulk
 
 router = APIRouter()
 
@@ -47,19 +47,6 @@ class LogMealRequest(BaseModel):
     into its per-item entries via POST /meals/{id}/explode/{food_log_id}."""
 
 
-def _item_nutrient_rows(item_id: int, nutrients: dict) -> list[tuple]:
-    rows = []
-    for name, info in nutrients.items():
-        if not isinstance(info, dict) or info.get("value") is None:
-            continue
-        try:
-            value = float(info["value"])
-        except (TypeError, ValueError):
-            continue
-        rows.append((item_id, name, value, info.get("unit", "")))
-    return rows
-
-
 async def _save_items(conn, meal_id: int, items: list[MealItemRequest]):
     for item in items:
         item_id = await conn.fetchval(
@@ -70,12 +57,7 @@ async def _save_items(conn, meal_id: int, items: list[MealItemRequest]):
             meal_id, item.food_name, item.source, item.source_id, item.serving_size, item.serving_unit,
             item.calories, json.dumps(item.nutrients),
         )
-        rows = _item_nutrient_rows(item_id, item.nutrients)
-        if rows:
-            await conn.executemany(
-                "INSERT INTO meal_item_nutrients (meal_item_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                rows,
-            )
+        await write_nutrients(conn, "meal_item", item_id, item.nutrients)
 
 
 @router.post("")
@@ -104,17 +86,7 @@ async def _get_meal_with_items(conn, meal_id: int, user_id: int):
         return None, []
     item_rows = await conn.fetch("SELECT * FROM meal_items WHERE meal_id = $1 ORDER BY id", meal_id)
     item_ids = [r["id"] for r in item_rows]
-    nutrient_rows = []
-    if item_ids:
-        nutrient_rows = await conn.fetch(
-            "SELECT meal_item_id, nutrient_name, value, unit FROM meal_item_nutrients WHERE meal_item_id = ANY($1::int[])",
-            item_ids,
-        )
-    nutrients_by_item: dict[int, dict] = {}
-    for nr in nutrient_rows:
-        nutrients_by_item.setdefault(nr["meal_item_id"], {})[nr["nutrient_name"]] = {
-            "value": nr["value"], "unit": nr["unit"],
-        }
+    nutrients_by_item = await read_nutrients_bulk(conn, "meal_item", item_ids)
     items = []
     for r in item_rows:
         items.append({
@@ -125,7 +97,7 @@ async def _get_meal_with_items(conn, meal_id: int, user_id: int):
             "serving_size": r["serving_size"],
             "serving_unit": r["serving_unit"],
             "calories": r["calories"],
-            "nutrients": order_nutrients(nutrients_by_item.get(r["id"], {})),
+            "nutrients": nutrients_by_item.get(r["id"], {}),
         })
     return meal, items
 
@@ -149,6 +121,10 @@ async def update_meal(meal_id: int, req: MealRequest, user_id: int = Depends(get
             if existing is None:
                 raise HTTPException(status_code=404, detail="Meal not found")
             await conn.execute("UPDATE meals SET name = $1, updated_at = now() WHERE id = $2", req.name, meal_id)
+            old_item_ids = [r["id"] for r in await conn.fetch(
+                "SELECT id FROM meal_items WHERE meal_id = $1", meal_id
+            )]
+            await delete_nutrient_facts_bulk(conn, "meal_item", old_item_ids)
             await conn.execute("DELETE FROM meal_items WHERE meal_id = $1", meal_id)
             await _save_items(conn, meal_id, req.items)
     return {"status": "updated"}
@@ -156,9 +132,27 @@ async def update_meal(meal_id: int, req: MealRequest, user_id: int = Depends(get
 
 @router.delete("/{meal_id}")
 async def delete_meal(meal_id: int, user_id: int = Depends(get_current_user)):
+    """meal_items still has a real FK (ON DELETE CASCADE) to meals, so
+    deleting a meal auto-deletes its items -- but their nutrient_facts
+    rows don't cascade (nutrient_facts has no FK at all, see
+    app/nutrient_facts.py), so those are cleared explicitly first."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM meals WHERE id = $1 AND user_id = $2", meal_id, user_id)
+        async with conn.transaction():
+            # Ownership-scoped join, not a bare meal_id lookup -- without
+            # the meals.user_id check here, a caller could trigger deletion
+            # of another user's meal_item nutrient_facts rows (the actual
+            # meals DELETE below is correctly user-scoped and would affect
+            # 0 rows in that case, but the item lookup above it must be
+            # scoped too, or it runs before that no-op is ever reached).
+            item_ids = [r["id"] for r in await conn.fetch(
+                """SELECT mi.id FROM meal_items mi
+                   JOIN meals m ON m.id = mi.meal_id
+                   WHERE mi.meal_id = $1 AND m.user_id = $2""",
+                meal_id, user_id,
+            )]
+            await delete_nutrient_facts_bulk(conn, "meal_item", item_ids)
+            await conn.execute("DELETE FROM meals WHERE id = $1 AND user_id = $2", meal_id, user_id)
     return {"status": "deleted"}
 
 
@@ -204,12 +198,7 @@ async def log_meal(meal_id: int, req: LogMealRequest, user_id: int = Depends(get
                     user_id, req.date, req.meal, meal["name"], str(meal_id),
                     macros["calories"], json.dumps(nutrients),
                 )
-                nutrient_rows = [(food_log_id, name, info["value"], info["unit"]) for name, info in nutrients.items()]
-                if nutrient_rows:
-                    await conn.executemany(
-                        "INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                        nutrient_rows,
-                    )
+                await write_nutrients(conn, "food_log", food_log_id, nutrients)
             return {"status": "logged", "food_log_ids": [food_log_id], "combined": True}
 
         food_log_ids = []
@@ -224,14 +213,7 @@ async def log_meal(meal_id: int, req: LogMealRequest, user_id: int = Depends(get
                     item["serving_size"], item["serving_unit"], item["calories"], json.dumps(item["nutrients"]),
                 )
                 food_log_ids.append(food_log_id)
-                nutrient_rows = [
-                    (food_log_id, name, info["value"], info["unit"]) for name, info in item["nutrients"].items()
-                ]
-                if nutrient_rows:
-                    await conn.executemany(
-                        "INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                        nutrient_rows,
-                    )
+                await write_nutrients(conn, "food_log", food_log_id, item["nutrients"])
     return {"status": "logged", "food_log_ids": food_log_ids, "combined": False}
 
 
@@ -265,6 +247,7 @@ async def explode_meal_entry(meal_id: int, food_log_id: int, user_id: int = Depe
 
         food_log_ids = []
         async with conn.transaction():
+            await delete_nutrient_facts(conn, "food_log", food_log_id)
             await conn.execute("DELETE FROM food_log WHERE id = $1", food_log_id)
             for item in items:
                 new_id = await conn.fetchval(
@@ -276,12 +259,5 @@ async def explode_meal_entry(meal_id: int, food_log_id: int, user_id: int = Depe
                     item["serving_size"], item["serving_unit"], item["calories"], json.dumps(item["nutrients"]),
                 )
                 food_log_ids.append(new_id)
-                nutrient_rows = [
-                    (new_id, name, info["value"], info["unit"]) for name, info in item["nutrients"].items()
-                ]
-                if nutrient_rows:
-                    await conn.executemany(
-                        "INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                        nutrient_rows,
-                    )
+                await write_nutrients(conn, "food_log", new_id, item["nutrients"])
     return {"status": "exploded", "food_log_ids": food_log_ids}

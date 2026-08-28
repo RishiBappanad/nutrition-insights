@@ -124,42 +124,59 @@ class TestDeriveMacroGrams:
 # ── food.py: nutrients_to_rows ───────────────────────────────────────────────
 
 class TestNutrientsToRows:
+    """nutrient_facts._nutrients_to_rows is now the single normalization
+    implementation for every X_nutrients-shaped write path (previously
+    duplicated between routers/food.py and routers/custom_foods.py, and
+    reimplemented slightly differently again in meals.py/recipes.py) --
+    see app/nutrient_facts.py. Row shape is now (owner_type, owner_id,
+    nutrient_name, value, unit), not (entity_id, name, value, unit)."""
+
     def test_normalizes_valid_nutrients(self):
-        from app.routers.food import nutrients_to_rows
+        from app.nutrient_facts import _nutrients_to_rows
         nutrients = {"Sodium, Na": {"value": 5.0, "unit": "mg"}, "Iron, Fe": {"value": "1.2", "unit": "mg"}}
-        rows = nutrients_to_rows(42, nutrients)
-        assert (42, "Sodium, Na", 5.0, "mg") in rows
-        assert (42, "Iron, Fe", 1.2, "mg") in rows
+        rows = _nutrients_to_rows("food_log", 42, nutrients)
+        assert ("food_log", 42, "Sodium, Na", 5.0, "mg") in rows
+        assert ("food_log", 42, "Iron, Fe", 1.2, "mg") in rows
 
     def test_skips_entries_with_missing_value(self):
-        from app.routers.food import nutrients_to_rows
+        from app.nutrient_facts import _nutrients_to_rows
         nutrients = {"Sodium, Na": {"unit": "mg"}}  # no "value" key
-        rows = nutrients_to_rows(1, nutrients)
+        rows = _nutrients_to_rows("food_log", 1, nutrients)
         assert rows == []
 
     def test_skips_non_numeric_value(self):
-        from app.routers.food import nutrients_to_rows
+        from app.nutrient_facts import _nutrients_to_rows
         nutrients = {"Sodium, Na": {"value": "not-a-number", "unit": "mg"}}
-        rows = nutrients_to_rows(1, nutrients)
+        rows = _nutrients_to_rows("food_log", 1, nutrients)
         assert rows == []
 
     def test_skips_malformed_entries_gracefully(self):
         """A food source with a gap in nutrient coverage (a bare string
         instead of a {value, unit} dict) shouldn't crash the whole log
         request — one bad nutrient entry is skipped, not fatal."""
-        from app.routers.food import nutrients_to_rows
+        from app.nutrient_facts import _nutrients_to_rows
         nutrients = {"Weird Field": "unexpected string", "Sodium, Na": {"value": 5, "unit": "mg"}}
-        rows = nutrients_to_rows(1, nutrients)
-        assert rows == [(1, "Sodium, Na", 5.0, "mg")]
+        rows = _nutrients_to_rows("food_log", 1, nutrients)
+        assert rows == [("food_log", 1, "Sodium, Na", 5.0, "mg")]
 
     def test_empty_nutrients_returns_empty_list(self):
-        from app.routers.food import nutrients_to_rows
-        assert nutrients_to_rows(1, {}) == []
+        from app.nutrient_facts import _nutrients_to_rows
+        assert _nutrients_to_rows("food_log", 1, {}) == []
 
     def test_missing_unit_defaults_to_empty_string(self):
-        from app.routers.food import nutrients_to_rows
-        rows = nutrients_to_rows(1, {"Vitamin C": {"value": 10}})
-        assert rows == [(1, "Vitamin C", 10.0, "")]
+        from app.nutrient_facts import _nutrients_to_rows
+        rows = _nutrients_to_rows("food_log", 1, {"Vitamin C": {"value": 10}})
+        assert rows == [("food_log", 1, "Vitamin C", 10.0, "")]
+
+    def test_different_owner_types_are_independent(self):
+        """The whole point of the owner_type discriminator: the same
+        owner_id under two different owner_types must not collide."""
+        from app.nutrient_facts import _nutrients_to_rows
+        nutrients = {"Protein": {"value": 10, "unit": "G"}}
+        food_rows = _nutrients_to_rows("food_log", 1, nutrients)
+        pantry_rows = _nutrients_to_rows("pantry_item", 1, nutrients)
+        assert food_rows == [("food_log", 1, "Protein", 10.0, "G")]
+        assert pantry_rows == [("pantry_item", 1, "Protein", 10.0, "G")]
 
 
 # ── water.py: default_water_target_ml ───────────────────────────────────────
@@ -828,6 +845,9 @@ class TestFoodEntryContractModels:
         assert recipe.items[0].food_name == "Rice"
 
     def test_nutrients_to_rows_skips_malformed_entries(self):
-        from app.food_entry_contract import _nutrients_to_rows
-        rows = _nutrients_to_rows(1, {"Bad": "not-a-dict", "Good": {"value": 5, "unit": "g"}, "NoValue": {"unit": "g"}})
-        assert rows == [(1, "Good", 5.0, "g")]
+        """food_entry_contract.py no longer has its own _nutrients_to_rows
+        -- it uses the single shared implementation in app/nutrient_facts.py
+        (see TestNutrientsToRows above for its full coverage)."""
+        from app.nutrient_facts import _nutrients_to_rows
+        rows = _nutrients_to_rows("food_log", 1, {"Bad": "not-a-dict", "Good": {"value": 5, "unit": "g"}, "NoValue": {"unit": "g"}})
+        assert rows == [("food_log", 1, "Good", 5.0, "g")]

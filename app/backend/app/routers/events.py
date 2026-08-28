@@ -38,7 +38,7 @@ from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
 from ..db import get_pool
-from ..nutrient_groups import order_nutrients
+from ..nutrient_facts import read_nutrients_bulk
 from ..food_entry_contract import (
     FoodLogEntryContract, ExerciseLogContract, log_food_entry, log_exercise_entry,
 )
@@ -208,18 +208,8 @@ async def _query_events(
                 user_id, start, end,
             )
             entry_ids = [r["id"] for r in food_rows]
-            nutrient_rows = []
-            if entry_ids:
-                nutrient_rows = await conn.fetch(
-                    "SELECT food_log_id, nutrient_name, value, unit FROM food_log_nutrients WHERE food_log_id = ANY($1::int[])",
-                    entry_ids,
-                )
-        nutrients_by_entry: dict[int, dict] = {}
-        for nr in nutrient_rows:
-            nutrients_by_entry.setdefault(nr["food_log_id"], {})[nr["nutrient_name"]] = {
-                "value": nr["value"], "unit": nr["unit"],
-            }
-        events.extend(_food_row_to_event(r, order_nutrients(nutrients_by_entry.get(r["id"], {}))) for r in food_rows)
+            nutrients_by_entry = await read_nutrients_bulk(conn, "food_log", entry_ids)
+        events.extend(_food_row_to_event(r, nutrients_by_entry.get(r["id"], {})) for r in food_rows)
 
     if event_type is None or event_type == "exercise_activity":
         async with pool.acquire() as conn:

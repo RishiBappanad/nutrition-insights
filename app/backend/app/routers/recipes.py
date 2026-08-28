@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from ..routers.auth import get_current_user
 from ..db import get_pool
 from ..portion_scaling import scale_macros, scale_nutrients
+from ..nutrient_facts import write_nutrients, read_nutrients_bulk, delete_nutrient_facts, delete_nutrient_facts_bulk
 from ..nutrient_groups import order_nutrients
 
 router = APIRouter()
@@ -48,19 +49,6 @@ class LogRecipeRequest(BaseModel):
     servings: float = 1.0
 
 
-def _item_nutrient_rows(item_id: int, nutrients: dict) -> list[tuple]:
-    rows = []
-    for name, info in nutrients.items():
-        if not isinstance(info, dict) or info.get("value") is None:
-            continue
-        try:
-            value = float(info["value"])
-        except (TypeError, ValueError):
-            continue
-        rows.append((item_id, name, value, info.get("unit", "")))
-    return rows
-
-
 async def _save_items(conn, recipe_id: int, items: list[RecipeItemRequest]):
     for item in items:
         item_id = await conn.fetchval(
@@ -71,12 +59,7 @@ async def _save_items(conn, recipe_id: int, items: list[RecipeItemRequest]):
             recipe_id, item.food_name, item.source, item.source_id, item.amount_grams, item.amount_multiple,
             item.calories, json.dumps(item.nutrients),
         )
-        rows = _item_nutrient_rows(item_id, item.nutrients)
-        if rows:
-            await conn.executemany(
-                "INSERT INTO recipe_item_nutrients (recipe_item_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                rows,
-            )
+        await write_nutrients(conn, "recipe_item", item_id, item.nutrients)
 
 
 @router.post("")
@@ -121,17 +104,7 @@ async def _get_recipe_with_items(conn, recipe_id: int, user_id: int):
         return None, []
     item_rows = await conn.fetch("SELECT * FROM recipe_items WHERE recipe_id = $1 ORDER BY id", recipe_id)
     item_ids = [r["id"] for r in item_rows]
-    nutrient_rows = []
-    if item_ids:
-        nutrient_rows = await conn.fetch(
-            "SELECT recipe_item_id, nutrient_name, value, unit FROM recipe_item_nutrients WHERE recipe_item_id = ANY($1::int[])",
-            item_ids,
-        )
-    nutrients_by_item: dict[int, dict] = {}
-    for nr in nutrient_rows:
-        nutrients_by_item.setdefault(nr["recipe_item_id"], {})[nr["nutrient_name"]] = {
-            "value": nr["value"], "unit": nr["unit"],
-        }
+    nutrients_by_item = await read_nutrients_bulk(conn, "recipe_item", item_ids)
     items = []
     for r in item_rows:
         items.append({
@@ -142,7 +115,7 @@ async def _get_recipe_with_items(conn, recipe_id: int, user_id: int):
             "amount_grams": r["amount_grams"],
             "amount_multiple": r["amount_multiple"],
             "calories": r["calories"],
-            "nutrients": order_nutrients(nutrients_by_item.get(r["id"], {})),
+            "nutrients": nutrients_by_item.get(r["id"], {}),
         })
     return recipe, items
 
@@ -209,6 +182,10 @@ async def update_recipe(recipe_id: int, req: RecipeRequest, user_id: int = Depen
                 "UPDATE recipes SET name = $1, servings_per_batch = $2, updated_at = now() WHERE id = $3",
                 req.name, req.servings_per_batch, recipe_id,
             )
+            old_item_ids = [r["id"] for r in await conn.fetch(
+                "SELECT id FROM recipe_items WHERE recipe_id = $1", recipe_id
+            )]
+            await delete_nutrient_facts_bulk(conn, "recipe_item", old_item_ids)
             await conn.execute("DELETE FROM recipe_items WHERE recipe_id = $1", recipe_id)
             await _save_items(conn, recipe_id, req.items)
     return {"status": "updated"}
@@ -216,9 +193,23 @@ async def update_recipe(recipe_id: int, req: RecipeRequest, user_id: int = Depen
 
 @router.delete("/{recipe_id}")
 async def delete_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
+    """recipe_items still has a real FK (ON DELETE CASCADE) to recipes, so
+    deleting a recipe auto-deletes its items -- but their nutrient_facts
+    rows don't cascade (nutrient_facts has no FK at all, see
+    app/nutrient_facts.py), so those are cleared explicitly first."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM recipes WHERE id = $1 AND user_id = $2", recipe_id, user_id)
+        async with conn.transaction():
+            # Ownership-scoped join, not a bare recipe_id lookup -- same
+            # reasoning as meals.py's delete_meal.
+            item_ids = [r["id"] for r in await conn.fetch(
+                """SELECT ri.id FROM recipe_items ri
+                   JOIN recipes r ON r.id = ri.recipe_id
+                   WHERE ri.recipe_id = $1 AND r.user_id = $2""",
+                recipe_id, user_id,
+            )]
+            await delete_nutrient_facts_bulk(conn, "recipe_item", item_ids)
+            await conn.execute("DELETE FROM recipes WHERE id = $1 AND user_id = $2", recipe_id, user_id)
     return {"status": "deleted"}
 
 
@@ -251,12 +242,7 @@ async def log_recipe(recipe_id: int, req: LogRecipeRequest, user_id: int = Depen
                 user_id, req.date, req.meal, recipe["name"], str(recipe_id), req.servings,
                 macros["calories"], json.dumps(nutrients),
             )
-            nutrient_rows = [(food_log_id, name, info["value"], info["unit"]) for name, info in nutrients.items()]
-            if nutrient_rows:
-                await conn.executemany(
-                    "INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                    nutrient_rows,
-                )
+            await write_nutrients(conn, "food_log", food_log_id, nutrients)
     return {"status": "logged", "food_log_id": food_log_id}
 
 
@@ -364,7 +350,6 @@ async def make_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
     reachable through the exact same /pantry list, consume, and remove
     flows every other pantry item already has, not a special case.
     """
-    from ..food_entry_contract import _nutrients_to_rows
     from .food import _recipe_per_serving_nutrition
     import json
 
@@ -395,11 +380,13 @@ async def make_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
                     continue  # already gone (e.g. duplicate recipe items referencing the same pantry row)
 
                 if pantry_item["tracking_mode"] == "single":
+                    await delete_nutrient_facts(conn, "pantry_item", pantry_item["id"])
                     await conn.execute("DELETE FROM pantry_items WHERE id = $1", pantry_item["id"])
                     removed.append(pantry_item["id"])
                 elif pantry_item["tracking_mode"] == "countable" and entry["requested_servings"] is not None:
                     new_remaining = pantry_item["remaining_servings"] - entry["requested_servings"]
                     if new_remaining <= 0:
+                        await delete_nutrient_facts(conn, "pantry_item", pantry_item["id"])
                         await conn.execute("DELETE FROM pantry_items WHERE id = $1", pantry_item["id"])
                         removed.append(pantry_item["id"])
                     else:
@@ -421,12 +408,7 @@ async def make_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
                 user_id, recipe["name"], str(recipe_id), recipe["servings_per_batch"],
                 per_serving_macros["calories"], json.dumps(per_serving_nutrients),
             )
-            rows = _nutrients_to_rows(pantry_item_id, per_serving_nutrients)
-            if rows:
-                await conn.executemany(
-                    "INSERT INTO pantry_item_nutrients (pantry_item_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                    rows,
-                )
+            await write_nutrients(conn, "pantry_item", pantry_item_id, per_serving_nutrients)
 
     return {
         "status": "made",

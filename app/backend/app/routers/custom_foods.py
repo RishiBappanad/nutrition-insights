@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
 from ..db import get_pool
-from ..nutrient_groups import order_nutrients
+from ..nutrient_facts import write_nutrients, read_nutrients, delete_nutrient_facts
 
 router = APIRouter()
 
@@ -30,27 +30,6 @@ class CustomFoodRequest(BaseModel):
     nutrients: dict = {}
 
 
-def _nutrients_to_rows(custom_food_id: int, nutrients: dict) -> list[tuple]:
-    """Same normalization rules as routers/food.py's nutrients_to_rows —
-    duplicated rather than imported cross-module here since the target
-    table differs (custom_food_nutrients vs food_log_nutrients) and the
-    row shape needs its own first column name; the validation logic
-    itself is intentionally identical."""
-    rows = []
-    for name, info in nutrients.items():
-        if not isinstance(info, dict):
-            continue
-        value = info.get("value")
-        if value is None:
-            continue
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            continue
-        rows.append((custom_food_id, name, value, info.get("unit", "")))
-    return rows
-
-
 @router.post("")
 async def create_custom_food(req: CustomFoodRequest, user_id: int = Depends(get_current_user)):
     pool = await get_pool()
@@ -64,12 +43,7 @@ async def create_custom_food(req: CustomFoodRequest, user_id: int = Depends(get_
                 user_id, req.food_name, req.brand, req.reference_amount, req.reference_unit,
                 req.reference_grams, req.calories, json.dumps(req.nutrients),
             )
-            rows = _nutrients_to_rows(food_id, req.nutrients)
-            if rows:
-                await conn.executemany(
-                    "INSERT INTO custom_food_nutrients (custom_food_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                    rows,
-                )
+            await write_nutrients(conn, "custom_food", food_id, req.nutrients)
     return {"status": "created", "id": food_id}
 
 
@@ -92,11 +66,9 @@ async def get_custom_food(food_id: int, user_id: int = Depends(get_current_user)
         )
         if row is None:
             raise HTTPException(status_code=404, detail="Custom food not found")
-        nutrient_rows = await conn.fetch(
-            "SELECT nutrient_name, value, unit FROM custom_food_nutrients WHERE custom_food_id = $1", food_id
-        )
+        nutrients = await read_nutrients(conn, "custom_food", food_id)
     result = _row_to_food(row)
-    result["nutrients"] = order_nutrients({n["nutrient_name"]: {"value": n["value"], "unit": n["unit"]} for n in nutrient_rows})
+    result["nutrients"] = nutrients
     return result
 
 
@@ -119,13 +91,8 @@ async def update_custom_food(food_id: int, req: CustomFoodRequest, user_id: int 
                 req.food_name, req.brand, req.reference_amount, req.reference_unit, req.reference_grams,
                 req.calories, json.dumps(req.nutrients), food_id,
             )
-            await conn.execute("DELETE FROM custom_food_nutrients WHERE custom_food_id = $1", food_id)
-            rows = _nutrients_to_rows(food_id, req.nutrients)
-            if rows:
-                await conn.executemany(
-                    "INSERT INTO custom_food_nutrients (custom_food_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                    rows,
-                )
+            await delete_nutrient_facts(conn, "custom_food", food_id)
+            await write_nutrients(conn, "custom_food", food_id, req.nutrients)
     return {"status": "updated"}
 
 
@@ -133,7 +100,9 @@ async def update_custom_food(food_id: int, req: CustomFoodRequest, user_id: int 
 async def delete_custom_food(food_id: int, user_id: int = Depends(get_current_user)):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM custom_foods WHERE id = $1 AND user_id = $2", food_id, user_id)
+        async with conn.transaction():
+            await delete_nutrient_facts(conn, "custom_food", food_id)
+            await conn.execute("DELETE FROM custom_foods WHERE id = $1 AND user_id = $2", food_id, user_id)
     return {"status": "deleted"}
 
 

@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
 from ..db import get_pool
-from ..routers.food import nutrients_to_rows
+from ..nutrient_facts import write_nutrients, delete_nutrient_facts
 from ..portion_scaling import scale_macros, scale_nutrients, multiple_based_factor
 
 router = APIRouter()
@@ -98,13 +98,7 @@ async def add_pantry_item(req: PantryItemRequest, user_id: int = Depends(get_cur
                 req.serving_unit, req.tracking_mode, remaining, req.expiration_date,
                 req.calories, json.dumps(req.nutrients),
             )
-            rows = nutrients_to_rows(item_id, req.nutrients)
-            if rows:
-                await conn.executemany(
-                    """INSERT INTO pantry_item_nutrients (pantry_item_id, nutrient_name, value, unit)
-                       VALUES ($1, $2, $3, $4)""",
-                    [(item_id, name, value, unit) for (_, name, value, unit) in rows],
-                )
+            await write_nutrients(conn, "pantry_item", item_id, req.nutrients)
     return {"status": "added", "id": item_id}
 
 
@@ -173,12 +167,21 @@ async def update_pantry_item(item_id: int, req: PantryItemUpdateRequest, user_id
 @router.delete("/{item_id}")
 async def delete_pantry_item(item_id: int, user_id: int = Depends(get_current_user)):
     """Remove without logging to diary (expired, thrown away, bought by
-    mistake) — distinct from /consume, which logs first."""
+    mistake) — distinct from /consume, which logs first. Deletes
+    pantry_items FIRST (its WHERE clause is the ownership check — there's
+    no separate SELECT before it), then only cleans up nutrient_facts if
+    that actually removed a row: nutrient_facts has no user_id column of
+    its own, so calling delete_nutrient_facts for an item_id that turned
+    out to belong to a different user (or not exist) would wipe that
+    other user's row instead of a no-op."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
-        )
+        async with conn.transaction():
+            result = await conn.execute(
+                "DELETE FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
+            )
+            if result != "DELETE 0":
+                await delete_nutrient_facts(conn, "pantry_item", item_id)
     return {"status": "deleted"}
 
 
@@ -186,12 +189,16 @@ async def delete_pantry_item(item_id: int, user_id: int = Depends(get_current_us
 async def finish_pantry_item(item_id: int, user_id: int = Depends(get_current_user)):
     """Mark a bulk item as used up. Deletes the row outright (matches the
     design doc's 'gone means gone' reasoning — no soft-delete state to
-    manage for a finished item)."""
+    manage for a finished item). Same delete-then-conditionally-clean-up
+    ordering as delete_pantry_item above, for the same reason."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
-        )
+        async with conn.transaction():
+            result = await conn.execute(
+                "DELETE FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
+            )
+            if result != "DELETE 0":
+                await delete_nutrient_facts(conn, "pantry_item", item_id)
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Pantry item not found")
     return {"status": "finished"}
@@ -251,21 +258,17 @@ async def consume_pantry_item(item_id: int, req: ConsumeRequest, user_id: int = 
                 user_id, req.date, req.meal, item["food_name"], item["source"], item["source_id"],
                 req.servings, item["serving_unit"], macros["calories"], json.dumps(nutrients),
             )
-            rows = nutrients_to_rows(food_log_id, nutrients)
-            if rows:
-                await conn.executemany(
-                    """INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit)
-                       VALUES ($1, $2, $3, $4)""",
-                    rows,
-                )
+            await write_nutrients(conn, "food_log", food_log_id, nutrients)
 
             pantry_status = "unchanged"
             if item["tracking_mode"] == "single":
+                await delete_nutrient_facts(conn, "pantry_item", item_id)
                 await conn.execute("DELETE FROM pantry_items WHERE id = $1", item_id)
                 pantry_status = "removed"
             elif item["tracking_mode"] == "countable":
                 new_remaining = item["remaining_servings"] - req.servings
                 if new_remaining <= 0:
+                    await delete_nutrient_facts(conn, "pantry_item", item_id)
                     await conn.execute("DELETE FROM pantry_items WHERE id = $1", item_id)
                     pantry_status = "removed"
                 else:
@@ -313,6 +316,7 @@ async def remove_pantry_servings(item_id: int, req: RemoveServingsRequest, user_
 
             new_remaining = item["remaining_servings"] - req.servings
             if new_remaining <= 0:
+                await delete_nutrient_facts(conn, "pantry_item", item_id)
                 await conn.execute("DELETE FROM pantry_items WHERE id = $1", item_id)
                 pantry_status = "removed"
             else:

@@ -232,9 +232,15 @@ async def reset_user_data(user_id: int = Depends(get_current_user)):
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM daily_nutrition WHERE user_id = $1", user_id)
-        await conn.execute("DELETE FROM lift_orm WHERE user_id = $1", user_id)
-        await conn.execute("DELETE FROM food_log WHERE user_id = $1", user_id)
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM nutrient_facts WHERE owner_type = 'food_log' "
+                "AND owner_id IN (SELECT id FROM food_log WHERE user_id = $1)",
+                user_id,
+            )
+            await conn.execute("DELETE FROM daily_nutrition WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM lift_orm WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM food_log WHERE user_id = $1", user_id)
 
     # Remove CSV files (from old syncs) but keep the directory
     for pattern in ["cronometer_*.csv", "hevy_workouts.csv", "tdee_tracking_log.csv"]:

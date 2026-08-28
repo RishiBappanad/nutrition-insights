@@ -50,13 +50,14 @@ async def _daily_nutrition_series(conn, user_id: int, metric: str) -> dict:
 
 async def _food_log_series(conn, user_id: int, metric: str) -> dict:
     """Aggregate manually-logged food into a {date: value} series for one
-    chartable nutrition metric. food_log/food_log_nutrients is the single
+    chartable nutrition metric. food_log/nutrient_facts is the single
     source of truth for "what was eaten" regardless of how it got logged
     (manual entry, a recipe, or a Cronometer diary import) -- unlike
     daily_nutrition, which only ever gets written by an explicit Cronometer
     sync. Calories is food_log's own top-level column (the sole numeric
     "amount" field per the Event Contract standardization); every other
-    nutrient lives in food_log_nutrients keyed by its USDA name."""
+    nutrient lives in nutrient_facts (owner_type='food_log') keyed by its
+    USDA name."""
     if metric == "Energy (kcal)":
         rows = await conn.fetch(
             "SELECT date, SUM(calories) AS total FROM food_log "
@@ -65,10 +66,10 @@ async def _food_log_series(conn, user_id: int, metric: str) -> dict:
         )
     else:
         rows = await conn.fetch(
-            """SELECT fl.date, SUM(fln.value) AS total
-               FROM food_log_nutrients fln
-               JOIN food_log fl ON fl.id = fln.food_log_id
-               WHERE fl.user_id = $1 AND fln.nutrient_name = $2
+            """SELECT fl.date, SUM(nf.value) AS total
+               FROM nutrient_facts nf
+               JOIN food_log fl ON fl.id = nf.owner_id AND nf.owner_type = 'food_log'
+               WHERE fl.user_id = $1 AND nf.nutrient_name = $2
                GROUP BY fl.date""",
             user_id, metric,
         )
@@ -179,9 +180,9 @@ async def get_nutrition_metrics(user_id: int) -> list:
             user_id,
         )
         logged_rows = await conn.fetch(
-            """SELECT DISTINCT fln.nutrient_name AS metric
-               FROM food_log_nutrients fln
-               JOIN food_log fl ON fl.id = fln.food_log_id
+            """SELECT DISTINCT nf.nutrient_name AS metric
+               FROM nutrient_facts nf
+               JOIN food_log fl ON fl.id = nf.owner_id AND nf.owner_type = 'food_log'
                WHERE fl.user_id = $1""",
             user_id,
         )

@@ -153,11 +153,11 @@ async def get_nutrient_progress(user_id: int, date: str) -> dict:
             user_id,
         )
         actual_rows = await conn.fetch(
-            """SELECT fln.nutrient_name, SUM(fln.value) AS total
-               FROM food_log_nutrients fln
-               JOIN food_log fl ON fl.id = fln.food_log_id
+            """SELECT nf.nutrient_name, SUM(nf.value) AS total
+               FROM nutrient_facts nf
+               JOIN food_log fl ON fl.id = nf.owner_id AND nf.owner_type = 'food_log'
                WHERE fl.user_id = $1 AND fl.date = $2
-               GROUP BY fln.nutrient_name""",
+               GROUP BY nf.nutrient_name""",
             user_id, date,
         )
 

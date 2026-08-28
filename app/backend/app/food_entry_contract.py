@@ -24,6 +24,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from .db import get_pool
+from .nutrient_facts import write_nutrients, delete_nutrient_facts_bulk
 
 
 class FoodLogEntryContract(BaseModel):
@@ -97,29 +98,10 @@ class ExerciseLogContract(BaseModel):
     notes: Optional[str] = None
 
 
-def _nutrients_to_rows(entity_id: int, nutrients: dict) -> list[tuple]:
-    """Same normalization as routers/food.py's nutrients_to_rows — kept
-    here too (not imported cross-module) since callers pass different
-    target-table id columns; the validation rules are intentionally
-    identical."""
-    rows = []
-    for name, info in nutrients.items():
-        if not isinstance(info, dict):
-            continue
-        value = info.get("value")
-        if value is None:
-            continue
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            continue
-        rows.append((entity_id, name, value, info.get("unit", "")))
-    return rows
-
-
 async def log_food_entry(user_id: int, entry: FoodLogEntryContract) -> int:
     """
-    Write one FoodLogEntryContract into food_log + food_log_nutrients.
+    Write one FoodLogEntryContract into food_log + nutrient_facts
+    (owner_type='food_log').
 
     This is the SAME insert logic POST /food/log runs (see
     routers/food.py::log_food) — any caller producing a
@@ -146,14 +128,7 @@ async def log_food_entry(user_id: int, entry: FoodLogEntryContract) -> int:
                 user_id, entry.date, entry.meal, entry.food_name, entry.source, entry.source_id,
                 entry.serving_size, entry.serving_unit, entry.calories, json.dumps(entry.nutrients),
             )
-            rows = _nutrients_to_rows(food_log_id, entry.nutrients)
-            if rows:
-                await conn.executemany(
-                    """INSERT INTO food_log_nutrients (food_log_id, nutrient_name, value, unit)
-                       VALUES ($1, $2, $3, $4)
-                       ON CONFLICT (food_log_id, nutrient_name) DO UPDATE SET value = EXCLUDED.value, unit = EXCLUDED.unit""",
-                    rows,
-                )
+            await write_nutrients(conn, "food_log", food_log_id, entry.nutrients)
     return food_log_id
 
 
@@ -183,6 +158,10 @@ async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
                     "UPDATE recipes SET name = $1, servings_per_batch = $2, updated_at = now() WHERE id = $3",
                     recipe.name, recipe.servings_per_batch, recipe_id,
                 )
+                old_item_ids = [r["id"] for r in await conn.fetch(
+                    "SELECT id FROM recipe_items WHERE recipe_id = $1", recipe_id
+                )]
+                await delete_nutrient_facts_bulk(conn, "recipe_item", old_item_ids)
                 await conn.execute("DELETE FROM recipe_items WHERE recipe_id = $1", recipe_id)
             else:
                 recipe_id = await conn.fetchval(
@@ -199,12 +178,7 @@ async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
                     recipe_id, item.food_name, item.source, item.source_id, item.amount_grams, item.amount_multiple,
                     item.calories, json.dumps(item.nutrients),
                 )
-                rows = _nutrients_to_rows(item_id, item.nutrients)
-                if rows:
-                    await conn.executemany(
-                        "INSERT INTO recipe_item_nutrients (recipe_item_id, nutrient_name, value, unit) VALUES ($1, $2, $3, $4)",
-                        rows,
-                    )
+                await write_nutrients(conn, "recipe_item", item_id, item.nutrients)
     return recipe_id
 
 

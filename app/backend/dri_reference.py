@@ -25,7 +25,7 @@ represented as None (no maximum threshold, matches Cronometer's own
 
 Units match what USDA FoodData Central nutrient names use (see
 integrations/food_search.py), so target values can be compared directly
-against food_log_nutrients rows without a unit-conversion layer:
+against nutrient_facts rows without a unit-conversion layer:
   - energy/macros: kcal, g
   - most vitamins/minerals: mg or ug (micrograms), per-nutrient below
 """
