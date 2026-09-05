@@ -1,6 +1,5 @@
 import csv
 import sys
-import asyncio
 import logging
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
@@ -20,8 +19,6 @@ async def _get_user_creds(user_id: int) -> dict:
     if not creds:
         raise HTTPException(status_code=400, detail="No credentials saved. Use /auth/credentials first.")
     return {
-        "hevy_username": decrypt(creds["hevy_username"]) if creds["hevy_username"] else None,
-        "hevy_password": decrypt(creds["hevy_password"]) if creds["hevy_password"] else None,
         "cronometer_username": decrypt(creds["cronometer_username"]) if creds["cronometer_username"] else None,
         "cronometer_password": decrypt(creds["cronometer_password"]) if creds["cronometer_password"] else None,
     }
@@ -331,7 +328,9 @@ async def _sync_diary_entries(cronometer_files: dict, user_id: int) -> int:
         return 0
 
     with open(servings_path) as f:
-        rows = list(csv.DictReader(f))
+        reader = csv.DictReader(f)
+        logger.info(f"[DEBUG headers] servings CSV columns: {reader.fieldnames}")
+        rows = list(reader)
 
     count = 0
     for raw_row in rows:
@@ -373,22 +372,29 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
     data_dir = str(user_data_dir(user_id))
 
     try:
-        client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
-        client.login()
-        results = client.export_all_to_files("2026-04-06", datetime.now().strftime("%Y-%m-%d"), output_dir=data_dir)
-    except Exception as rpc_error:
-        # If RPC export fails (e.g., 403), try web scraper as fallback
-        logger.warning(f"Cronometer RPC export failed: {rpc_error}. Trying web scraper fallback...")
         try:
-            with CronometerWebScraper(headless=True) as scraper:
-                if scraper.login(creds["cronometer_username"], creds["cronometer_password"]):
-                    results = scraper.export_all("2026-04-06", datetime.now().strftime("%Y-%m-%d"), output_dir=data_dir)
-                else:
-                    raise HTTPException(status_code=401, detail="Cronometer web login failed")
-        except Exception as web_error:
-            logger.error(f"Cronometer web scraper also failed: {web_error}")
-            raise HTTPException(status_code=502, detail=f"Cronometer export unavailable (RPC: {rpc_error}; Web: {web_error})")
+            client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
+            client.login()
+            results = client.export_all_to_files("2026-04-06", datetime.now().strftime("%Y-%m-%d"), output_dir=data_dir)
+        except Exception as rpc_error:
+            # If RPC export fails (e.g., 403), try web scraper as fallback
+            logger.warning(f"Cronometer RPC export failed: {rpc_error}. Trying web scraper fallback...")
+            try:
+                with CronometerWebScraper(headless=True) as scraper:
+                    if scraper.login(creds["cronometer_username"], creds["cronometer_password"]):
+                        results = scraper.export_all("2026-04-06", datetime.now().strftime("%Y-%m-%d"), output_dir=data_dir)
+                    else:
+                        raise HTTPException(status_code=401, detail="Cronometer web login failed")
+            except Exception as web_error:
+                logger.error(f"Cronometer web scraper also failed: {web_error}")
+                raise HTTPException(status_code=502, detail=f"Cronometer export unavailable (RPC: {rpc_error}; Web: {web_error})")
 
+        # Processing below must run regardless of which path above produced
+        # `results` (RPC success, or web-scraper fallback success) -- this
+        # used to be nested inside `except Exception as rpc_error:` above,
+        # which meant it only ran on the fallback path. On the normal path
+        # (RPC succeeds, the common case), the endpoint returned 200 with no
+        # body and silently synced nothing at all. Fixed 2026-09-03.
         if results.get("biometrics"):
             _filter_biometrics(results["biometrics"])
         tdee_days_updated = await _update_tdee_log(results, user_id)
@@ -401,7 +407,9 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
         # Insert daily summary metrics
         if results.get("daily_summary"):
             with open(results["daily_summary"]) as f:
-                for row in csv.DictReader(f):
+                reader = csv.DictReader(f)
+                logger.info(f"[DEBUG headers] daily_summary CSV columns: {reader.fieldnames}")
+                for row in reader:
                     if "Group" in row and row.get("Group", "").strip('"') != "Total":
                         continue
                     date = row.get("Date", "")
@@ -442,6 +450,8 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
             "diary_entries_imported": diary_entries_imported,
             "exercise_entries_imported": exercise_entries_imported,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -493,74 +503,20 @@ async def sync_bmr(user_id: int = Depends(get_current_user), push_to_cronometer:
     return {"status": "ok", "bmr": bmr, "pushed_to_cronometer": pushed}
 
 
-@router.post("/hevy")
-async def sync_hevy(user_id: int = Depends(get_current_user)):
-    """Export Hevy workout data via Playwright."""
-    creds = await _get_user_creds(user_id)
-    if not creds["hevy_username"] or not creds["hevy_password"]:
-        raise HTTPException(status_code=400, detail="Hevy credentials not set")
-
-    data_dir = str(user_data_dir(user_id))
-
-    def _run_hevy():
-        from integrations.hevy_web import HevyWebScraper
-        with HevyWebScraper(headless=True) as scraper:
-            if not scraper.login(creds["hevy_username"], creds["hevy_password"]):
-                return None
-            return scraper.export_workouts(output_dir=data_dir)
-
-    try:
-        loop = asyncio.get_event_loop()
-        path = await loop.run_in_executor(None, _run_hevy)
-        if not path:
-            raise HTTPException(status_code=401, detail="Hevy login failed")
-
-        # Populate lift_orm table from exported CSV
-        from ..user_db import upsert_lift_orm
-        from ..routers.data import _compute_orm, _parse_hevy_date
-
-        with open(path) as f:
-            for row in csv.DictReader(f):
-                exercise = row.get("exercise_title", "").strip()
-                weight_str = row.get("weight_lbs", "")
-                reps_str = row.get("reps", "")
-                start_time = row.get("start_time", "")
-                if not exercise or not weight_str or not reps_str:
-                    continue
-                try:
-                    weight = float(weight_str)
-                    reps = int(reps_str)
-                except (ValueError, TypeError):
-                    continue
-                date = _parse_hevy_date(start_time)
-                if not date:
-                    continue
-                orm = _compute_orm(weight, reps)
-                if orm > 0:
-                    await upsert_lift_orm(user_id, date, exercise, round(orm, 1))
-
-        return {"status": "ok", "file": path}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.post("/all")
 async def sync_all(user_id: int = Depends(get_current_user)):
-    """Run full sync pipeline."""
+    """Run full sync pipeline. Hevy used to run here too -- removed
+    2026-09-05 along with POST /sync/hevy (see
+    archive/hevy_fitness_tracker/ for the removed code and why: fitness
+    and nutrition are separate trackers per CLAUDE.md's tenets, and
+    strength-training data now comes from the manual POST /lifts/log
+    stand-in instead of a synced integration owned by this app)."""
     results = {}
     try:
         crono = await sync_cronometer(user_id)
         results["cronometer"] = crono
     except Exception as e:
         results["cronometer"] = {"error": str(e)}
-
-    try:
-        hevy = await sync_hevy(user_id)
-        results["hevy"] = hevy
-    except Exception as e:
-        results["hevy"] = {"error": str(e)}
 
     return results
 

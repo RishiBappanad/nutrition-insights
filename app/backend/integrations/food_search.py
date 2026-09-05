@@ -14,6 +14,46 @@ USDA_API_KEY = "DEMO_KEY"  # Replace with real key for production
 CNF_BASE = "https://food-nutrition.canada.ca/api/canadian-nutrient-file"
 
 
+KCAL_PER_KJ = 1 / 4.184
+
+
+def _normalize_energy(raw_nutrients: List[Dict]) -> Dict:
+    """Build a {name: {value, unit}} dict from a USDA foodNutrients list,
+    collapsing Energy into one canonical "Energy" (KCAL) entry.
+
+    USDA FDC reports Energy twice per food under the exact same
+    nutrientName -- once in kcal, once in kJ. A naive `nutrients[name] =
+    ...` loop silently drops one of the two, non-deterministically
+    depending on array order, since the second one processed overwrites
+    the first at the same dict key -- this was the root cause of some
+    foods showing 0 calories (whichever survived happened to be the kJ
+    entry) despite other macros coming through fine. Always resolve to
+    the real kcal value when present; fall back to converting from kJ
+    (a fixed, exact one-shot conversion, not an approximation) only if
+    USDA didn't report a kcal entry at all for this food."""
+    nutrients = {}
+    energy_kcal = None
+    energy_kj = None
+    for n in raw_nutrients:
+        name = n.get("nutrientName", "")
+        value = n.get("value", 0)
+        unit = (n.get("unitName") or "").upper()
+        if name == "Energy":
+            if unit == "KCAL":
+                energy_kcal = value
+            elif unit == "KJ":
+                energy_kj = value
+            continue
+        nutrients[name] = {"value": value, "unit": unit}
+
+    if energy_kcal is not None:
+        nutrients["Energy"] = {"value": energy_kcal, "unit": "KCAL"}
+    elif energy_kj is not None:
+        nutrients["Energy"] = {"value": round(energy_kj * KCAL_PER_KJ, 1), "unit": "KCAL"}
+
+    return nutrients
+
+
 def search_usda(query: str, page_size: int = 10) -> List[Dict]:
     """Search USDA FoodData Central. Returns normalized results."""
     try:
@@ -28,12 +68,7 @@ def search_usda(query: str, page_size: int = 10) -> List[Dict]:
 
         results = []
         for food in data.get("foods", []):
-            nutrients = {}
-            for n in food.get("foodNutrients", []):
-                name = n.get("nutrientName", "")
-                value = n.get("value", 0)
-                unit = n.get("unitName", "")
-                nutrients[name] = {"value": value, "unit": unit}
+            nutrients = _normalize_energy(food.get("foodNutrients", []))
 
             results.append({
                 "source": "USDA",
@@ -87,7 +122,18 @@ def search_cnf(query: str) -> List[Dict]:
 
 
 def _get_cnf_nutrients(food_code) -> Dict:
-    """Fetch nutrient data for a CNF food."""
+    """Fetch nutrient data for a CNF food.
+
+    CNF reports energy as two separate named nutrients, "Energy (kcal)"
+    and "Energy (kJ)" (confirmed against a real API response) -- unlike
+    USDA, these don't collide in the dict since the names differ. But
+    the frontend's calorie extraction (food-log.jsx's extractMacro)
+    looks for a nutrient named exactly "Energy", the same canonical key
+    _normalize_energy() above produces for USDA results -- CNF's
+    "Energy (kcal)" never matched that, so every CNF-sourced food
+    silently showed 0 calories regardless of the kJ/kcal question.
+    Normalized here the same way USDA is, so both sources produce the
+    same shape and the frontend needs no source-specific logic."""
     try:
         resp = requests.get(
             f"{CNF_BASE}/nutrientamount/?lang=en&type=json&id={food_code}",
@@ -97,11 +143,25 @@ def _get_cnf_nutrients(food_code) -> Dict:
         data = resp.json()
 
         nutrients = {}
+        energy_kcal = None
+        energy_kj = None
         for item in data:
             name = item.get("nutrient_web_name", "")
             value = item.get("nutrient_value", 0)
+            if name == "Energy (kcal)":
+                energy_kcal = value
+                continue
+            if name == "Energy (kJ)":
+                energy_kj = value
+                continue
             if name and value:
                 nutrients[name] = {"value": value, "unit": ""}
+
+        if energy_kcal is not None:
+            nutrients["Energy"] = {"value": energy_kcal, "unit": "KCAL"}
+        elif energy_kj is not None:
+            nutrients["Energy"] = {"value": round(energy_kj * KCAL_PER_KJ, 1), "unit": "KCAL"}
+
         return nutrients
     except Exception as e:
         logger.error(f"CNF nutrient fetch failed for {food_code}: {e}")

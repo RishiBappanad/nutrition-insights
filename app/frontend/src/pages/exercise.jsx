@@ -8,7 +8,7 @@ import { Plus, Trash2, Flame, Timer, Pencil, X, Save } from 'lucide-react'
  * Manual exercise/activity log — Cronometer's "Exercise" diary tab
  * equivalent: named activities (e.g. "Running", 30 min, 300 kcal), not
  * structured strength-training sets (that's Lifts/lift-insights.jsx,
- * fed by Hevy). A day can have any number of these.
+ * logged via POST /lifts/log). A day can have any number of these.
  */
 export default function Exercise() {
   const [date, setDate] = useState(todayIso())

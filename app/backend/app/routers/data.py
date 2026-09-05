@@ -1,8 +1,11 @@
-import csv
 from pathlib import Path
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from ..routers.auth import get_current_user
-from ..user_db import query_nutrition, query_orm, get_nutrition_metrics, get_exercises, upsert_daily_nutrition, upsert_lift_orm, get_metric_series
+from ..user_db import (
+    query_nutrition, query_orm, get_nutrition_metrics, get_exercises,
+    upsert_daily_nutrition, upsert_tdee_log, get_metric_series,
+)
 from ..db import get_pool
 
 router = APIRouter()
@@ -43,87 +46,33 @@ async def get_tdee_log(user_id: int = Depends(get_current_user)):
     return {"entries": records}
 
 
-@router.get("/workouts")
-async def get_workouts(user_id: int = Depends(get_current_user), limit: int = 20):
-    """Get recent Hevy workouts."""
-    csv_path = user_data_dir(user_id) / "hevy_workouts.csv"
-    if not csv_path.exists():
-        return {"workouts": []}
-
-    with open(csv_path) as f:
-        rows = list(csv.DictReader(f))
-    return {"workouts": rows[-limit:]}
+class WeightLogRequest(BaseModel):
+    date: str
+    weight_lbs: float
 
 
-def _compute_orm(weight: float, reps: int) -> float:
-    """Compute estimated 1RM using Brzycki (reps<=10) or Epley (reps>10)."""
-    if reps <= 0 or weight <= 0:
-        return 0
-    if reps == 1:
-        return weight
-    if reps <= 10:
-        return weight / (1.0278 - 0.0278 * reps)
-    return weight * (1 + reps / 30)
+@router.post("/weight")
+async def log_weight(req: WeightLogRequest, user_id: int = Depends(get_current_user)):
+    """Manually log body weight for a date. Writes to both
+    daily_nutrition (the "Weight (lbs)" chart metric) and tdee_log
+    (BMR/TDEE's weight input) -- the same two places Cronometer's
+    biometrics sync writes, so a manual entry is a first-class data
+    source exactly like a synced one, not a second-tier fallback that
+    only shows up on the chart but never affects BMR."""
+    if req.weight_lbs <= 0:
+        raise HTTPException(status_code=400, detail="weight_lbs must be positive")
+    await upsert_daily_nutrition(user_id, req.date, {"Weight (lbs)": req.weight_lbs})
+    await upsert_tdee_log(user_id, req.date, weight_lbs=req.weight_lbs)
+    return {"status": "logged"}
 
 
-def _parse_hevy_date(date_str: str) -> str:
-    """Parse 'Jun 5, 2026, 8:33 AM' to '2026-06-05'."""
-    from datetime import datetime
-    try:
-        dt = datetime.strptime(date_str.strip(), "%b %d, %Y, %I:%M %p")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        return ""
-
-
-def _get_orm_data(csv_path: Path) -> dict:
-    """Process hevy CSV into {exercise: [{date, orm}]} with max ORM per day."""
-    from collections import defaultdict
-
-    if not csv_path.exists():
-        return {}
-
-    daily_max = defaultdict(lambda: defaultdict(float))  # exercise -> date -> max_orm
-
-    with open(csv_path) as f:
-        for row in csv.DictReader(f):
-            exercise = row.get("exercise_title", "").strip()
-            weight_str = row.get("weight_lbs", "")
-            reps_str = row.get("reps", "")
-            start_time = row.get("start_time", "")
-
-            if not exercise or not weight_str or not reps_str:
-                continue
-
-            try:
-                weight = float(weight_str)
-                reps = int(reps_str)
-            except (ValueError, TypeError):
-                continue
-
-            date = _parse_hevy_date(start_time)
-            if not date:
-                continue
-
-            orm = _compute_orm(weight, reps)
-            if orm > daily_max[exercise][date]:
-                daily_max[exercise][date] = round(orm, 1)
-
-    # Convert to sorted lists
-    result = {}
-    for exercise, dates in daily_max.items():
-        result[exercise] = sorted(
-            [{"date": d, "orm": v} for d, v in dates.items()],
-            key=lambda x: x["date"]
-        )
-    return result
-
-
-@router.get("/orm")
-async def get_orm(user_id: int = Depends(get_current_user)):
-    """Get ORM data per exercise."""
-    csv_path = user_data_dir(user_id) / "hevy_workouts.csv"
-    return _get_orm_data(csv_path)
+@router.get("/weight")
+async def get_weight_history(user_id: int = Depends(get_current_user)):
+    """Full {date: value} weight history -- merges Cronometer-synced and
+    manually-logged entries, same source as the Charts page (see
+    user_db.get_metric_series)."""
+    series = await get_metric_series(user_id, "Weight (lbs)")
+    return {"entries": [{"date": d, "weight_lbs": v} for d, v in sorted(series.items())]}
 
 
 @router.get("/chart")

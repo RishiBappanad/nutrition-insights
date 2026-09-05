@@ -29,8 +29,6 @@ ALGORITHM = "HS256"
 
 
 class CredentialsRequest(BaseModel):
-    hevy_username: str = ""
-    hevy_password: str = ""
     cronometer_username: str = ""
     cronometer_password: str = ""
 
@@ -71,15 +69,17 @@ async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(securit
 
 @router.post("/credentials")
 async def save_credentials(req: CredentialsRequest, user_id: int = Depends(get_current_user)):
+    """hevy_username/hevy_password columns still exist on `credentials`
+    but are no longer written here -- Hevy sync was removed 2026-09-05
+    (see archive/hevy_fitness_tracker/ in the backend). Any value a user
+    saved previously is left untouched, not wiped, in case it's useful
+    when porting to a future fitness tracker."""
     pool = await get_pool()
     async with pool.acquire() as db:
         await db.execute(
             """UPDATE credentials SET
-                hevy_username = $1, hevy_password = $2,
-                cronometer_username = $3, cronometer_password = $4
-            WHERE user_id = $5""",
-            encrypt(req.hevy_username) if req.hevy_username else None,
-            encrypt(req.hevy_password) if req.hevy_password else None,
+                cronometer_username = $1, cronometer_password = $2
+            WHERE user_id = $3""",
             encrypt(req.cronometer_username) if req.cronometer_username else None,
             encrypt(req.cronometer_password) if req.cronometer_password else None,
             user_id,

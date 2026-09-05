@@ -54,6 +54,12 @@ export default function Charts() {
   const W = 560,
     H = 200,
     PAD = 40
+  // A single date has nowhere to interpolate to -- center it rather than
+  // dividing by (allDates.length - 1), which would be 0.
+  const dateToX = (d) =>
+    allDates.length <= 1
+      ? PAD + (W - PAD * 2) / 2
+      : PAD + (allDates.indexOf(d) / (allDates.length - 1)) * (W - PAD * 2)
 
   return (
     <div className="space-y-6">
@@ -133,11 +139,15 @@ export default function Charts() {
           )}
 
           {/* SVG Chart */}
-          {allDates.length >= 2 ? (
+          {allDates.length >= 1 ? (
             <svg
               viewBox={`0 0 ${W} ${H + 30}`}
               className="w-full h-auto mt-3"
               onMouseMove={(e) => {
+                if (allDates.length <= 1) {
+                  setHoverIdx(allDates.length === 1 ? 0 : null)
+                  return
+                }
                 const rect = e.currentTarget.getBoundingClientRect()
                 const svgX =
                   ((e.clientX - rect.left) / rect.width) * W
@@ -151,35 +161,41 @@ export default function Charts() {
               onMouseLeave={() => setHoverIdx(null)}
             >
               {Object.entries(series).map(([name, points], idx) => {
-                if (points.length < 2) return null
+                if (points.length === 0) return null
                 const vals = points.map((p) => p.value)
                 const min = Math.min(...vals),
                   max = Math.max(...vals)
                 const range = max - min || 1
-                const dateToX = (d) =>
-                  PAD +
-                  (allDates.indexOf(d) / (allDates.length - 1)) *
-                    (W - PAD * 2)
                 const valToY = (v) =>
                   H - PAD - ((v - min) / range) * (H - PAD * 2)
-                const pathD = points
-                  .map(
-                    (p, i) =>
-                      `${i === 0 ? 'M' : 'L'}${dateToX(p.date).toFixed(1)},${valToY(p.value).toFixed(1)}`
-                  )
-                  .join(' ')
                 const hoverPoint =
                   hoverIdx !== null
                     ? points.find((p) => p.date === allDates[hoverIdx])
                     : null
                 return (
                   <g key={name}>
-                    <path
-                      d={pathD}
-                      fill="none"
-                      stroke={chartColors[idx % 3]}
-                      strokeWidth="2"
-                    />
+                    {points.length >= 2 ? (
+                      <path
+                        d={points
+                          .map(
+                            (p, i) =>
+                              `${i === 0 ? 'M' : 'L'}${dateToX(p.date).toFixed(1)},${valToY(p.value).toFixed(1)}`
+                          )
+                          .join(' ')}
+                        fill="none"
+                        stroke={chartColors[idx % 3]}
+                        strokeWidth="2"
+                      />
+                    ) : (
+                      // A single point has no line to draw -- show it as
+                      // a dot instead of not rendering anything.
+                      <circle
+                        cx={dateToX(points[0].date)}
+                        cy={valToY(points[0].value)}
+                        r="3"
+                        fill={chartColors[idx % 3]}
+                      />
+                    )}
                     <text
                       x={W - PAD + 4}
                       y={valToY(vals[vals.length - 1])}
@@ -202,25 +218,16 @@ export default function Charts() {
               {hoverIdx !== null && (
                 <g>
                   <line
-                    x1={
-                      PAD +
-                      (hoverIdx / (allDates.length - 1)) * (W - PAD * 2)
-                    }
+                    x1={dateToX(allDates[hoverIdx])}
                     y1={0}
-                    x2={
-                      PAD +
-                      (hoverIdx / (allDates.length - 1)) * (W - PAD * 2)
-                    }
+                    x2={dateToX(allDates[hoverIdx])}
                     y2={H - PAD + 10}
                     stroke="#999"
                     strokeWidth="0.5"
                     strokeDasharray="3,2"
                   />
                   <text
-                    x={
-                      PAD +
-                      (hoverIdx / (allDates.length - 1)) * (W - PAD * 2)
-                    }
+                    x={dateToX(allDates[hoverIdx])}
                     y={H + 15}
                     fontSize="9"
                     fill="hsl(156, 30%, 12%)"
@@ -236,12 +243,7 @@ export default function Charts() {
                     return (
                       <text
                         key={name}
-                        x={
-                          PAD +
-                          (hoverIdx / (allDates.length - 1)) *
-                            (W - PAD * 2) +
-                          6
-                        }
+                        x={dateToX(allDates[hoverIdx]) + 6}
                         y={16 + idx * 12}
                         fontSize="9"
                         fill={chartColors[idx % 3]}
@@ -257,7 +259,7 @@ export default function Charts() {
                   {allDates[0]}
                 </text>
               )}
-              {hoverIdx === null && (
+              {hoverIdx === null && allDates.length > 1 && (
                 <text
                   x={W - PAD}
                   y={H + 5}
@@ -269,9 +271,13 @@ export default function Charts() {
                 </text>
               )}
             </svg>
-          ) : (
+          ) : selected.length === 0 ? (
             <p className="text-sm text-muted-foreground mt-3">
               Select metrics to display chart.
+            </p>
+          ) : (
+            <p className="text-sm text-muted-foreground mt-3">
+              No data yet for the selected metric{selected.length > 1 ? 's' : ''}.
             </p>
           )}
         </CardContent>

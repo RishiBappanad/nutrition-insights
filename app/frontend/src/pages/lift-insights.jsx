@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
 import { api } from '@/lib/api'
 import { usePreferences } from '@/lib/use-preferences'
+import { todayIso } from '@/lib/dates'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
+import { Plus } from 'lucide-react'
 
 export default function LiftInsights() {
   const { colors } = usePreferences()
@@ -13,14 +15,16 @@ export default function LiftInsights() {
   const [lookback, setLookback] = useState(2)
   const [data, setData] = useState([])
 
-  useEffect(() => {
+  function refreshExercises() {
     api('/data/lift-insights')
       .then((r) => r.json())
       .then((d) => {
         setExercises(d.exercises || [])
-        if (d.exercises?.length) setExercise(d.exercises[0])
+        if (d.exercises?.length && !exercise) setExercise(d.exercises[0])
       })
-  }, [])
+  }
+
+  useEffect(refreshExercises, [])
 
   useEffect(() => {
     if (!exercise) return
@@ -47,6 +51,8 @@ export default function LiftInsights() {
           Correlate nutrition intake with lift performance
         </p>
       </div>
+
+      <LogLiftForm onLogged={refreshExercises} />
 
       <Card>
         <CardHeader>
@@ -198,5 +204,112 @@ export default function LiftInsights() {
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+// Deliberately minimal ("just a dummy" per the decision to defer real
+// set-by-set strength tracking to a future, separate fitness tracker,
+// see archive/hevy_fitness_tracker/ in the backend) -- one set in, one
+// estimated 1RM out, no history/edit UI here since the chart above
+// already shows ORM over time once data exists.
+function LogLiftForm({ onLogged }) {
+  const [date, setDate] = useState(todayIso())
+  const [exercise, setExercise] = useState('')
+  const [weight, setWeight] = useState('')
+  const [reps, setReps] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [saved, setSaved] = useState(false)
+
+  async function handleLog(e) {
+    e.preventDefault()
+    if (!exercise.trim() || !weight || !reps) {
+      setError('Exercise, weight, and reps are required')
+      return
+    }
+    setSaving(true)
+    setError('')
+    const res = await api('/lifts/log', {
+      method: 'POST',
+      body: JSON.stringify({
+        date,
+        exercise: exercise.trim(),
+        weight_lbs: Number(weight),
+        reps: Number(reps),
+      }),
+    })
+    setSaving(false)
+    if (res.ok) {
+      setExercise('')
+      setWeight('')
+      setReps('')
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+      onLogged?.()
+    } else {
+      const data = await res.json().catch(() => ({}))
+      setError(data.detail || `Failed (${res.status})`)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Log a Lift</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={handleLog} className="space-y-3">
+          <div className="grid gap-3 md:grid-cols-4">
+            <div className="space-y-1.5 md:col-span-2">
+              <label className="text-xs font-medium text-muted-foreground">Exercise</label>
+              <input
+                type="text"
+                placeholder="e.g. Bench Press"
+                value={exercise}
+                onChange={(e) => setExercise(e.target.value)}
+                className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">Weight (lbs)</label>
+              <input
+                type="number"
+                min="0"
+                value={weight}
+                onChange={(e) => setWeight(e.target.value)}
+                className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">Reps</label>
+              <input
+                type="number"
+                min="1"
+                value={reps}
+                onChange={(e) => setReps(e.target.value)}
+                className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="px-3 py-2 rounded-md border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            <button
+              type="submit"
+              disabled={saving}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+            >
+              <Plus className="h-4 w-4" />
+              {saving ? 'Logging...' : saved ? 'Logged' : 'Log Set'}
+            </button>
+            {error && <span className="text-sm text-destructive">{error}</span>}
+          </div>
+        </form>
+      </CardContent>
+    </Card>
   )
 }

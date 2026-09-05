@@ -139,8 +139,6 @@ function AppearanceSettings() {
 
 export default function Settings() {
   const [form, setForm] = useState({
-    hevy_username: '',
-    hevy_password: '',
     cronometer_username: '',
     cronometer_password: '',
   })
@@ -178,7 +176,7 @@ export default function Settings() {
         <CardHeader>
           <CardTitle>Connected Accounts</CardTitle>
           <CardDescription>
-            Add your Cronometer and Hevy credentials to sync data
+            Add your Cronometer credentials to sync data
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -211,41 +209,6 @@ export default function Settings() {
                     value={form.cronometer_password}
                     onChange={(e) =>
                       setForm({ ...form, cronometer_password: e.target.value })
-                    }
-                    className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* Hevy Section */}
-            <div className="space-y-3">
-              <h3 className="text-sm font-semibold text-foreground">Hevy</h3>
-              <div className="grid gap-3 md:grid-cols-2">
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium text-muted-foreground">
-                    Username / Email
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="hevy@example.com"
-                    value={form.hevy_username}
-                    onChange={(e) =>
-                      setForm({ ...form, hevy_username: e.target.value })
-                    }
-                    className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium text-muted-foreground">
-                    Password
-                  </label>
-                  <input
-                    type="password"
-                    placeholder="••••••••"
-                    value={form.hevy_password}
-                    onChange={(e) =>
-                      setForm({ ...form, hevy_password: e.target.value })
                     }
                     className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
                   />

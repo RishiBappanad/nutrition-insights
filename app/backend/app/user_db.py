@@ -23,6 +23,22 @@ async def upsert_daily_nutrition(user_id: int, date: str, metrics: dict):
         )
 
 
+def compute_orm(weight: float, reps: int) -> float:
+    """Estimate 1RM using Brzycki (reps<=10) or Epley (reps>10). Moved
+    here from routers/data.py 2026-09-05 when Hevy sync was removed
+    (see archive/hevy_fitness_tracker/) -- this formula is generic 1RM
+    math, not Hevy-specific, so it's shared by the manual POST
+    /lifts/log stand-in instead of living only inside the removed sync
+    code."""
+    if reps <= 0 or weight <= 0:
+        return 0
+    if reps == 1:
+        return weight
+    if reps <= 10:
+        return weight / (1.0278 - 0.0278 * reps)
+    return weight * (1 + reps / 30)
+
+
 async def upsert_lift_orm(user_id: int, date: str, exercise: str, orm: float):
     """Insert/replace ORM for an exercise on a date (keeps max)."""
     pool = await get_pool()
@@ -76,15 +92,41 @@ async def _food_log_series(conn, user_id: int, metric: str) -> dict:
     return {r["date"]: r["total"] for r in rows}
 
 
+async def _exercise_log_series(conn, user_id: int) -> dict:
+    """Aggregate manually-logged exercise/activity calorie burn (POST
+    /exercise) into a {date: value} series for the "Active Calories
+    Burned" chart metric -- same rationale as _food_log_series above:
+    daily_nutrition only ever gets this metric from an explicit
+    Cronometer sync (its exercises-CSV import), so a user who only logs
+    activity manually would otherwise see this metric never populate,
+    even though POST /exercise already has their calorie burn."""
+    rows = await conn.fetch(
+        "SELECT date, SUM(calories_burned) AS total FROM exercise_log "
+        "WHERE user_id = $1 GROUP BY date",
+        user_id,
+    )
+    return {r["date"]: r["total"] for r in rows}
+
+
+async def _manual_series(conn, user_id: int, metric: str) -> dict:
+    """Manually-entered data for one chartable metric, merged underneath
+    daily_nutrition's Cronometer sync (see get_metric_series/
+    query_nutrition). "Active Calories Burned" comes from exercise_log;
+    every other nutrition metric comes from food_log/nutrient_facts."""
+    if metric == "Active Calories Burned":
+        return await _exercise_log_series(conn, user_id)
+    return await _food_log_series(conn, user_id, metric)
+
+
 async def get_metric_series(user_id: int, metric: str) -> dict:
-    """Public, single-metric version of the daily_nutrition/food_log merge
+    """Public, single-metric version of the daily_nutrition/manual merge
     in query_nutrition below, for callers (e.g. GET /data/lift-insights)
     that need a plain {date: value} series rather than the chart
     endpoint's {metric: [{date, value}]} shape or its rolling average."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         synced = await _daily_nutrition_series(conn, user_id, metric)
-        logged = await _food_log_series(conn, user_id, metric)
+        logged = await _manual_series(conn, user_id, metric)
     return {**logged, **synced}
 
 
@@ -113,7 +155,7 @@ async def query_nutrition(user_id: int, metrics: list, lookback: int = 1) -> dic
     async with pool.acquire() as conn:
         for metric in metrics:
             synced = await _daily_nutrition_series(conn, user_id, metric)
-            logged = await _food_log_series(conn, user_id, metric)
+            logged = await _manual_series(conn, user_id, metric)
             merged = {**logged, **synced}
             dates = sorted(merged)
 
@@ -190,11 +232,18 @@ async def get_nutrition_metrics(user_id: int) -> list:
             "SELECT EXISTS(SELECT 1 FROM food_log WHERE user_id = $1 AND calories IS NOT NULL)",
             user_id,
         )
+        has_burn = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM exercise_log WHERE user_id = $1 AND calories_burned > 0)",
+            user_id,
+        )
 
     metrics = {r["metric"] for r in synced_rows} | {r["metric"] for r in logged_rows}
     if has_calories:
         metrics.add("Energy (kcal)")
-    return sorted(metrics)
+    if has_burn:
+        metrics.add("Active Calories Burned")
+    from .nutrient_groups import order_nutrient_names
+    return order_nutrient_names(metrics)
 
 
 async def upsert_tdee_log(user_id: int, date: str, weight_lbs: float = None,

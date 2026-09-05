@@ -10,7 +10,8 @@ import { MicronutrientCard } from '@/components/ui/micronutrient-card'
 import { MealSections } from '@/components/ui/meal-sections'
 import { WaterWidget } from '@/components/ui/water-widget'
 import { EntryDetailPanel } from '@/components/ui/entry-detail-panel'
-import { RefreshCw, Flame, Activity, Calculator, UtensilsCrossed, BookOpen, Layers, ChevronLeft, ChevronRight, CalendarDays, Dumbbell } from 'lucide-react'
+import { DashboardProvider, useDashboardContext } from '@/lib/dashboard-context'
+import { RefreshCw, Flame, Activity, Calculator, UtensilsCrossed, BookOpen, Layers, ChevronLeft, ChevronRight, CalendarDays, Dumbbell, Scale, Check } from 'lucide-react'
 
 export default function Dashboard() {
   const { colors, sufficiencyThresholdPct, unitSystem, macroChartStyle, importantNutrients, updateMacroChartStyle } = usePreferences()
@@ -112,6 +113,7 @@ export default function Dashboard() {
   }
 
   return (
+    <DashboardProvider value={{ date, setDate }}>
     <div className="space-y-6">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
@@ -262,52 +264,30 @@ export default function Dashboard() {
       </Card>
 
       {/* Sync Controls */}
-      <div className="grid gap-4 md:grid-cols-2">
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Cronometer</CardTitle>
-            <Activity className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <p className="text-xs text-muted-foreground mb-3">
-              Pull nutrition &amp; biometric data from Cronometer (does not affect your BMR —
-              use "Recalculate BMR" above for that)
-            </p>
-            <button
-              onClick={() => handleSync('cronometer')}
-              disabled={!!syncing}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
-            >
-              <RefreshCw
-                className={`h-4 w-4 ${syncing === 'cronometer' ? 'animate-spin' : ''}`}
-              />
-              {syncing === 'cronometer' ? 'Syncing...' : 'Sync'}
-            </button>
-          </CardContent>
-        </Card>
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+          <CardTitle className="text-sm font-medium">Cronometer</CardTitle>
+          <Activity className="h-4 w-4 text-muted-foreground" />
+        </CardHeader>
+        <CardContent>
+          <p className="text-xs text-muted-foreground mb-3">
+            Pull nutrition &amp; biometric data from Cronometer (does not affect your BMR —
+            use "Recalculate BMR" above for that)
+          </p>
+          <button
+            onClick={() => handleSync('cronometer')}
+            disabled={!!syncing}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${syncing === 'cronometer' ? 'animate-spin' : ''}`}
+            />
+            {syncing === 'cronometer' ? 'Syncing...' : 'Sync'}
+          </button>
+        </CardContent>
+      </Card>
 
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Hevy</CardTitle>
-            <Activity className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <p className="text-xs text-muted-foreground mb-3">
-              Sync workout &amp; lift data
-            </p>
-            <button
-              onClick={() => handleSync('hevy')}
-              disabled={!!syncing}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
-            >
-              <RefreshCw
-                className={`h-4 w-4 ${syncing === 'hevy' ? 'animate-spin' : ''}`}
-              />
-              {syncing === 'hevy' ? 'Syncing...' : 'Sync'}
-            </button>
-          </CardContent>
-        </Card>
-      </div>
+      <WeightLogCard />
 
       {/* Sync Result */}
       {syncResult && (
@@ -323,5 +303,72 @@ export default function Dashboard() {
         </Card>
       )}
     </div>
+    </DashboardProvider>
+  )
+}
+
+function WeightLogCard() {
+  const { date } = useDashboardContext()
+  const [weight, setWeight] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [error, setError] = useState('')
+
+  async function handleLog(e) {
+    e.preventDefault()
+    const value = Number(weight)
+    if (!value || value <= 0) {
+      setError('Enter a valid weight')
+      return
+    }
+    setSaving(true)
+    setError('')
+    const res = await api('/data/weight', {
+      method: 'POST',
+      body: JSON.stringify({ date, weight_lbs: value }),
+    })
+    setSaving(false)
+    if (res.ok) {
+      setWeight('')
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } else {
+      const data = await res.json().catch(() => ({}))
+      setError(data.detail || `Failed (${res.status})`)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle className="text-sm font-medium">Weight</CardTitle>
+        <Scale className="h-4 w-4 text-muted-foreground" />
+      </CardHeader>
+      <CardContent>
+        <p className="text-xs text-muted-foreground mb-3">
+          Log weight for {isToday(date) ? 'today' : friendlyDate(date)} — feeds both the Charts page and BMR/TDEE
+        </p>
+        <form onSubmit={handleLog} className="flex items-center gap-2">
+          <input
+            type="number"
+            step="0.1"
+            min="0"
+            placeholder="lbs"
+            value={weight}
+            onChange={(e) => setWeight(e.target.value)}
+            className="w-24 px-3 py-2 rounded-md border bg-background text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+          />
+          <button
+            type="submit"
+            disabled={saving}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+          >
+            {saved ? <Check className="h-4 w-4" /> : null}
+            {saving ? 'Logging...' : saved ? 'Logged' : 'Log'}
+          </button>
+          {error && <span className="text-sm text-destructive">{error}</span>}
+        </form>
+      </CardContent>
+    </Card>
   )
 }

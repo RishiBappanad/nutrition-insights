@@ -115,31 +115,42 @@ def get_nutrient_groups() -> dict:
     }
 
 
-def order_nutrients(nutrients: dict) -> dict:
-    """Reorder a flat {nutrient_name: {value, unit}} dict into TrackStack's
-    canonical display order (see module docstring). Anything not in any
-    known group — an unusual label-scanned name, a CNF nutrient using a
-    different naming convention — is appended last, in whatever order it
-    was already in. Nothing is ever dropped, just left unclassified."""
+def order_nutrient_names(names) -> list[str]:
+    """Reorder any iterable of nutrient names into TrackStack's canonical
+    display order (see module docstring): macros first (with their
+    sub-nutrients immediately after), then General, then Vitamins, then
+    Minerals. Anything not in any known group — an unusual label-scanned
+    name, a CNF nutrient using a different naming convention — is appended
+    last, alphabetically. Nothing is ever dropped, just left unclassified.
+    Shared by order_nutrients() below (which
+    orders a {name: {value, unit}} dict) and by any caller that only has
+    a bare list of names (e.g. the chart metric selector)."""
+    names = list(names)
+    present = set(names)
     ordered_names: list[str] = []
     seen: set[str] = set()
 
     for macro in ("Protein", "Carbohydrate", "Fat", "Alcohol"):
         spec = MACRO_GROUPS[macro]
         for name in (spec["primary"], *spec["sub_nutrients"]):
-            if name in nutrients and name not in seen:
+            if name in present and name not in seen:
                 ordered_names.append(name)
                 seen.add(name)
 
     for group in (GENERAL_GROUP, VITAMIN_GROUP, MINERAL_GROUP):
         for name in group:
-            if name in nutrients and name not in seen:
+            if name in present and name not in seen:
                 ordered_names.append(name)
                 seen.add(name)
 
-    for name in nutrients:
-        if name not in seen:
-            ordered_names.append(name)
-            seen.add(name)
+    for name in sorted(n for n in names if n not in seen):
+        ordered_names.append(name)
+        seen.add(name)
 
-    return {name: nutrients[name] for name in ordered_names}
+    return ordered_names
+
+
+def order_nutrients(nutrients: dict) -> dict:
+    """Reorder a flat {nutrient_name: {value, unit}} dict into TrackStack's
+    canonical display order — see order_nutrient_names() above."""
+    return {name: nutrients[name] for name in order_nutrient_names(nutrients.keys())}
