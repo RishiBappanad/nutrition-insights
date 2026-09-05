@@ -18,6 +18,28 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# Cronometer's exports contain real non-ASCII bytes (e.g. "µ" in
+# micrograms column headers). Every write AND every read of one of these
+# files goes through open_cronometer_export() below instead of a bare
+# open() -- read and write drifted apart once already: relying on
+# Python's platform-default encoding on the read side worked by
+# coincidence on Cloud Run's Linux containers (UTF-8 default) but broke
+# immediately running locally on Windows (cp1252 default), raising a
+# bare UnicodeDecodeError. Routing every open() for these files through
+# one function makes that drift structurally impossible, not just
+# unlikely.
+CRONOMETER_EXPORT_ENCODING = "utf-8"
+
+
+def open_cronometer_export(path, mode: str = "r", encoding: str = CRONOMETER_EXPORT_ENCODING):
+    """Open a Cronometer export file (CSV or otherwise) with the one
+    correct, explicit encoding. Use this instead of a bare open() for
+    every read or write of a file produced by export_all_to_files()
+    below -- see CRONOMETER_EXPORT_ENCODING's comment for why. `encoding`
+    defaults to that constant but can still be overridden per-call if a
+    future export type genuinely needs a different one."""
+    return open(path, mode, encoding=encoding)
+
 # Cronometer API endpoints
 HTML_LOGIN_URL = "https://cronometer.com/login/"
 API_LOGIN_URL = "https://cronometer.com/login"
@@ -864,7 +886,7 @@ class CronometerRPCClient:
                 filename = f"cronometer_{export_type}.csv"
                 filepath = output_path / filename
                 
-                with open(filepath, 'w', encoding='utf-8') as f:
+                with open_cronometer_export(filepath, "w") as f:
                     f.write(csv_data)
                 
                 results[export_type] = str(filepath)

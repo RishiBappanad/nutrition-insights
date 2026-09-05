@@ -1,11 +1,13 @@
 import csv
 import sys
+import asyncio
 import logging
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from ..routers.auth import get_current_user
 from ..routers.data import user_data_dir
 from ..db import get_pool, decrypt
+from integrations.cronometer_rpc import open_cronometer_export
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +28,11 @@ async def _get_user_creds(user_id: int) -> dict:
 
 def _filter_biometrics(csv_path: str) -> None:
     """Remove heart rate rows from biometrics CSV in place."""
-    p = Path(csv_path)
-    lines = p.read_text().splitlines()
+    with open_cronometer_export(csv_path) as f:
+        lines = f.read().splitlines()
     filtered = [lines[0]] + [l for l in lines[1:] if "Heart Rate" not in l]
-    p.write_text("\n".join(filtered) + "\n")
+    with open_cronometer_export(csv_path, "w") as f:
+        f.write("\n".join(filtered) + "\n")
 
 
 def _parse_tdee_rows(cronometer_files: dict) -> dict:
@@ -43,7 +46,7 @@ def _parse_tdee_rows(cronometer_files: dict) -> dict:
     weights = {}
     bio_path = cronometer_files.get("biometrics")
     if bio_path:
-        with open(bio_path) as f:
+        with open_cronometer_export(bio_path) as f:
             for row in csv.DictReader(f):
                 if "Weight" in row["Metric"] and "Apple Health" not in row["Metric"]:
                     weights[row["Day"]] = float(row["Amount"])
@@ -51,7 +54,7 @@ def _parse_tdee_rows(cronometer_files: dict) -> dict:
     calories_consumed = {}
     summary_path = cronometer_files.get("daily_summary")
     if summary_path:
-        with open(summary_path) as f:
+        with open_cronometer_export(summary_path) as f:
             for row in csv.DictReader(f):
                 if row.get("Energy (kcal)"):
                     date = row.get("Date", "")
@@ -61,7 +64,7 @@ def _parse_tdee_rows(cronometer_files: dict) -> dict:
     active_calories = defaultdict(float)
     exercises_path = cronometer_files.get("exercises")
     if exercises_path:
-        with open(exercises_path) as f:
+        with open_cronometer_export(exercises_path) as f:
             for row in csv.DictReader(f):
                 if row["Calories Burned"]:
                     active_calories[row["Day"]] += abs(float(row["Calories Burned"]))
@@ -232,7 +235,7 @@ async def _sync_exercise_entries(cronometer_files: dict, user_id: int) -> int:
     if not exercises_path:
         return 0
 
-    with open(exercises_path) as f:
+    with open_cronometer_export(exercises_path) as f:
         raw_csv = f.read()
 
     try:
@@ -327,7 +330,7 @@ async def _sync_diary_entries(cronometer_files: dict, user_id: int) -> int:
     if not servings_path:
         return 0
 
-    with open(servings_path) as f:
+    with open_cronometer_export(servings_path) as f:
         reader = csv.DictReader(f)
         logger.info(f"[DEBUG headers] servings CSV columns: {reader.fieldnames}")
         rows = list(reader)
@@ -370,21 +373,37 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
     from datetime import datetime
 
     data_dir = str(user_data_dir(user_id))
+    start_date, end_date = "2026-04-06", datetime.now().strftime("%Y-%m-%d")
+    loop = asyncio.get_event_loop()
+
+    def _run_rpc_export():
+        client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
+        client.login()
+        return client.export_all_to_files(start_date, end_date, output_dir=data_dir)
+
+    def _run_web_export():
+        with CronometerWebScraper(headless=True) as scraper:
+            if not scraper.login(creds["cronometer_username"], creds["cronometer_password"]):
+                raise RuntimeError("Cronometer web login failed")
+            return scraper.export_all(start_date, end_date, output_dir=data_dir)
 
     try:
         try:
-            client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
-            client.login()
-            results = client.export_all_to_files("2026-04-06", datetime.now().strftime("%Y-%m-%d"), output_dir=data_dir)
+            # requests (RPC client) and Playwright (web scraper fallback)
+            # are both synchronous, blocking I/O -- run via run_in_executor
+            # so a slow/unresponsive Cronometer login or export doesn't
+            # block this process's entire asyncio event loop (starving
+            # every other request, including /health) for however long
+            # the blocking calls take. Confirmed this was happening: a
+            # sync request would hang with zero server-side progress
+            # visible until the blocking chain finally resolved or timed
+            # out on its own.
+            results = await loop.run_in_executor(None, _run_rpc_export)
         except Exception as rpc_error:
             # If RPC export fails (e.g., 403), try web scraper as fallback
             logger.warning(f"Cronometer RPC export failed: {rpc_error}. Trying web scraper fallback...")
             try:
-                with CronometerWebScraper(headless=True) as scraper:
-                    if scraper.login(creds["cronometer_username"], creds["cronometer_password"]):
-                        results = scraper.export_all("2026-04-06", datetime.now().strftime("%Y-%m-%d"), output_dir=data_dir)
-                    else:
-                        raise HTTPException(status_code=401, detail="Cronometer web login failed")
+                results = await loop.run_in_executor(None, _run_web_export)
             except Exception as web_error:
                 logger.error(f"Cronometer web scraper also failed: {web_error}")
                 raise HTTPException(status_code=502, detail=f"Cronometer export unavailable (RPC: {rpc_error}; Web: {web_error})")
@@ -406,7 +425,7 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
 
         # Insert daily summary metrics
         if results.get("daily_summary"):
-            with open(results["daily_summary"]) as f:
+            with open_cronometer_export(results["daily_summary"]) as f:
                 reader = csv.DictReader(f)
                 logger.info(f"[DEBUG headers] daily_summary CSV columns: {reader.fieldnames}")
                 for row in reader:
@@ -430,7 +449,7 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
         if results.get("exercises"):
             from collections import defaultdict
             daily_burn = defaultdict(float)
-            with open(results["exercises"]) as f:
+            with open_cronometer_export(results["exercises"]) as f:
                 for row in csv.DictReader(f):
                     if row.get("Calories Burned"):
                         daily_burn[row["Day"]] += abs(float(row["Calories Burned"]))
@@ -439,7 +458,7 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
 
         # Insert weight as a nutrition metric (biometrics)
         if results.get("biometrics"):
-            with open(results["biometrics"]) as f:
+            with open_cronometer_export(results["biometrics"]) as f:
                 for row in csv.DictReader(f):
                     if "Weight" in row["Metric"] and "Apple Health" not in row["Metric"]:
                         await upsert_daily_nutrition(user_id, row["Day"], {"Weight (lbs)": float(row["Amount"])})
