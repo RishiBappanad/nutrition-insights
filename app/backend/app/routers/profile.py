@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 
 from ..routers.auth import get_current_user
-from ..db import get_pool
+from ..db.profile import query as profile_query
 from ..nutrition_targets import seed_dri_targets
 from ..routers.water import default_water_target_ml
 
@@ -57,21 +57,9 @@ class ProfileRequest(BaseModel):
 async def set_profile(req: ProfileRequest, user_id: int = Depends(get_current_user)):
     water_target = req.water_target_ml if req.water_target_ml is not None else default_water_target_ml(req.sex)
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO user_profile (user_id, age, sex, height_cm, weight_kg, activity_level, water_target_ml, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-               ON CONFLICT (user_id) DO UPDATE SET
-                   age = EXCLUDED.age,
-                   sex = EXCLUDED.sex,
-                   height_cm = EXCLUDED.height_cm,
-                   weight_kg = EXCLUDED.weight_kg,
-                   activity_level = EXCLUDED.activity_level,
-                   water_target_ml = EXCLUDED.water_target_ml,
-                   updated_at = now()""",
-            user_id, req.age, req.sex, req.height_cm, req.weight_kg, req.activity_level, water_target,
-        )
+    await profile_query.upsert_profile(
+        user_id, req.age, req.sex, req.height_cm, req.weight_kg, req.activity_level, water_target,
+    )
 
     seeded_count = await seed_dri_targets(user_id, req.sex, req.age)
     return {"status": "saved", "water_target_ml": water_target, "dri_targets_seeded": seeded_count}
@@ -79,9 +67,7 @@ async def set_profile(req: ProfileRequest, user_id: int = Depends(get_current_us
 
 @router.get("")
 async def get_profile(user_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM user_profile WHERE user_id = $1", user_id)
+    row = await profile_query.get_profile(user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="No profile set yet")
     return {
