@@ -11,7 +11,6 @@ caller re-entering it every time — this was a real gap fixed per user
 request (previously a pantry item stored zero nutrition and /consume
 silently logged 0 macros unless a caller happened to resupply them,
 which the frontend never did)."""
-import json
 from datetime import date as date_cls, timedelta
 from typing import Optional
 
@@ -19,9 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
-from ..db import get_pool
-from ..nutrient_facts import write_nutrients, delete_nutrient_facts
-from ..portion_scaling import scale_macros, scale_nutrients, multiple_based_factor
+from ..db.pantry import query as pantry_query
 from ..food_category import FoodCategory
 
 router = APIRouter()
@@ -91,20 +88,11 @@ async def add_pantry_item(req: PantryItemRequest, user_id: int = Depends(get_cur
     elif req.tracking_mode == "bulk":
         remaining = None  # bulk items don't track a count at all
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            item_id = await conn.fetchval(
-                """INSERT INTO pantry_items (user_id, food_name, source, source_id, category, serving_size,
-                       serving_unit, tracking_mode, remaining_servings, expiration_date,
-                       calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                   RETURNING id""",
-                user_id, req.food_name, req.source, req.source_id, req.category, req.serving_size,
-                req.serving_unit, req.tracking_mode, remaining, req.expiration_date,
-                req.calories, json.dumps(req.nutrients),
-            )
-            await write_nutrients(conn, "pantry_item", item_id, req.nutrients)
+    item_id = await pantry_query.create_pantry_item(
+        user_id, req.food_name, req.source, req.source_id, req.category, req.serving_size,
+        req.serving_unit, req.tracking_mode, remaining, req.expiration_date,
+        req.calories, req.nutrients,
+    )
     return {"status": "added", "id": item_id}
 
 
@@ -112,12 +100,7 @@ async def add_pantry_item(req: PantryItemRequest, user_id: int = Depends(get_cur
 async def list_pantry_items(user_id: int = Depends(get_current_user)):
     """Excludes finished items — matches the design doc's 'gone means
     gone' behavior for bulk items marked finished."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM pantry_items WHERE user_id = $1 AND is_finished = FALSE ORDER BY expiration_date NULLS LAST, added_at",
-            user_id,
-        )
+    rows = await pantry_query.list_pantry_items(user_id)
     return {"items": [_row_to_item(r) for r in rows]}
 
 
@@ -128,16 +111,7 @@ async def get_expiring_items(days: int = Query(7, ge=0), user_id: int = Depends(
     date set — those never 'expire' by definition."""
     cutoff = (date_cls.today() + timedelta(days=days)).isoformat()
     today = date_cls.today().isoformat()
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT * FROM pantry_items
-               WHERE user_id = $1 AND is_finished = FALSE
-                 AND expiration_date IS NOT NULL
-                 AND expiration_date <= $2
-               ORDER BY expiration_date""",
-            user_id, cutoff,
-        )
+    rows = await pantry_query.list_expiring_items(user_id, cutoff)
     return {
         "items": [_row_to_item(r) for r in rows],
         "as_of": today,
@@ -147,26 +121,16 @@ async def get_expiring_items(days: int = Query(7, ge=0), user_id: int = Depends(
 
 @router.patch("/{item_id}")
 async def update_pantry_item(item_id: int, req: PantryItemUpdateRequest, user_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        existing = await conn.fetchrow(
-            "SELECT * FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
-        )
-        if existing is None:
-            raise HTTPException(status_code=404, detail="Pantry item not found")
+    existing = await pantry_query.get_pantry_item_for_update(item_id, user_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Pantry item not found")
 
-        if req.tracking_mode is not None:
-            _validate_mode(req.tracking_mode)
+    if req.tracking_mode is not None:
+        _validate_mode(req.tracking_mode)
 
-        await conn.execute(
-            """UPDATE pantry_items SET
-                   remaining_servings = COALESCE($1, remaining_servings),
-                   expiration_date = COALESCE($2, expiration_date),
-                   tracking_mode = COALESCE($3, tracking_mode),
-                   updated_at = now()
-               WHERE id = $4 AND user_id = $5""",
-            req.remaining_servings, req.expiration_date, req.tracking_mode, item_id, user_id,
-        )
+    await pantry_query.update_pantry_item(
+        item_id, user_id, req.remaining_servings, req.expiration_date, req.tracking_mode,
+    )
     return {"status": "updated"}
 
 
@@ -180,14 +144,7 @@ async def delete_pantry_item(item_id: int, user_id: int = Depends(get_current_us
     its own, so calling delete_nutrient_facts for an item_id that turned
     out to belong to a different user (or not exist) would wipe that
     other user's row instead of a no-op."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await conn.execute(
-                "DELETE FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
-            )
-            if result != "DELETE 0":
-                await delete_nutrient_facts(conn, "pantry_item", item_id)
+    await pantry_query.delete_pantry_item(item_id, user_id)
     return {"status": "deleted"}
 
 
@@ -197,15 +154,8 @@ async def finish_pantry_item(item_id: int, user_id: int = Depends(get_current_us
     design doc's 'gone means gone' reasoning — no soft-delete state to
     manage for a finished item). Same delete-then-conditionally-clean-up
     ordering as delete_pantry_item above, for the same reason."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await conn.execute(
-                "DELETE FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
-            )
-            if result != "DELETE 0":
-                await delete_nutrient_facts(conn, "pantry_item", item_id)
-    if result == "DELETE 0":
+    deleted = await pantry_query.finish_pantry_item(item_id, user_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Pantry item not found")
     return {"status": "finished"}
 
@@ -229,62 +179,15 @@ async def consume_pantry_item(item_id: int, req: ConsumeRequest, user_id: int = 
     if req.servings <= 0:
         raise HTTPException(status_code=400, detail="servings must be positive")
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            item = await conn.fetchrow(
-                "SELECT * FROM pantry_items WHERE id = $1 AND user_id = $2 FOR UPDATE",
-                item_id, user_id,
-            )
-            if item is None:
-                raise HTTPException(status_code=404, detail="Pantry item not found")
-
-            if item["tracking_mode"] == "countable":
-                if item["remaining_servings"] is None or req.servings > item["remaining_servings"]:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Cannot consume {req.servings} servings — only "
-                                f"{item['remaining_servings']} remaining",
-                    )
-
-            factor = multiple_based_factor(req.servings)
-            macros = scale_macros({"calories": item["calories"]}, factor)
-            # Protein/carbs/fat/fiber scale as part of the stored
-            # nutrients dict below, not as macros — they were stored
-            # there at add-time (add_pantry_item), same as every other
-            # non-macro nutrient.
-            stored_nutrients = json.loads(item["nutrients_json"]) if item["nutrients_json"] else {}
-            nutrients = scale_nutrients(stored_nutrients, factor)
-
-            food_log_id = await conn.fetchval(
-                """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       category, serving_size, serving_unit, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                   RETURNING id""",
-                user_id, req.date, req.meal, item["food_name"], item["source"], item["source_id"],
-                item["category"], req.servings, item["serving_unit"], macros["calories"], json.dumps(nutrients),
-            )
-            await write_nutrients(conn, "food_log", food_log_id, nutrients)
-
-            pantry_status = "unchanged"
-            if item["tracking_mode"] == "single":
-                await delete_nutrient_facts(conn, "pantry_item", item_id)
-                await conn.execute("DELETE FROM pantry_items WHERE id = $1", item_id)
-                pantry_status = "removed"
-            elif item["tracking_mode"] == "countable":
-                new_remaining = item["remaining_servings"] - req.servings
-                if new_remaining <= 0:
-                    await delete_nutrient_facts(conn, "pantry_item", item_id)
-                    await conn.execute("DELETE FROM pantry_items WHERE id = $1", item_id)
-                    pantry_status = "removed"
-                else:
-                    await conn.execute(
-                        "UPDATE pantry_items SET remaining_servings = $1, updated_at = now() WHERE id = $2",
-                        new_remaining, item_id,
-                    )
-                    pantry_status = "decremented"
-
-    return {"status": "logged", "food_log_id": food_log_id, "pantry_status": pantry_status}
+    result = await pantry_query.consume_pantry_item(item_id, user_id, req.servings, req.date, req.meal)
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Pantry item not found")
+    if result.get("error") == "insufficient":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot consume {req.servings} servings — only {result['remaining']} remaining",
+        )
+    return {"status": "logged", "food_log_id": result["food_log_id"], "pantry_status": result["pantry_status"]}
 
 
 @router.post("/{item_id}/remove")
@@ -298,41 +201,21 @@ async def remove_pantry_servings(item_id: int, req: RemoveServingsRequest, user_
     if req.servings <= 0:
         raise HTTPException(status_code=400, detail="servings must be positive")
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            item = await conn.fetchrow(
-                "SELECT * FROM pantry_items WHERE id = $1 AND user_id = $2 FOR UPDATE",
-                item_id, user_id,
-            )
-            if item is None:
-                raise HTTPException(status_code=404, detail="Pantry item not found")
-            if item["tracking_mode"] != "countable":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Only countable items support partial removal — use DELETE /{id} for single "
-                           "items or POST /{id}/finish for bulk items",
-                )
-            if item["remaining_servings"] is None or req.servings > item["remaining_servings"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot remove {req.servings} servings — only "
-                            f"{item['remaining_servings']} remaining",
-                )
-
-            new_remaining = item["remaining_servings"] - req.servings
-            if new_remaining <= 0:
-                await delete_nutrient_facts(conn, "pantry_item", item_id)
-                await conn.execute("DELETE FROM pantry_items WHERE id = $1", item_id)
-                pantry_status = "removed"
-            else:
-                await conn.execute(
-                    "UPDATE pantry_items SET remaining_servings = $1, updated_at = now() WHERE id = $2",
-                    new_remaining, item_id,
-                )
-                pantry_status = "decremented"
-
-    return {"status": "removed_no_log", "pantry_status": pantry_status}
+    result = await pantry_query.remove_pantry_servings(item_id, user_id, req.servings)
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Pantry item not found")
+    if result.get("error") == "not_countable":
+        raise HTTPException(
+            status_code=400,
+            detail="Only countable items support partial removal — use DELETE /{id} for single "
+                   "items or POST /{id}/finish for bulk items",
+        )
+    if result.get("error") == "insufficient":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot remove {req.servings} servings — only {result['remaining']} remaining",
+        )
+    return {"status": "removed_no_log", "pantry_status": result["pantry_status"]}
 
 
 def _row_to_item(r) -> dict:
