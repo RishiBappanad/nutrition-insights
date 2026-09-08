@@ -39,8 +39,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
-from ..db import get_pool
-from ..nutrient_facts import read_nutrients_bulk
+from ..db.events import query as events_query
 from ..food_category import FoodCategory
 from ..food_entry_contract import (
     FoodLogEntryContract, ExerciseLogContract, log_food_entry, log_exercise_entry,
@@ -249,24 +248,13 @@ async def _query_events(
         raise HTTPException(status_code=400, detail=f"unknown event_type {event_type!r} — must be one of {sorted(VALID_EVENT_TYPES)}")
 
     events: list[dict] = []
-    pool = await get_pool()
 
     if event_type is None or event_type == "food_entry":
-        async with pool.acquire() as conn:
-            food_rows = await conn.fetch(
-                "SELECT * FROM food_log WHERE user_id = $1 AND date >= $2 AND date <= $3 ORDER BY date",
-                user_id, start, end,
-            )
-            entry_ids = [r["id"] for r in food_rows]
-            nutrients_by_entry = await read_nutrients_bulk(conn, "food_log", entry_ids)
+        food_rows, nutrients_by_entry = await events_query.list_food_log_events(user_id, start, end)
         events.extend(_food_row_to_event(r, nutrients_by_entry.get(r["id"], {})) for r in food_rows)
 
     if event_type is None or event_type == "exercise_activity":
-        async with pool.acquire() as conn:
-            exercise_rows = await conn.fetch(
-                "SELECT * FROM exercise_log WHERE user_id = $1 AND date >= $2 AND date <= $3 ORDER BY date",
-                user_id, start, end,
-            )
+        exercise_rows = await events_query.list_exercise_log_events(user_id, start, end)
         events.extend(_exercise_row_to_event(r) for r in exercise_rows)
 
     if source is not None:
