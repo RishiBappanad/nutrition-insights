@@ -6,7 +6,7 @@ from ..user_db import (
     query_nutrition, query_orm, get_nutrition_metrics, get_exercises,
     upsert_daily_nutrition, upsert_tdee_log, get_metric_series,
 )
-from ..db import get_pool
+from ..db.data import query as data_query
 
 router = APIRouter()
 
@@ -139,13 +139,7 @@ async def get_lift_insights(
     # would see every lift day correlate against nothing.
     metric_series = await get_metric_series(user_id, nutrition_metric)
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        # Get ORM dates for this exercise
-        orm_rows = await conn.fetch(
-            "SELECT date, orm FROM lift_orm WHERE user_id = $1 AND exercise = $2 ORDER BY date",
-            user_id, exercise,
-        )
+    orm_rows = await data_query.list_lift_orm(user_id, exercise)
 
     # For each lift day, get rolling avg of nutrition metric from prior days
     from datetime import datetime, timedelta
@@ -179,17 +173,7 @@ async def reset_user_data(user_id: int = Depends(get_current_user)):
     """Delete all nutrition and lift data for the current user. Does not delete credentials."""
     data_dir = user_data_dir(user_id)
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(
-                "DELETE FROM nutrient_facts WHERE owner_type = 'food_log' "
-                "AND owner_id IN (SELECT id FROM food_log WHERE user_id = $1)",
-                user_id,
-            )
-            await conn.execute("DELETE FROM daily_nutrition WHERE user_id = $1", user_id)
-            await conn.execute("DELETE FROM lift_orm WHERE user_id = $1", user_id)
-            await conn.execute("DELETE FROM food_log WHERE user_id = $1", user_id)
+    await data_query.reset_user_nutrition_lift_data(user_id)
 
     # Remove CSV files (from old syncs) but keep the directory
     for pattern in ["cronometer_*.csv", "hevy_workouts.csv", "tdee_tracking_log.csv"]:
