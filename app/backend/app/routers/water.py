@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
-from ..db import get_pool
+from ..db.water import query as water_query
 
 router = APIRouter()
 
@@ -34,12 +34,7 @@ def default_water_target_ml(sex: str) -> float:
 async def log_water(req: WaterLogRequest, user_id: int = Depends(get_current_user)):
     if req.amount_ml <= 0:
         raise HTTPException(status_code=400, detail="amount_ml must be positive")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        entry_id = await conn.fetchval(
-            "INSERT INTO water_log (user_id, date, amount_ml) VALUES ($1, $2, $3) RETURNING id",
-            user_id, req.date, req.amount_ml,
-        )
+    entry_id = await water_query.insert_water_log(user_id, req.date, req.amount_ml)
     return {"status": "logged", "id": entry_id}
 
 
@@ -47,15 +42,8 @@ async def log_water(req: WaterLogRequest, user_id: int = Depends(get_current_use
 async def get_water_log(date: str = Query(...), user_id: int = Depends(get_current_user)):
     """Entries for the day plus the total and resolved daily target
     (custom override if set on user_profile, else the sex-based default)."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, amount_ml, logged_at FROM water_log WHERE user_id = $1 AND date = $2 ORDER BY logged_at",
-            user_id, date,
-        )
-        profile = await conn.fetchrow(
-            "SELECT sex, water_target_ml FROM user_profile WHERE user_id = $1", user_id
-        )
+    rows = await water_query.list_water_log(user_id, date)
+    profile = await water_query.get_water_profile(user_id)
 
     total_ml = sum(r["amount_ml"] for r in rows)
     if profile and profile["water_target_ml"] is not None:
@@ -79,9 +67,5 @@ async def delete_water_entry(entry_id: int, user_id: int = Depends(get_current_u
     """Scoped to the current user, matching the existing food_log delete
     pattern — a user can never delete another user's entry even if they
     guess an id."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM water_log WHERE id = $1 AND user_id = $2", entry_id, user_id
-        )
+    await water_query.delete_water_log(entry_id, user_id)
     return {"status": "deleted"}
