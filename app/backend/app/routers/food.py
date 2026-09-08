@@ -2,10 +2,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from ..routers.auth import get_current_user
 from ..db import get_pool
+from ..db.food import query as food_query
 from ..portion_scaling import scale_food_entry
 from ..food_entry_contract import FoodLogEntryContract, log_food_entry
 from ..nutrient_groups import order_nutrients
-from ..nutrient_facts import read_nutrients_bulk, delete_nutrient_facts
 
 router = APIRouter()
 
@@ -70,12 +70,7 @@ async def _search_user_recipes(user_id: int, query: str) -> list[dict]:
     reference unit."""
     from .recipes import _get_recipe_with_items
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, name, servings_per_batch FROM recipes WHERE user_id = $1 AND name ILIKE $2 ORDER BY name",
-            user_id, f"%{query}%",
-        )
+    rows = await food_query.search_recipes_by_name(user_id, query)
 
     results = []
     for row in rows:
@@ -143,12 +138,7 @@ async def _search_user_meals(user_id: int, query: str) -> list[dict]:
     no per-item breakdown) — see search_food()'s docstring."""
     from .meals import _get_meal_with_items
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, name FROM meals WHERE user_id = $1 AND name ILIKE $2 ORDER BY name",
-            user_id, f"%{query}%",
-        )
+    rows = await food_query.search_meals_by_name(user_id, query)
 
     results = []
     for row in rows:
@@ -315,14 +305,7 @@ async def get_food_log(
     `nutrients`/`nutrient_totals` (under "Protein", "Carbohydrate, by
     difference", "Total lipid (fat)", "Fiber, total dietary") like every
     other nutrient, not their own fields in `entries`/`totals` below."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM food_log WHERE user_id = $1 AND date = $2 ORDER BY id",
-            user_id, date,
-        )
-        entry_ids = [r["id"] for r in rows]
-        nutrients_by_entry = await read_nutrients_bulk(conn, "food_log", entry_ids)
+    rows, nutrients_by_entry = await food_query.list_food_log(user_id, date)
 
     entries = []
     nutrient_totals: dict[str, dict] = {}
@@ -360,11 +343,5 @@ async def delete_food_entry(
     delete another user's entry by guessing an id. nutrient_facts has no FK
     to cascade automatically (see app/nutrient_facts.py), so its rows for
     this entry are deleted explicitly first."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await delete_nutrient_facts(conn, "food_log", entry_id)
-            await conn.execute(
-                "DELETE FROM food_log WHERE id = $1 AND user_id = $2", entry_id, user_id
-            )
+    await food_query.delete_food_entry(entry_id, user_id)
     return {"status": "deleted"}
