@@ -3,15 +3,13 @@ at face value. Deliberately simpler than recipes (routers/recipes.py) --
 no servings-per-batch, no scaling, no pantry availability check. A meal
 is just "these items, saved together, logged all at once" (e.g. "My usual
 breakfast" = eggs + toast + coffee, always logged as that exact trio)."""
-import json
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
-from ..db import get_pool
-from ..nutrient_facts import write_nutrients, read_nutrients_bulk, delete_nutrient_facts, delete_nutrient_facts_bulk
+from ..db.meals import query as meals_query
 from ..food_category import FoodCategory, resolve_category
 
 router = APIRouter()
@@ -55,71 +53,30 @@ class LogMealRequest(BaseModel):
     into its per-item entries via POST /meals/{id}/explode/{food_log_id}."""
 
 
-async def _save_items(conn, meal_id: int, items: list[MealItemRequest]):
-    for item in items:
-        item_id = await conn.fetchval(
-            """INSERT INTO meal_items (meal_id, food_name, source, source_id, category, serving_size, serving_unit,
-                   calories, nutrients_json)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-               RETURNING id""",
-            meal_id, item.food_name, item.source, item.source_id, item.category,
-            item.serving_size, item.serving_unit, item.calories, json.dumps(item.nutrients),
-        )
-        await write_nutrients(conn, "meal_item", item_id, item.nutrients)
+# food.py's _search_user_meals imports this directly (`from .meals import
+# _get_meal_with_items`) -- kept as an alias so that import keeps working
+# unchanged now that the real implementation lives in db/meals/query.py.
+_get_meal_with_items = meals_query.get_meal_with_items
 
 
 @router.post("")
 async def create_meal(req: MealRequest, user_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            resolved_category, category_is_custom = resolve_category(
-                req.category, [item.model_dump() for item in req.items],
-            )
-            meal_id = await conn.fetchval(
-                "INSERT INTO meals (user_id, name, category, category_is_custom) VALUES ($1, $2, $3, $4) RETURNING id",
-                user_id, req.name, resolved_category, category_is_custom,
-            )
-            await _save_items(conn, meal_id, req.items)
+    resolved_category, category_is_custom = resolve_category(
+        req.category, [item.model_dump() for item in req.items],
+    )
+    meal_id = await meals_query.create_meal(user_id, req.name, resolved_category, category_is_custom, req.items)
     return {"status": "created", "id": meal_id}
 
 
 @router.get("")
 async def list_meals(user_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, name, category FROM meals WHERE user_id = $1 ORDER BY name", user_id)
+    rows = await meals_query.list_meals(user_id)
     return {"meals": [{"id": r["id"], "name": r["name"], "category": r["category"]} for r in rows]}
-
-
-async def _get_meal_with_items(conn, meal_id: int, user_id: int):
-    meal = await conn.fetchrow("SELECT * FROM meals WHERE id = $1 AND user_id = $2", meal_id, user_id)
-    if meal is None:
-        return None, []
-    item_rows = await conn.fetch("SELECT * FROM meal_items WHERE meal_id = $1 ORDER BY id", meal_id)
-    item_ids = [r["id"] for r in item_rows]
-    nutrients_by_item = await read_nutrients_bulk(conn, "meal_item", item_ids)
-    items = []
-    for r in item_rows:
-        items.append({
-            "id": r["id"],
-            "food_name": r["food_name"],
-            "source": r["source"],
-            "source_id": r["source_id"],
-            "category": r["category"],
-            "serving_size": r["serving_size"],
-            "serving_unit": r["serving_unit"],
-            "calories": r["calories"],
-            "nutrients": nutrients_by_item.get(r["id"], {}),
-        })
-    return meal, items
 
 
 @router.get("/{meal_id}")
 async def get_meal(meal_id: int, user_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        meal, items = await _get_meal_with_items(conn, meal_id, user_id)
+    meal, items = await meals_query.get_meal_with_items_new_conn(meal_id, user_id)
     if meal is None:
         raise HTTPException(status_code=404, detail="Meal not found")
     return {
@@ -130,27 +87,13 @@ async def get_meal(meal_id: int, user_id: int = Depends(get_current_user)):
 
 @router.put("/{meal_id}")
 async def update_meal(meal_id: int, req: MealRequest, user_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            existing = await conn.fetchrow(
-                "SELECT id, category, category_is_custom FROM meals WHERE id = $1 AND user_id = $2", meal_id, user_id
-            )
-            if existing is None:
-                raise HTTPException(status_code=404, detail="Meal not found")
-            resolved_category, category_is_custom = resolve_category(
-                req.category, [item.model_dump() for item in req.items], dict(existing),
-            )
-            await conn.execute(
-                "UPDATE meals SET name = $1, category = $2, category_is_custom = $3, updated_at = now() WHERE id = $4",
-                req.name, resolved_category, category_is_custom, meal_id,
-            )
-            old_item_ids = [r["id"] for r in await conn.fetch(
-                "SELECT id FROM meal_items WHERE meal_id = $1", meal_id
-            )]
-            await delete_nutrient_facts_bulk(conn, "meal_item", old_item_ids)
-            await conn.execute("DELETE FROM meal_items WHERE meal_id = $1", meal_id)
-            await _save_items(conn, meal_id, req.items)
+    existing = await meals_query.get_meal_for_update(meal_id, user_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    resolved_category, category_is_custom = resolve_category(
+        req.category, [item.model_dump() for item in req.items], dict(existing),
+    )
+    await meals_query.update_meal(meal_id, req.name, resolved_category, category_is_custom, req.items)
     return {"status": "updated"}
 
 
@@ -160,23 +103,7 @@ async def delete_meal(meal_id: int, user_id: int = Depends(get_current_user)):
     deleting a meal auto-deletes its items -- but their nutrient_facts
     rows don't cascade (nutrient_facts has no FK at all, see
     app/nutrient_facts.py), so those are cleared explicitly first."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            # Ownership-scoped join, not a bare meal_id lookup -- without
-            # the meals.user_id check here, a caller could trigger deletion
-            # of another user's meal_item nutrient_facts rows (the actual
-            # meals DELETE below is correctly user-scoped and would affect
-            # 0 rows in that case, but the item lookup above it must be
-            # scoped too, or it runs before that no-op is ever reached).
-            item_ids = [r["id"] for r in await conn.fetch(
-                """SELECT mi.id FROM meal_items mi
-                   JOIN meals m ON m.id = mi.meal_id
-                   WHERE mi.meal_id = $1 AND m.user_id = $2""",
-                meal_id, user_id,
-            )]
-            await delete_nutrient_facts_bulk(conn, "meal_item", item_ids)
-            await conn.execute("DELETE FROM meals WHERE id = $1 AND user_id = $2", meal_id, user_id)
+    await meals_query.delete_meal(meal_id, user_id)
     return {"status": "deleted"}
 
 
@@ -196,48 +123,28 @@ async def log_meal(meal_id: int, req: LogMealRequest, user_id: int = Depends(get
     POST /meals/{meal_id}/explode/{food_log_id} afterward to convert that
     one entry back into its per-item entries, if wanted later.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        meal, items = await _get_meal_with_items(conn, meal_id, user_id)
-        if meal is None:
-            raise HTTPException(status_code=404, detail="Meal not found")
+    meal, items = await meals_query.get_meal_with_items_new_conn(meal_id, user_id)
+    if meal is None:
+        raise HTTPException(status_code=404, detail="Meal not found")
 
-        if req.combined:
-            macros = {"calories": 0.0}
-            nutrients: dict = {}
-            for item in items:
-                macros["calories"] += item.get("calories", 0) or 0
-                # Protein/carbs/fat/fiber are summed here along with every
-                # other non-macro nutrient.
-                for name, info in item.get("nutrients", {}).items():
-                    bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
-                    bucket["value"] += info["value"]
+    if req.combined:
+        macros = {"calories": 0.0}
+        nutrients: dict = {}
+        for item in items:
+            macros["calories"] += item.get("calories", 0) or 0
+            # Protein/carbs/fat/fiber are summed here along with every
+            # other non-macro nutrient.
+            for name, info in item.get("nutrients", {}).items():
+                bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
+                bucket["value"] += info["value"]
 
-            async with conn.transaction():
-                food_log_id = await conn.fetchval(
-                    """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                           category, serving_size, serving_unit, calories, nutrients_json)
-                       VALUES ($1, $2, $3, $4, 'meal', $5, $6, 1, 'meal', $7, $8)
-                       RETURNING id""",
-                    user_id, req.date, req.meal, meal["name"], str(meal_id), meal["category"],
-                    macros["calories"], json.dumps(nutrients),
-                )
-                await write_nutrients(conn, "food_log", food_log_id, nutrients)
-            return {"status": "logged", "food_log_ids": [food_log_id], "combined": True}
+        food_log_id = await meals_query.insert_combined_meal_log(
+            user_id, req.date, req.meal, meal["name"], str(meal_id), meal["category"],
+            macros["calories"], nutrients,
+        )
+        return {"status": "logged", "food_log_ids": [food_log_id], "combined": True}
 
-        food_log_ids = []
-        async with conn.transaction():
-            for item in items:
-                food_log_id = await conn.fetchval(
-                    """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                           category, serving_size, serving_unit, calories, nutrients_json)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                       RETURNING id""",
-                    user_id, req.date, req.meal, item["food_name"], item["source"], item["source_id"],
-                    item["category"], item["serving_size"], item["serving_unit"], item["calories"], json.dumps(item["nutrients"]),
-                )
-                food_log_ids.append(food_log_id)
-                await write_nutrients(conn, "food_log", food_log_id, item["nutrients"])
+    food_log_ids = await meals_query.insert_exploded_meal_items_log(user_id, req.date, req.meal, items)
     return {"status": "logged", "food_log_ids": food_log_ids, "combined": False}
 
 
@@ -256,32 +163,15 @@ async def explode_meal_entry(meal_id: int, food_log_id: int, user_id: int = Depe
     corrupt an unrelated diary entry, so all four are checked explicitly
     rather than trusting the caller's meal_id/food_log_id pairing.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        entry = await conn.fetchrow(
-            "SELECT * FROM food_log WHERE id = $1 AND user_id = $2 AND source = 'meal' AND source_id = $3",
-            food_log_id, user_id, str(meal_id),
-        )
-        if entry is None:
-            raise HTTPException(status_code=404, detail="Combined meal entry not found for this meal_id/food_log_id")
+    entry = await meals_query.get_combined_meal_log_entry(food_log_id, user_id, meal_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Combined meal entry not found for this meal_id/food_log_id")
 
-        meal, items = await _get_meal_with_items(conn, meal_id, user_id)
-        if meal is None:
-            raise HTTPException(status_code=404, detail="Meal not found")
+    meal, items = await meals_query.get_meal_with_items_new_conn(meal_id, user_id)
+    if meal is None:
+        raise HTTPException(status_code=404, detail="Meal not found")
 
-        food_log_ids = []
-        async with conn.transaction():
-            await delete_nutrient_facts(conn, "food_log", food_log_id)
-            await conn.execute("DELETE FROM food_log WHERE id = $1", food_log_id)
-            for item in items:
-                new_id = await conn.fetchval(
-                    """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                           category, serving_size, serving_unit, calories, nutrients_json)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                       RETURNING id""",
-                    user_id, entry["date"], entry["meal"], item["food_name"], item["source"], item["source_id"],
-                    item["category"], item["serving_size"], item["serving_unit"], item["calories"], json.dumps(item["nutrients"]),
-                )
-                food_log_ids.append(new_id)
-                await write_nutrients(conn, "food_log", new_id, item["nutrients"])
+    food_log_ids = await meals_query.replace_combined_entry_with_items(
+        food_log_id, user_id, entry["date"], entry["meal"], items,
+    )
     return {"status": "exploded", "food_log_ids": food_log_ids}
