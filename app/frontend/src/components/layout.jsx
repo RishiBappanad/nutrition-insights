@@ -15,7 +15,10 @@ import {
   Refrigerator,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { AppSwitcher, MobileAppSwitcher } from '@/components/app-switcher'
+import { AppSwitcher, MobileAppSwitcher } from 'trackstack-ui'
+
+const TRACKSTACK_AUTH_URL = import.meta.env.VITE_TRACKSTACK_AUTH_URL ?? ''
+const CURRENT_APP_ID = 'nutrition'
 
 // Log Food, Recipes, and Meals are intentionally NOT persistent sidebar
 // items — they're all diary-logging entry points, surfaced instead as
@@ -42,7 +45,7 @@ export function Layout({ children, onLogout }) {
     <div className="flex min-h-screen w-full bg-background">
       {/* Desktop: App Switcher + Sidebar */}
       <div className="hidden md:flex">
-        <AppSwitcher />
+        <AppSwitcher authBaseUrl={TRACKSTACK_AUTH_URL} currentAppId={CURRENT_APP_ID} />
         <aside className="w-56 flex-shrink-0 bg-sidebar border-r border-sidebar-border flex flex-col">
           <div className="h-14 flex items-center px-5 border-b border-sidebar-border">
             <div className="flex items-center gap-2 text-sidebar-foreground">
@@ -94,7 +97,7 @@ export function Layout({ children, onLogout }) {
       {/* Main content wrapper */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Mobile: App switcher bar + header */}
-        <MobileAppSwitcher />
+        <MobileAppSwitcher authBaseUrl={TRACKSTACK_AUTH_URL} currentAppId={CURRENT_APP_ID} />
         <header className="h-12 md:hidden flex items-center justify-between px-4 border-b border-border bg-card">
           <div className="flex items-center gap-2">
             <Apple className="h-4 w-4 text-primary" />
