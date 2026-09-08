@@ -6,7 +6,8 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from ..routers.auth import get_current_user
 from ..routers.data import user_data_dir
-from ..db import get_pool, decrypt
+from ..db import decrypt
+from ..db.sync import query as sync_query
 from integrations.cronometer_rpc import open_cronometer_export
 
 logger = logging.getLogger(__name__)
@@ -15,9 +16,7 @@ router = APIRouter()
 
 
 async def _get_user_creds(user_id: int) -> dict:
-    pool = await get_pool()
-    async with pool.acquire() as db:
-        creds = await db.fetchrow("SELECT * FROM credentials WHERE user_id = $1", user_id)
+    creds = await sync_query.get_credentials(user_id)
     if not creds:
         raise HTTPException(status_code=400, detail="No credentials saved. Use /auth/credentials first.")
     return {
@@ -558,14 +557,11 @@ async def list_cronometer_recipes(user_id: int = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Cronometer credentials not set")
 
     from integrations.cronometer_rpc import CronometerRPCClient
-    from ..db import get_pool
 
     try:
         # Get existing imported recipe source_ids for this user
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("SELECT source_id FROM recipes WHERE user_id = $1 AND source = 'Cronometer'", user_id)
-            imported_set = {r["source_id"] for r in rows if r["source_id"]}
+        rows = await sync_query.list_cronometer_recipe_source_ids(user_id)
+        imported_set = {r["source_id"] for r in rows if r["source_id"]}
 
         client = CronometerRPCClient(creds["cronometer_username"], creds["cronometer_password"])
         client.login()
