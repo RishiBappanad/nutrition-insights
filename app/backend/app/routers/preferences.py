@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 
 from ..routers.auth import get_current_user
-from ..db import get_pool
+from ..db.preferences import query as preferences_query
 from ..nutrient_groups import IMPORTANT_TO_ME_STARTER_PRESETS, VITAMIN_GROUP, MINERAL_GROUP
 
 router = APIRouter()
@@ -108,9 +108,7 @@ async def get_preferences(user_id: int = Depends(get_current_user)):
     """Always returns a complete colors map (stored overrides merged over
     defaults) and resolved scalar preferences — the frontend never needs
     its own fallback logic for a partially-set preferences row."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM user_preferences WHERE user_id = $1", user_id)
+    row = await preferences_query.get_preferences_row(user_id)
 
     stored_colors = json.loads(row["colors_json"]) if row and row["colors_json"] else {}
     colors = {**DEFAULT_COLORS, **stored_colors}
@@ -147,40 +145,29 @@ async def set_preferences(req: PreferencesRequest, user_id: int = Depends(get_cu
     default, if never set). Mirrors nutrition_targets.py's
     is_custom-preserving pattern: a user setting one preference shouldn't
     reset every other preference back to default."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        existing = await conn.fetchrow("SELECT * FROM user_preferences WHERE user_id = $1", user_id)
-        current_colors = json.loads(existing["colors_json"]) if existing and existing["colors_json"] else {}
-        merged_colors = {**current_colors, **req.colors}
+    existing = await preferences_query.get_preferences_row(user_id)
+    current_colors = json.loads(existing["colors_json"]) if existing and existing["colors_json"] else {}
+    merged_colors = {**current_colors, **req.colors}
 
-        threshold = req.sufficiency_threshold_pct
-        if threshold is None and existing:
-            threshold = existing["sufficiency_threshold_pct"]
+    threshold = req.sufficiency_threshold_pct
+    if threshold is None and existing:
+        threshold = existing["sufficiency_threshold_pct"]
 
-        unit_system = req.unit_system
-        if unit_system is None and existing:
-            unit_system = existing["unit_system"]
+    unit_system = req.unit_system
+    if unit_system is None and existing:
+        unit_system = existing["unit_system"]
 
-        macro_chart_style = req.macro_chart_style
-        if macro_chart_style is None and existing:
-            macro_chart_style = existing["macro_chart_style"]
+    macro_chart_style = req.macro_chart_style
+    if macro_chart_style is None and existing:
+        macro_chart_style = existing["macro_chart_style"]
 
-        important_nutrients_json = existing["important_nutrients_json"] if existing else None
-        if req.important_nutrients is not None:
-            important_nutrients_json = json.dumps(req.important_nutrients)
+    important_nutrients_json = existing["important_nutrients_json"] if existing else None
+    if req.important_nutrients is not None:
+        important_nutrients_json = json.dumps(req.important_nutrients)
 
-        await conn.execute(
-            """INSERT INTO user_preferences (user_id, colors_json, sufficiency_threshold_pct, unit_system, macro_chart_style, important_nutrients_json, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, now())
-               ON CONFLICT (user_id) DO UPDATE SET
-                   colors_json = EXCLUDED.colors_json,
-                   sufficiency_threshold_pct = EXCLUDED.sufficiency_threshold_pct,
-                   unit_system = EXCLUDED.unit_system,
-                   macro_chart_style = EXCLUDED.macro_chart_style,
-                   important_nutrients_json = EXCLUDED.important_nutrients_json,
-                   updated_at = now()""",
-            user_id, json.dumps(merged_colors), threshold, unit_system, macro_chart_style, important_nutrients_json,
-        )
+    await preferences_query.upsert_preferences(
+        user_id, json.dumps(merged_colors), threshold, unit_system, macro_chart_style, important_nutrients_json,
+    )
 
     return {
         "colors": {**DEFAULT_COLORS, **merged_colors},
@@ -194,9 +181,7 @@ async def set_preferences(req: PreferencesRequest, user_id: int = Depends(get_cu
 @router.delete("")
 async def reset_preferences(user_id: int = Depends(get_current_user)):
     """Reset everything back to defaults."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM user_preferences WHERE user_id = $1", user_id)
+    await preferences_query.delete_preferences(user_id)
     return {
         "colors": DEFAULT_COLORS,
         "sufficiency_threshold_pct": DEFAULT_SUFFICIENCY_THRESHOLD_PCT,
