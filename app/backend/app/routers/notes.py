@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
-from ..db import get_pool
+from ..db.notes import query as notes_query
 
 router = APIRouter()
 
@@ -25,14 +25,7 @@ class NoteRequest(BaseModel):
 async def set_note(req: NoteRequest, user_id: int = Depends(get_current_user)):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text must not be empty — use DELETE to remove a note")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO diary_notes (user_id, date, text, updated_at)
-               VALUES ($1, $2, $3, now())
-               ON CONFLICT (user_id, date) DO UPDATE SET text = EXCLUDED.text, updated_at = now()""",
-            user_id, req.date, req.text,
-        )
+    await notes_query.upsert_note(user_id, req.date, req.text)
     return {"status": "saved"}
 
 
@@ -41,12 +34,7 @@ async def get_note(date: str = Query(...), user_id: int = Depends(get_current_us
     """Returns null fields (not a 404) when no note exists for the date —
     'no note yet' is a normal, expected state for a diary day, not an
     error condition."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT text, attachment_url, updated_at FROM diary_notes WHERE user_id = $1 AND date = $2",
-            user_id, date,
-        )
+    row = await notes_query.get_note(user_id, date)
     if row is None:
         return {"date": date, "text": None, "attachment_url": None, "updated_at": None}
     return {
@@ -59,9 +47,5 @@ async def get_note(date: str = Query(...), user_id: int = Depends(get_current_us
 
 @router.delete("/")
 async def delete_note(date: str = Query(...), user_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM diary_notes WHERE user_id = $1 AND date = $2", user_id, date
-        )
+    await notes_query.delete_note(user_id, date)
     return {"status": "deleted"}
