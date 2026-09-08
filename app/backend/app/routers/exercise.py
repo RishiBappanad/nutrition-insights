@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
-from ..db import get_pool
+from ..db.exercise import query as exercise_query
 from ..food_entry_contract import ExerciseLogContract, log_exercise_entry
 
 router = APIRouter()
@@ -84,12 +84,7 @@ async def list_exercise_log(date: str = Query(...), user_id: int = Depends(get_c
     the frontend to sum) per this project's convention of resolving
     aggregates server-side (see targets.py's /progress for the same
     pattern)."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM exercise_log WHERE user_id = $1 AND date = $2 ORDER BY created_at",
-            user_id, date,
-        )
+    rows = await exercise_query.list_exercise_log(user_id, date)
     entries = [_row_to_entry(r) for r in rows]
     return {
         "date": date,
@@ -100,36 +95,17 @@ async def list_exercise_log(date: str = Query(...), user_id: int = Depends(get_c
 
 @router.patch("/{entry_id}")
 async def update_exercise_entry(entry_id: int, req: ExerciseLogUpdateRequest, user_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        existing = await conn.fetchrow(
-            "SELECT * FROM exercise_log WHERE id = $1 AND user_id = $2", entry_id, user_id
-        )
-        if existing is None:
-            raise HTTPException(status_code=404, detail="Exercise entry not found")
-
-        await conn.execute(
-            """UPDATE exercise_log SET
-                   date = COALESCE($1, date),
-                   activity_name = COALESCE($2, activity_name),
-                   duration_minutes = COALESCE($3, duration_minutes),
-                   calories_burned = COALESCE($4, calories_burned),
-                   notes = COALESCE($5, notes),
-                   updated_at = now()
-               WHERE id = $6 AND user_id = $7""",
-            req.date, req.activity_name, req.duration_minutes, req.calories_burned, req.notes,
-            entry_id, user_id,
-        )
+    existing = await exercise_query.update_exercise_entry(
+        entry_id, user_id, req.date, req.activity_name, req.duration_minutes, req.calories_burned, req.notes,
+    )
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Exercise entry not found")
     return {"status": "updated"}
 
 
 @router.delete("/{entry_id}")
 async def delete_exercise_entry(entry_id: int, user_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM exercise_log WHERE id = $1 AND user_id = $2", entry_id, user_id
-        )
+    result = await exercise_query.delete_exercise_entry(entry_id, user_id)
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Exercise entry not found")
     return {"status": "deleted"}
