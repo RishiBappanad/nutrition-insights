@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 from .db import get_pool
 from .nutrient_facts import write_nutrients, delete_nutrient_facts_bulk
+from .food_category import FoodCategory, resolve_category
 
 
 class FoodLogEntryContract(BaseModel):
@@ -42,6 +43,10 @@ class FoodLogEntryContract(BaseModel):
     food_name: str
     source: Optional[str] = None
     source_id: Optional[str] = None
+    # Food-type category (produce/protein/dairy/etc, see
+    # app/food_category.py) -- distinct from `meal` above. None is a
+    # real, honest "no source category data" state, not an omission.
+    category: Optional[FoodCategory] = None
     serving_size: float = 1.0
     serving_unit: str = "serving"
     # `calories` is the sole top-level numeric field — TrackStack's
@@ -61,6 +66,7 @@ class RecipeItemContract(BaseModel):
     food_name: str
     source: Optional[str] = None
     source_id: Optional[str] = None
+    category: Optional[FoodCategory] = None
     amount_grams: Optional[float] = None
     amount_multiple: Optional[float] = None
     calories: float = 0
@@ -72,11 +78,21 @@ class RecipeImportContract(BaseModel):
     RecipeRequest in routers/recipes.py. A source that has its own
     recipe concept (Cronometer, a future importer) converts to this
     model and calls import_recipe() below, rather than constructing
-    recipes/recipe_items rows directly."""
+    recipes/recipe_items rows directly.
+
+    `category`, left unset: import_recipe() computes the recipe's own
+    category as whichever category contributes the most total calories
+    across `items` (explicit user decision, 2026-09-08) and stores that
+    as the auto-computed default. Set `category` explicitly to override
+    that default instead — this is also how a human user overriding a
+    recipe's category at creation time flows through (see
+    routers/recipes.py's create_recipe, which delegates to
+    import_recipe() for exactly this reason)."""
     name: str
     servings_per_batch: float = 1.0
     source: Optional[str] = None
     source_id: Optional[str] = None
+    category: Optional[FoodCategory] = None
     items: list[RecipeItemContract] = []
 
 
@@ -122,11 +138,11 @@ async def log_food_entry(user_id: int, entry: FoodLogEntryContract) -> int:
         async with conn.transaction():
             food_log_id = await conn.fetchval(
                 """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       serving_size, serving_unit, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                       category, serving_size, serving_unit, calories, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                    RETURNING id""",
                 user_id, entry.date, entry.meal, entry.food_name, entry.source, entry.source_id,
-                entry.serving_size, entry.serving_unit, entry.calories, json.dumps(entry.nutrients),
+                entry.category, entry.serving_size, entry.serving_unit, entry.calories, json.dumps(entry.nutrients),
             )
             await write_nutrients(conn, "food_log", food_log_id, entry.nutrients)
     return food_log_id
@@ -147,16 +163,26 @@ async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
     async with pool.acquire() as conn:
         async with conn.transaction():
             recipe_id = None
+            existing = None
             if recipe.source and recipe.source_id:
-                recipe_id = await conn.fetchval(
-                    "SELECT id FROM recipes WHERE user_id = $1 AND source = $2 AND source_id = $3",
+                row = await conn.fetchrow(
+                    "SELECT id, category, category_is_custom FROM recipes WHERE user_id = $1 AND source = $2 AND source_id = $3",
                     user_id, recipe.source, recipe.source_id,
                 )
+                if row is not None:
+                    recipe_id = row["id"]
+                    existing = dict(row)
+
+            resolved_category, category_is_custom = resolve_category(
+                recipe.category, [item.model_dump() for item in recipe.items], existing,
+            )
 
             if recipe_id is not None:
                 await conn.execute(
-                    "UPDATE recipes SET name = $1, servings_per_batch = $2, updated_at = now() WHERE id = $3",
-                    recipe.name, recipe.servings_per_batch, recipe_id,
+                    """UPDATE recipes SET name = $1, servings_per_batch = $2,
+                           category = $3, category_is_custom = $4, updated_at = now()
+                       WHERE id = $5""",
+                    recipe.name, recipe.servings_per_batch, resolved_category, category_is_custom, recipe_id,
                 )
                 old_item_ids = [r["id"] for r in await conn.fetch(
                     "SELECT id FROM recipe_items WHERE recipe_id = $1", recipe_id
@@ -165,18 +191,20 @@ async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
                 await conn.execute("DELETE FROM recipe_items WHERE recipe_id = $1", recipe_id)
             else:
                 recipe_id = await conn.fetchval(
-                    "INSERT INTO recipes (user_id, name, servings_per_batch, source, source_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                    """INSERT INTO recipes (user_id, name, servings_per_batch, source, source_id, category, category_is_custom)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id""",
                     user_id, recipe.name, recipe.servings_per_batch, recipe.source, recipe.source_id,
+                    resolved_category, category_is_custom,
                 )
 
             for item in recipe.items:
                 item_id = await conn.fetchval(
-                    """INSERT INTO recipe_items (recipe_id, food_name, source, source_id, amount_grams, amount_multiple,
+                    """INSERT INTO recipe_items (recipe_id, food_name, source, source_id, category, amount_grams, amount_multiple,
                            calories, nutrients_json)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                        RETURNING id""",
-                    recipe_id, item.food_name, item.source, item.source_id, item.amount_grams, item.amount_multiple,
-                    item.calories, json.dumps(item.nutrients),
+                    recipe_id, item.food_name, item.source, item.source_id, item.category,
+                    item.amount_grams, item.amount_multiple, item.calories, json.dumps(item.nutrients),
                 )
                 await write_nutrients(conn, "recipe_item", item_id, item.nutrients)
     return recipe_id

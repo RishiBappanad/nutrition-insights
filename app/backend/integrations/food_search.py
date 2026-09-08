@@ -6,6 +6,8 @@ import requests
 import logging
 from typing import List, Dict, Optional
 
+from app.food_category import map_raw_category
+
 logger = logging.getLogger(__name__)
 
 USDA_BASE = "https://api.nal.usda.gov/fdc/v1"
@@ -70,12 +72,17 @@ def search_usda(query: str, page_size: int = 10) -> List[Dict]:
         for food in data.get("foods", []):
             nutrients = _normalize_energy(food.get("foodNutrients", []))
 
+            food_name = food["description"]
             results.append({
                 "source": "USDA",
                 "id": str(food["fdcId"]),
-                "name": food["description"],
+                "name": food_name,
                 "brand": food.get("brandName", ""),
-                "category": food.get("foodCategory", ""),
+                # Resolved to our fixed enum here, not just passed
+                # through raw -- see app/food_category.py. A food whose
+                # raw USDA category doesn't map to anything we recognize
+                # gets None, not a fabricated guess.
+                "category": map_raw_category(food.get("foodCategory", ""), food_name),
                 "nutrients": nutrients,
                 "serving_size": food.get("servingSize"),
                 "serving_unit": food.get("servingSizeUnit", "g"),
@@ -110,7 +117,13 @@ def search_cnf(query: str) -> List[Dict]:
                 "id": str(food_code),
                 "name": food.get("food_description", ""),
                 "brand": "",
-                "category": food.get("food_group", {}).get("food_group_name", ""),
+                # CNF's food-list endpoint never actually includes a
+                # food_group field (confirmed against a real response --
+                # the old `food.get("food_group", {})` lookup here was
+                # always silently returning {}, meaning "category" was
+                # always ""). Rather than keep pretending, this is
+                # honestly None until a real CNF category source is found.
+                "category": None,
                 "nutrients": nutrients,
                 "serving_size": 100,
                 "serving_unit": "g",

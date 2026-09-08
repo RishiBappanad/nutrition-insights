@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from ..routers.auth import get_current_user
 from ..db import get_pool
 from ..nutrient_facts import write_nutrients, read_nutrients, delete_nutrient_facts
+from ..food_category import FoodCategory, DEFAULT_CATEGORY
 
 router = APIRouter()
 
@@ -24,6 +25,12 @@ class CustomFoodRequest(BaseModel):
     reference_amount: float = 1.0
     reference_unit: str = "serving"
     reference_grams: Optional[float] = None  # None if this food has no known gram weight
+    # A custom food has no ingredients to compute a default category
+    # from (unlike recipes/meals), so this is simpler than those: an
+    # explicit value is used as-is, otherwise DEFAULT_CATEGORY. No
+    # category_is_custom column here for the same reason -- there's no
+    # auto-computed value it would ever need to distinguish itself from.
+    category: Optional[FoodCategory] = None
     # `calories` is the sole top-level numeric field. Protein/carbs/fat/
     # fiber belong in nutrients under their standard USDA names.
     calories: float = 0
@@ -37,11 +44,11 @@ async def create_custom_food(req: CustomFoodRequest, user_id: int = Depends(get_
         async with conn.transaction():
             food_id = await conn.fetchval(
                 """INSERT INTO custom_foods (user_id, food_name, brand, reference_amount, reference_unit,
-                       reference_grams, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                       reference_grams, category, calories, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                    RETURNING id""",
                 user_id, req.food_name, req.brand, req.reference_amount, req.reference_unit,
-                req.reference_grams, req.calories, json.dumps(req.nutrients),
+                req.reference_grams, req.category or DEFAULT_CATEGORY, req.calories, json.dumps(req.nutrients),
             )
             await write_nutrients(conn, "custom_food", food_id, req.nutrients)
     return {"status": "created", "id": food_id}
@@ -85,11 +92,11 @@ async def update_custom_food(food_id: int, req: CustomFoodRequest, user_id: int 
 
             await conn.execute(
                 """UPDATE custom_foods SET food_name=$1, brand=$2, reference_amount=$3, reference_unit=$4,
-                       reference_grams=$5, calories=$6,
-                       nutrients_json=$7, updated_at=now()
-                   WHERE id = $8""",
+                       reference_grams=$5, category=$6, calories=$7,
+                       nutrients_json=$8, updated_at=now()
+                   WHERE id = $9""",
                 req.food_name, req.brand, req.reference_amount, req.reference_unit, req.reference_grams,
-                req.calories, json.dumps(req.nutrients), food_id,
+                req.category or DEFAULT_CATEGORY, req.calories, json.dumps(req.nutrients), food_id,
             )
             await delete_nutrient_facts(conn, "custom_food", food_id)
             await write_nutrients(conn, "custom_food", food_id, req.nutrients)
@@ -114,5 +121,6 @@ def _row_to_food(r) -> dict:
         "reference_amount": r["reference_amount"],
         "reference_unit": r["reference_unit"],
         "reference_grams": r["reference_grams"],
+        "category": r["category"],
         "calories": r["calories"],
     }

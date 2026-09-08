@@ -22,6 +22,7 @@ from ..routers.auth import get_current_user
 from ..db import get_pool
 from ..nutrient_facts import write_nutrients, delete_nutrient_facts
 from ..portion_scaling import scale_macros, scale_nutrients, multiple_based_factor
+from ..food_category import FoodCategory
 
 router = APIRouter()
 
@@ -32,6 +33,11 @@ class PantryItemRequest(BaseModel):
     food_name: str
     source: Optional[str] = None
     source_id: Optional[str] = None
+    # Carried through as-is from whatever the caller has (e.g. a search
+    # result's already-resolved category, or a custom food's) -- a
+    # pantry item is a single item, not a composite, so there's no
+    # dominant-by-calories default to compute here.
+    category: Optional[FoodCategory] = None
     serving_size: float = 1.0
     serving_unit: str = "serving"
     tracking_mode: str = "countable"
@@ -89,12 +95,12 @@ async def add_pantry_item(req: PantryItemRequest, user_id: int = Depends(get_cur
     async with pool.acquire() as conn:
         async with conn.transaction():
             item_id = await conn.fetchval(
-                """INSERT INTO pantry_items (user_id, food_name, source, source_id, serving_size,
+                """INSERT INTO pantry_items (user_id, food_name, source, source_id, category, serving_size,
                        serving_unit, tracking_mode, remaining_servings, expiration_date,
                        calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                    RETURNING id""",
-                user_id, req.food_name, req.source, req.source_id, req.serving_size,
+                user_id, req.food_name, req.source, req.source_id, req.category, req.serving_size,
                 req.serving_unit, req.tracking_mode, remaining, req.expiration_date,
                 req.calories, json.dumps(req.nutrients),
             )
@@ -252,11 +258,11 @@ async def consume_pantry_item(item_id: int, req: ConsumeRequest, user_id: int = 
 
             food_log_id = await conn.fetchval(
                 """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       serving_size, serving_unit, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                       category, serving_size, serving_unit, calories, nutrients_json)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                    RETURNING id""",
                 user_id, req.date, req.meal, item["food_name"], item["source"], item["source_id"],
-                req.servings, item["serving_unit"], macros["calories"], json.dumps(nutrients),
+                item["category"], req.servings, item["serving_unit"], macros["calories"], json.dumps(nutrients),
             )
             await write_nutrients(conn, "food_log", food_log_id, nutrients)
 
@@ -335,6 +341,7 @@ def _row_to_item(r) -> dict:
         "food_name": r["food_name"],
         "source": r["source"],
         "source_id": r["source_id"],
+        "category": r["category"],
         "serving_size": r["serving_size"],
         "serving_unit": r["serving_unit"],
         "tracking_mode": r["tracking_mode"],

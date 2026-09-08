@@ -112,6 +112,13 @@ async def init_db():
             -- this feature and had no creation timestamp at all.
             ALTER TABLE food_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
+            -- Food-type category (produce/protein/dairy/etc, see
+            -- app/food_category.py) -- distinct from `meal` above
+            -- (Breakfast/Lunch/Dinner/Snack, when it was eaten). Nullable:
+            -- an item with no source category data honestly has none,
+            -- not a fabricated default.
+            ALTER TABLE food_log ADD COLUMN IF NOT EXISTS category TEXT;
+
             -- Normalized per-nutrient breakdown for ANY loggable item that
             -- needs one -- a food_log entry, a pantry item, a custom food,
             -- a recipe/meal item, and whatever's added later. Replaces 5
@@ -283,6 +290,7 @@ async def init_db():
             -- this project via the user_preferences columns bug).
             ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS calories DOUBLE PRECISION DEFAULT 0;
             ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS nutrients_json TEXT;
+            ALTER TABLE pantry_items ADD COLUMN IF NOT EXISTS category TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_pantry_items_user ON pantry_items(user_id);
             CREATE INDEX IF NOT EXISTS idx_pantry_items_expiration ON pantry_items(user_id, expiration_date)
@@ -319,6 +327,8 @@ async def init_db():
             -- Per-nutrient breakdown for a custom food lives in
             -- nutrient_facts (owner_type='custom_food').
 
+            ALTER TABLE custom_foods ADD COLUMN IF NOT EXISTS category TEXT;
+
             CREATE INDEX IF NOT EXISTS idx_custom_foods_user ON custom_foods(user_id);
 
             -- Recipes: aggregate items + servings-per-batch, so logging
@@ -338,6 +348,19 @@ async def init_db():
 
             ALTER TABLE recipes ADD COLUMN IF NOT EXISTS source TEXT;
             ALTER TABLE recipes ADD COLUMN IF NOT EXISTS source_id TEXT;
+
+            -- Resolved food-type category for the recipe as a whole.
+            -- Defaults to whichever category contributes the most total
+            -- calories across the recipe's items (see
+            -- food_category.dominant_category_by_calories) -- explicit
+            -- user decision, 2026-09-08, over weight- or count-based
+            -- alternatives. category_is_custom mirrors
+            -- nutrition_targets.is_custom's pattern: distinguishes "user
+            -- explicitly picked this" from "still the auto-computed
+            -- default," so editing the recipe's ingredients later only
+            -- recomputes the default when the user never overrode it.
+            ALTER TABLE recipes ADD COLUMN IF NOT EXISTS category TEXT;
+            ALTER TABLE recipes ADD COLUMN IF NOT EXISTS category_is_custom BOOLEAN NOT NULL DEFAULT FALSE;
 
             -- One row per ingredient in a recipe. source/source_id mirrors
             -- food_log's convention (USDA/CNF/custom) — a recipe ingredient
@@ -359,6 +382,12 @@ async def init_db():
             -- Per-nutrient breakdown for a recipe item lives in
             -- nutrient_facts (owner_type='recipe_item').
 
+            -- Each ingredient's own category (produce/protein/etc, from
+            -- its source's raw category if it has one) -- this is what
+            -- recipes.category's dominant-by-calories default is computed
+            -- from, not user-facing on its own.
+            ALTER TABLE recipe_items ADD COLUMN IF NOT EXISTS category TEXT;
+
             CREATE INDEX IF NOT EXISTS idx_recipes_user ON recipes(user_id);
             CREATE INDEX IF NOT EXISTS idx_recipe_items_recipe ON recipe_items(recipe_id);
 
@@ -372,6 +401,12 @@ async def init_db():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
 
+            -- Same category/category_is_custom pattern as recipes above --
+            -- meals are structurally the same "composite of items" shape,
+            -- so they get the same dominant-by-calories default treatment.
+            ALTER TABLE meals ADD COLUMN IF NOT EXISTS category TEXT;
+            ALTER TABLE meals ADD COLUMN IF NOT EXISTS category_is_custom BOOLEAN NOT NULL DEFAULT FALSE;
+
             CREATE TABLE IF NOT EXISTS meal_items (
                 id SERIAL PRIMARY KEY,
                 meal_id INTEGER NOT NULL REFERENCES meals(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
@@ -383,6 +418,8 @@ async def init_db():
                 calories DOUBLE PRECISION DEFAULT 0,
                 nutrients_json TEXT
             );
+
+            ALTER TABLE meal_items ADD COLUMN IF NOT EXISTS category TEXT;
 
             -- Per-nutrient breakdown for a meal item lives in
             -- nutrient_facts (owner_type='meal_item').

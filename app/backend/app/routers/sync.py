@@ -159,6 +159,7 @@ def _servings_row_to_food_log_entry(row: dict) -> "FoodLogEntryContract":
     _sync_diary_entries() below — not from here, and not via any direct
     INSERT in this module."""
     from ..food_entry_contract import FoodLogEntryContract
+    from ..food_category import map_raw_category
 
     macros = {}
     for csv_col, macro_key in _SERVINGS_MACRO_COLUMNS.items():
@@ -189,13 +190,22 @@ def _servings_row_to_food_log_entry(row: dict) -> "FoodLogEntryContract":
 
     meal = _MEAL_GROUP_MAP.get((row.get("Group") or "").strip().lower(), row.get("Group") or "Uncategorized")
     serving_size, serving_unit = _parse_amount(row.get("Amount", ""))
+    food_name = row.get("Food Name", "").strip() or "Unknown"
+    # Cronometer's own "Category" column -- previously in
+    # _SERVINGS_NON_NUTRIENT_COLUMNS above and discarded entirely (a
+    # known, tracked gap since EVENT_CONTRACT_SPEC.md was drafted).
+    # Reuses the same USDA-taxonomy mapping search results use, since
+    # Cronometer's category values are that same taxonomy (confirmed
+    # real value "Fast Foods" against an actual export).
+    category = map_raw_category(row.get("Category"), food_name)
 
     return FoodLogEntryContract(
         date=row.get("Day", ""),
         meal=meal,
-        food_name=row.get("Food Name", "").strip() or "Unknown",
+        food_name=food_name,
         source="Cronometer",
         source_id=None,  # Cronometer's servings export has no stable per-serving ID
+        category=category,
         serving_size=serving_size,
         serving_unit=serving_unit,
         nutrients=nutrients,

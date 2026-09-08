@@ -88,7 +88,15 @@ async def _search_user_recipes(user_id: int, query: str) -> list[dict]:
             "id": str(recipe["id"]),
             "name": recipe["name"],
             "brand": "",
-            "category": "Recipe",
+            # This used to be the hardcoded string "Recipe" -- a
+            # UI-facing "what kind of result is this" label that
+            # collided with the real food-type category field added
+            # 2026-09-08 (app/food_category.py). The `recipe`/`meal`/
+            # `recipeOrMeal` booleans below already cover "what kind of
+            # result," and confirmed nothing in the frontend reads
+            # `.category`'s string value, so this now carries the
+            # recipe's actual resolved category instead.
+            "category": recipe["category"],
             "nutrients": {
                 # per_serving_nutrients already carries "Protein",
                 # "Carbohydrate, by difference", "Total lipid (fat)", and
@@ -164,7 +172,7 @@ async def _search_user_meals(user_id: int, query: str) -> list[dict]:
             "id": str(meal["id"]),
             "name": meal["name"],
             "brand": "",
-            "category": "Meal",
+            "category": meal["category"],
             "nutrients": {
                 **nutrients,
                 "Energy": {"value": round(macros["calories"]), "unit": "KCAL"},
@@ -281,6 +289,10 @@ async def log_food(
         food_name=entry.get("food_name"),
         source=entry.get("source"),
         source_id=entry.get("source_id"),
+        # Frontend passes through whatever category the search result it
+        # was picked from already had resolved (see integrations/
+        # food_search.py) -- this endpoint doesn't re-derive it.
+        category=entry.get("category"),
         serving_size=entry.get("serving_size", 1.0),
         serving_unit=entry.get("serving_unit", "serving"),
         calories=macros["calories"],
@@ -322,6 +334,7 @@ async def get_food_log(
             "meal": r["meal"],
             "food_name": r["food_name"],
             "source": r["source"],
+            "category": r["category"],
             "serving_size": r["serving_size"],
             "serving_unit": r["serving_unit"],
             "calories": r["calories"],

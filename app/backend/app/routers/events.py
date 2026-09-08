@@ -19,17 +19,19 @@ genuinely different underlying tables, not just one:
   - "food_entry"       -> food_log (+ food_log_nutrients)
   - "exercise_activity" -> exercise_log
 
-Known, explicitly tracked gap (see workspace-notes/ACTION_ITEMS.md): the
-Core Event Shape's `category` field is NOT populated here. Neither
-food_log nor exercise_log stores a category today — this was flagged
-when the Event Contract was drafted (Cronometer's CSV `Category` column
-is currently discarded during sync, and USDA/CNF category data has never
-been wired in). Rather than fabricate a value, every event from this
-adapter reports `category: null`. GET /aggregations/by_category still
-works, but degenerates to a single "uncategorized" bucket until that
-separate, already-tracked migration lands. `hidden` and `status` are
-likewise always their defaults (false / null) — neither concept exists
-in this tracker's schema yet.
+`category` (see app/food_category.py, implemented 2026-09-08) is
+populated for food_entry events -- resolved from food_log.category,
+which is set at write time from whichever source has real category data
+(Cronometer's CSV Category column, USDA/CNF search results, or a
+recipe/meal's own dominant-by-calories-computed category). It's `null`
+only when a food_log entry genuinely has no source category data (e.g.
+a hand-typed manual entry with no search result behind it) -- an honest
+gap, not an unimplemented one. exercise_activity events always report
+`category: null`: a food-type category (produce/protein/dairy/etc)
+doesn't apply to an activity like "Running," and exercise_log has no
+category concept of its own. `hidden` and `status` are still always
+their defaults (false / null) — neither concept exists in this
+tracker's schema yet.
 """
 from typing import Optional
 
@@ -39,6 +41,7 @@ from pydantic import BaseModel
 from ..routers.auth import get_current_user
 from ..db import get_pool
 from ..nutrient_facts import read_nutrients_bulk
+from ..food_category import FoodCategory
 from ..food_entry_contract import (
     FoodLogEntryContract, ExerciseLogContract, log_food_entry, log_exercise_entry,
 )
@@ -64,7 +67,9 @@ class EventLogRequest(BaseModel):
     amount: float = 0
     source: Optional[str] = None
     source_id: Optional[str] = None
-    category: Optional[str] = None  # accepted, NOT persisted — see module docstring
+    # Persisted for food_entry (food_log.category); still ignored for
+    # exercise_activity, which has no category concept — see module docstring.
+    category: Optional[FoodCategory] = None
     hidden: bool = False            # accepted, NOT persisted — no such column yet
     status: Optional[str] = None    # accepted, NOT persisted — no such column yet
     metadata: dict = {}
@@ -81,6 +86,7 @@ async def _dispatch_log(user_id: int, req: EventLogRequest) -> dict:
             food_name=food_name,
             source=req.source,
             source_id=req.source_id,
+            category=req.category,
             serving_size=req.metadata.get("serving_size", 1.0),
             serving_unit=req.metadata.get("serving_unit", "serving"),
             calories=req.amount,
@@ -128,7 +134,7 @@ def _food_row_to_event(r, nutrients: dict) -> dict:
         "id": r["id"],
         "user_id": r["user_id"],
         "event_type": "food_entry",
-        "category": None,  # see module docstring — known, tracked gap
+        "category": r["category"],
         "occurred_at": r["date"],
         "created_at": r["created_at"].isoformat(),
         "amount": r["calories"],
@@ -151,7 +157,7 @@ def _exercise_row_to_event(r) -> dict:
         "id": r["id"],
         "user_id": r["user_id"],
         "event_type": "exercise_activity",
-        "category": None,  # see module docstring — known, tracked gap
+        "category": None,  # doesn't apply to activities — see module docstring
         "occurred_at": r["date"],
         "created_at": r["created_at"].isoformat(),
         "amount": r["calories_burned"],

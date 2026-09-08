@@ -18,6 +18,7 @@ from ..db import get_pool
 from ..portion_scaling import scale_macros, scale_nutrients
 from ..nutrient_facts import write_nutrients, read_nutrients_bulk, delete_nutrient_facts, delete_nutrient_facts_bulk
 from ..nutrient_groups import order_nutrients
+from ..food_category import FoodCategory, resolve_category
 
 router = APIRouter()
 
@@ -26,6 +27,10 @@ class RecipeItemRequest(BaseModel):
     food_name: str
     source: Optional[str] = None
     source_id: Optional[str] = None
+    # Food-type category (produce/protein/dairy/etc) for this ingredient
+    # -- feeds the recipe's own dominant-by-calories default, see
+    # RecipeRequest.category below.
+    category: Optional[FoodCategory] = None
     amount_grams: Optional[float] = None
     amount_multiple: Optional[float] = None
     # `calories` is the sole top-level numeric field (TrackStack's
@@ -40,6 +45,13 @@ class RecipeItemRequest(BaseModel):
 class RecipeRequest(BaseModel):
     name: str
     servings_per_batch: float = 1.0
+    # Leave unset to auto-compute as whichever category contributes the
+    # most total calories across `items` (explicit user decision,
+    # 2026-09-08); set explicitly to override that default. On update,
+    # omitting this preserves whatever the recipe already has (an
+    # earlier override stays an override; an earlier auto-computed value
+    # gets recomputed from the new items) -- see update_recipe.
+    category: Optional[FoodCategory] = None
     items: list[RecipeItemRequest] = []
 
 
@@ -52,12 +64,12 @@ class LogRecipeRequest(BaseModel):
 async def _save_items(conn, recipe_id: int, items: list[RecipeItemRequest]):
     for item in items:
         item_id = await conn.fetchval(
-            """INSERT INTO recipe_items (recipe_id, food_name, source, source_id, amount_grams, amount_multiple,
+            """INSERT INTO recipe_items (recipe_id, food_name, source, source_id, category, amount_grams, amount_multiple,
                    calories, nutrients_json)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                RETURNING id""",
-            recipe_id, item.food_name, item.source, item.source_id, item.amount_grams, item.amount_multiple,
-            item.calories, json.dumps(item.nutrients),
+            recipe_id, item.food_name, item.source, item.source_id, item.category,
+            item.amount_grams, item.amount_multiple, item.calories, json.dumps(item.nutrients),
         )
         await write_nutrients(conn, "recipe_item", item_id, item.nutrients)
 
@@ -76,6 +88,7 @@ async def create_recipe(req: RecipeRequest, user_id: int = Depends(get_current_u
     contract = RecipeImportContract(
         name=req.name,
         servings_per_batch=req.servings_per_batch,
+        category=req.category,
         items=[RecipeItemContract(**item.model_dump()) for item in req.items],
     )
     recipe_id = await import_recipe(user_id, contract)
@@ -87,12 +100,12 @@ async def list_recipes(user_id: int = Depends(get_current_user)):
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, name, servings_per_batch, created_at, updated_at FROM recipes WHERE user_id = $1 ORDER BY name",
+            "SELECT id, name, servings_per_batch, category, created_at, updated_at FROM recipes WHERE user_id = $1 ORDER BY name",
             user_id,
         )
     return {
         "recipes": [
-            {"id": r["id"], "name": r["name"], "servings_per_batch": r["servings_per_batch"]}
+            {"id": r["id"], "name": r["name"], "servings_per_batch": r["servings_per_batch"], "category": r["category"]}
             for r in rows
         ]
     }
@@ -112,6 +125,7 @@ async def _get_recipe_with_items(conn, recipe_id: int, user_id: int):
             "food_name": r["food_name"],
             "source": r["source"],
             "source_id": r["source_id"],
+            "category": r["category"],
             "amount_grams": r["amount_grams"],
             "amount_multiple": r["amount_multiple"],
             "calories": r["calories"],
@@ -157,6 +171,8 @@ async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
         "id": recipe["id"],
         "name": recipe["name"],
         "servings_per_batch": recipe["servings_per_batch"],
+        "category": recipe["category"],
+        "category_is_custom": recipe["category_is_custom"],
         "items": items,
         "batch_totals": batch,
         "per_serving_totals": per_serving,
@@ -175,12 +191,21 @@ async def update_recipe(recipe_id: int, req: RecipeRequest, user_id: int = Depen
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            existing = await conn.fetchrow("SELECT id FROM recipes WHERE id = $1 AND user_id = $2", recipe_id, user_id)
+            existing = await conn.fetchrow(
+                "SELECT id, category, category_is_custom FROM recipes WHERE id = $1 AND user_id = $2", recipe_id, user_id
+            )
             if existing is None:
                 raise HTTPException(status_code=404, detail="Recipe not found")
+
+            resolved_category, category_is_custom = resolve_category(
+                req.category, [item.model_dump() for item in req.items], dict(existing),
+            )
+
             await conn.execute(
-                "UPDATE recipes SET name = $1, servings_per_batch = $2, updated_at = now() WHERE id = $3",
-                req.name, req.servings_per_batch, recipe_id,
+                """UPDATE recipes SET name = $1, servings_per_batch = $2,
+                       category = $3, category_is_custom = $4, updated_at = now()
+                   WHERE id = $5""",
+                req.name, req.servings_per_batch, resolved_category, category_is_custom, recipe_id,
             )
             old_item_ids = [r["id"] for r in await conn.fetch(
                 "SELECT id FROM recipe_items WHERE recipe_id = $1", recipe_id
@@ -236,10 +261,10 @@ async def log_recipe(recipe_id: int, req: LogRecipeRequest, user_id: int = Depen
 
             food_log_id = await conn.fetchval(
                 """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       serving_size, serving_unit, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, 'recipe', $5, $6, 'serving', $7, $8)
+                       category, serving_size, serving_unit, calories, nutrients_json)
+                   VALUES ($1, $2, $3, $4, 'recipe', $5, $6, $7, 'serving', $8, $9)
                    RETURNING id""",
-                user_id, req.date, req.meal, recipe["name"], str(recipe_id), req.servings,
+                user_id, req.date, req.meal, recipe["name"], str(recipe_id), recipe["category"], req.servings,
                 macros["calories"], json.dumps(nutrients),
             )
             await write_nutrients(conn, "food_log", food_log_id, nutrients)
@@ -400,12 +425,12 @@ async def make_recipe(recipe_id: int, user_id: int = Depends(get_current_user)):
 
             per_serving_macros, per_serving_nutrients = _recipe_per_serving_nutrition(recipe, items)
             pantry_item_id = await conn.fetchval(
-                """INSERT INTO pantry_items (user_id, food_name, source, source_id, serving_size,
+                """INSERT INTO pantry_items (user_id, food_name, source, source_id, category, serving_size,
                        serving_unit, tracking_mode, remaining_servings,
                        calories, nutrients_json)
-                   VALUES ($1, $2, 'recipe', $3, 1, 'serving', 'countable', $4, $5, $6)
+                   VALUES ($1, $2, 'recipe', $3, $4, 1, 'serving', 'countable', $5, $6, $7)
                    RETURNING id""",
-                user_id, recipe["name"], str(recipe_id), recipe["servings_per_batch"],
+                user_id, recipe["name"], str(recipe_id), recipe["category"], recipe["servings_per_batch"],
                 per_serving_macros["calories"], json.dumps(per_serving_nutrients),
             )
             await write_nutrients(conn, "pantry_item", pantry_item_id, per_serving_nutrients)

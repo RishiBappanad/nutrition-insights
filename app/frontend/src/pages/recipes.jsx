@@ -469,10 +469,31 @@ function RecipeDetail({ recipeId, onBack, onEdit }) {
   )
 }
 
+// Mirrors app/food_category.py's FoodCategory enum -- kept as plain
+// display labels here since this is just dropdown data, not logic (the
+// actual resolution -- auto-compute vs. override -- happens once,
+// server-side, via food_category.resolve_category()).
+const FOOD_CATEGORIES = [
+  { value: 'produce', label: 'Produce' },
+  { value: 'protein', label: 'Protein' },
+  { value: 'dairy', label: 'Dairy' },
+  { value: 'grains_starches', label: 'Grains & Starches' },
+  { value: 'legumes_nuts', label: 'Legumes & Nuts' },
+  { value: 'fats_oils', label: 'Fats & Oils' },
+  { value: 'beverages', label: 'Beverages' },
+  { value: 'alcohol', label: 'Alcohol' },
+  { value: 'snacks_sweets', label: 'Snacks & Sweets' },
+  { value: 'prepared_restaurant', label: 'Prepared / Restaurant' },
+]
+
 function RecipeEditor({ recipeId, onDone, onCancel }) {
   const [name, setName] = useState('')
   const [servingsPerBatch, setServingsPerBatch] = useState(1)
   const [items, setItems] = useState([])
+  // '' means "auto" (server computes dominant-by-calories from items) --
+  // never sent in the request body in that state, so saving without
+  // touching this dropdown doesn't accidentally lock in an override.
+  const [category, setCategory] = useState('')
   const [loading, setLoading] = useState(!!recipeId)
   const [saving, setSaving] = useState(false)
   const [status, setStatus] = useState('')
@@ -489,8 +510,14 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
       .then((d) => {
         setName(d.name)
         setServingsPerBatch(d.servings_per_batch)
+        // Only preload the dropdown if this was a real user override --
+        // an auto-computed value stays '' (auto), so re-saving without
+        // touching it keeps recomputing from the current items instead
+        // of freezing whatever it happened to be last time.
+        setCategory(d.category_is_custom ? d.category : '')
         setItems(d.items.map((i) => ({
           food_name: i.food_name, source: i.source, source_id: i.source_id,
+          category: i.category,
           amount_grams: i.amount_grams, amount_multiple: i.amount_multiple,
           calories: i.calories,
           nutrients: i.nutrients,
@@ -519,6 +546,7 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
     const referenceGrams = result.serving_size || 100
     items.push({
       food_name: result.name, source: result.source, source_id: result.id,
+      category: result.category,
       amount_grams: referenceGrams,
       calories: extractMacro(result.nutrients, 'calories'),
       nutrients: result.nutrients,
@@ -543,7 +571,10 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
     }
     setSaving(true)
     setStatus('')
-    const body = { name, servings_per_batch: Number(servingsPerBatch), items }
+    const body = {
+      name, servings_per_batch: Number(servingsPerBatch), items,
+      ...(category ? { category } : {}),
+    }
     const res = recipeId
       ? await api(`/recipes/${recipeId}`, { method: 'PUT', body: JSON.stringify(body) })
       : await api('/recipes', { method: 'POST', body: JSON.stringify(body) })
@@ -578,6 +609,19 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
               <label className="text-xs font-medium text-muted-foreground">Servings Per Batch</label>
               <input type="number" min="0.5" step="0.5" value={servingsPerBatch} onChange={(e) => setServingsPerBatch(e.target.value)}
                 className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">Category</label>
+              <select
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                className="w-full px-3 py-2 rounded-md border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="">Auto (whichever ingredient has the most calories)</option>
+                {FOOD_CATEGORIES.map((c) => (
+                  <option key={c.value} value={c.value}>{c.label}</option>
+                ))}
+              </select>
             </div>
           </div>
         </CardContent>
