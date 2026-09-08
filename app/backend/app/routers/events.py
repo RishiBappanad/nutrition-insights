@@ -33,7 +33,7 @@ category concept of its own. `hidden` and `status` are still always
 their defaults (false / null) — neither concept exists in this
 tracker's schema yet.
 """
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -73,6 +73,50 @@ class EventLogRequest(BaseModel):
     hidden: bool = False            # accepted, NOT persisted — no such column yet
     status: Optional[str] = None    # accepted, NOT persisted — no such column yet
     metadata: dict = {}
+
+
+class Event(BaseModel):
+    """Core Event Shape, as returned by GET /events -- see
+    workspace-notes/EVENT_CONTRACT_SPEC.md. The response-side
+    counterpart to EventLogRequest above: intentionally almost
+    identical (a logged event, read back, looks like what you'd log),
+    plus id/user_id/created_at, which only exist once a row has
+    actually been written."""
+    id: int
+    user_id: int
+    event_type: str
+    category: Optional[FoodCategory] = None
+    occurred_at: str
+    created_at: str
+    amount: float
+    source: Optional[str] = None
+    source_id: Optional[str] = None
+    hidden: bool = False
+    status: Optional[str] = None
+    metadata: dict = {}
+
+
+class LogEventResponse(BaseModel):
+    status: str
+    id: int
+
+
+class GetEventsResponse(BaseModel):
+    events: list[Event]
+    total: int
+
+
+class AggregationsResponse(BaseModel):
+    """Each row in `data` is a small dict with a dynamic group-dimension
+    key (literally "category", "source", or "event_type" -- whichever
+    `agg_type` was requested, see get_aggregations below) plus the fixed
+    `total_amount`/`unit` fields. That dynamic key is why this isn't a
+    list of a more strictly-typed row model: the field NAME itself
+    varies by request, not just its value, which Pydantic can't express
+    as a named field. `dict[str, str | float]` is the honest shape --
+    an object with the group key (string) and total_amount (float) and
+    unit (string)."""
+    data: list[dict[str, Union[str, float]]]
 
 
 async def _dispatch_log(user_id: int, req: EventLogRequest) -> dict:
@@ -116,7 +160,7 @@ async def _dispatch_log(user_id: int, req: EventLogRequest) -> dict:
     )
 
 
-@router.post("/log")
+@router.post("/log", response_model=LogEventResponse)
 async def log_event(req: EventLogRequest, user_id: int = Depends(get_current_user)):
     """Universal event ingestion. Dispatches to the same
     food_entry_contract.log_food_entry()/log_exercise_entry() functions
@@ -173,7 +217,7 @@ def _exercise_row_to_event(r) -> dict:
     }
 
 
-@router.get("")
+@router.get("", response_model=GetEventsResponse)
 async def get_events(
     start: str = Query(..., description="Inclusive start date, YYYY-MM-DD"),
     end: str = Query(..., description="Inclusive end date, YYYY-MM-DD"),
@@ -232,7 +276,7 @@ async def _query_events(
     return events
 
 
-@aggregations_router.get("/{agg_type}")
+@aggregations_router.get("/{agg_type}", response_model=AggregationsResponse)
 async def get_aggregations(
     agg_type: str,
     start: str = Query(..., description="Inclusive start date, YYYY-MM-DD"),
@@ -243,11 +287,12 @@ async def get_aggregations(
     unit across every group is honest here, not a coincidence masking a
     units bug) grouped by the requested dimension.
 
-    agg_type="by_category" is implemented but degenerates to one
-    "uncategorized" bucket today — see module docstring. Still returned
-    (not 501/omitted) since even a single honest bucket is useful to a
-    caller and it keeps the endpoint's shape stable for when category
-    data lands, rather than changing shape out from under consumers."""
+    agg_type="by_category" reflects real category data (see
+    app/food_category.py, implemented 2026-09-08) for food_entry events;
+    exercise_activity events always fall into "uncategorized" (category
+    doesn't apply to activities — see module docstring), so a caller
+    mixing both event types will still see an "uncategorized" bucket,
+    just not exclusively one anymore."""
     if agg_type not in ("by_category", "by_source", "by_event_type"):
         raise HTTPException(status_code=400, detail="agg_type must be one of: by_category, by_source, by_event_type")
 
