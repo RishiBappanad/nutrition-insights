@@ -19,7 +19,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from pydantic import BaseModel
 
-from ..db import get_pool, encrypt, decrypt
+from ..db import encrypt, decrypt
+from ..db.auth import query as auth_query
 
 router = APIRouter()
 security = HTTPBearer()
@@ -34,20 +35,7 @@ class CredentialsRequest(BaseModel):
 
 
 async def _ensure_local_user(account_id: int, email: str) -> None:
-    """Create a mirror row in the local users table if one doesn't exist yet.
-    Safe to call on every request — INSERT ... ON CONFLICT DO NOTHING."""
-    pool = await get_pool()
-    async with pool.acquire() as db:
-        await db.execute(
-            """INSERT INTO users (id, username, password_hash)
-               VALUES ($1, $2, 'trackstack-auth')
-               ON CONFLICT (id) DO NOTHING""",
-            account_id, email,
-        )
-        await db.execute(
-            "INSERT INTO credentials (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
-            account_id,
-        )
+    await auth_query.ensure_local_user(account_id, email)
 
 
 async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)) -> int:
@@ -74,14 +62,9 @@ async def save_credentials(req: CredentialsRequest, user_id: int = Depends(get_c
     (see archive/hevy_fitness_tracker/ in the backend). Any value a user
     saved previously is left untouched, not wiped, in case it's useful
     when porting to a future fitness tracker."""
-    pool = await get_pool()
-    async with pool.acquire() as db:
-        await db.execute(
-            """UPDATE credentials SET
-                cronometer_username = $1, cronometer_password = $2
-            WHERE user_id = $3""",
-            encrypt(req.cronometer_username) if req.cronometer_username else None,
-            encrypt(req.cronometer_password) if req.cronometer_password else None,
-            user_id,
-        )
+    await auth_query.save_credentials(
+        user_id,
+        encrypt(req.cronometer_username) if req.cronometer_username else None,
+        encrypt(req.cronometer_password) if req.cronometer_password else None,
+    )
     return {"status": "saved"}
