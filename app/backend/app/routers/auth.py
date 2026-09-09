@@ -25,7 +25,16 @@ from ..db.auth import query as auth_query
 router = APIRouter()
 security = HTTPBearer()
 
-SECRET_KEY = os.getenv("JWT_SECRET", "change-me-in-production")
+SECRET_KEY = os.environ["JWT_SECRET"]
+# Was os.getenv("JWT_SECRET", "change-me-in-production") -- a silent
+# fallback that let this service run with a guessable, publicly-visible
+# secret if the real one ever failed to load, instead of refusing to
+# start. This is exactly the failure mode that let a real JWT_SECRET
+# mismatch between this service and trackstack-auth (the token issuer)
+# go unnoticed: every token trackstack-auth issued was silently rejected
+# here, but the service itself looked healthy the whole time. Failing
+# loudly at import time (KeyError, not a fallback) matches how
+# trackstack-auth itself already handles this.
 ALGORITHM = "HS256"
 
 
