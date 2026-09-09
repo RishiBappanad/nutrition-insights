@@ -1,8 +1,20 @@
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pathlib import Path
+
+# No logging.basicConfig() existed anywhere in this app before -- every
+# logger.info()/logger.warning() call throughout the whole backend (this
+# file's routers included) was silently swallowed by Python's default
+# root logger level (WARNING, no handler), not actually broken calls.
+# Found while debugging why a Cronometer sync appeared to hang with zero
+# visible server-side progress -- the calls tracking exactly that
+# (cronometer_rpc.py's login()) were firing the whole time, just never
+# reaching any handler. uvicorn's OWN access logs appeared fine
+# throughout because uvicorn configures its own loggers separately.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from .routers import auth, sync, data, food, targets, water, notes, pantry, profile, custom_foods, recipes, meals, label_scanner, preferences, exercise, events, lifts
 from .db import init_db, close_db

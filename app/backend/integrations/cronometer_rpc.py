@@ -53,15 +53,36 @@ API_V3_BASE = "https://cronometer.com/api/v3"
 
 # GWT RPC constants.
 #
-# GWT_PERMUTATION is captured, not derived — GWT compiles a distinct
-# permutation hash per supported browser/user-agent, and Cronometer
-# appears to recompile/redeploy periodically (the value hardcoded here
-# previously, 0AC0B7E4D7F952D1D90194EA6F2AC472, returned a 404 when
-# checked live — confirmed stale). This value was captured from a real
-# authenticated browser session's Network tab on 2026-07-20. If calls
-# start failing, the fix is re-capturing a fresh permutation from a live
-# session's request headers (x-gwt-permutation), not guessing.
-GWT_PERMUTATION = "8119D24F8CC7814B83B62DD87A7C62D8"
+# GWT_PERMUTATION used to be a hardcoded, manually-recaptured value --
+# and went stale for the SECOND time (0AC0B7E4D7F952D1D90194EA6F2AC472 ->
+# 8119D24F8CC7814B83B62DD87A7C62D8 -> confirmed dead again 2026-09-09,
+# a live AAA259BF1BDF8FCF3E16CC51400C0CE4 permutation returning 200 while
+# the hardcoded one 404'd on Cronometer's own deferredjs cache path).
+# Cronometer recompiles/redeploys its GWT module periodically, and a
+# human has to notice sync silently degrading to the (slower, flakier)
+# web-scraper fallback each time this drifts. Fetching it live from
+# Cronometer's own public, unauthenticated bootstrap file instead --
+# the same file a real browser loads to find its own permutation before
+# making any RPC call -- makes this self-healing across Cronometer's own
+# redeploys instead of a recurring manual fix.
+_GWT_NOCACHE_JS_URL = "https://cronometer.com/cronometer/cronometer.nocache.js"
+_GWT_PERMUTATION_FALLBACK = "AAA259BF1BDF8FCF3E16CC51400C0CE4"  # last known-good, in case the live fetch ever fails (network hiccup at startup, etc.)
+
+
+def _fetch_current_gwt_permutation() -> str:
+    try:
+        resp = requests.get(_GWT_NOCACHE_JS_URL, timeout=10)
+        resp.raise_for_status()
+        match = re.search(r"\b([A-F0-9]{32})\b", resp.text)
+        if match:
+            return match.group(1)
+        logger.warning("Could not find a GWT permutation hash in cronometer.nocache.js; using last known-good value")
+    except Exception as e:
+        logger.warning(f"Failed to fetch current GWT permutation live ({e}); using last known-good value")
+    return _GWT_PERMUTATION_FALLBACK
+
+
+GWT_PERMUTATION = _fetch_current_gwt_permutation()
 GWT_CONTENT_TYPE = "text/x-gwt-rpc; charset=UTF-8"
 GWT_MODULE_BASE = "https://cronometer.com/cronometer/"
 
@@ -153,20 +174,23 @@ class CronometerRPCClient:
     def login(self) -> None:
         """Authenticate with Cronometer using username/password."""
         try:
-            logger.info("Authenticating with Cronometer...")
-            
+            logger.info("login: start")
+
             # Get CSRF token and login
             csrf = self._get_csrf_token()
+            logger.info(f"login: got csrf token (len={len(csrf)})")
             data = {
                 "anticsrf": csrf,
                 "username": self.username,
                 "password": self.password,
             }
             resp = self.session.post(API_LOGIN_URL, data=data, timeout=30)
+            logger.info(f"login: POST {API_LOGIN_URL} -> {resp.status_code}")
             resp.raise_for_status()
-            
+
             # Check for login errors
             body = resp.text
+            logger.info(f"login: response body (first 300 chars): {body[:300]!r}")
             if "error" in body.lower():
                 try:
                     payload = resp.json()
@@ -177,11 +201,14 @@ class CronometerRPCClient:
 
             # Update nonce and authenticate via GWT
             self._update_nonce_from_cookies()
+            logger.info(f"login: got nonce after form login: {self.nonce!r}")
             self._gwt_authenticate()
-            
+            logger.info("login: GWT authenticate done")
+
             logger.info("Successfully authenticated with Cronometer")
-            
+
         except Exception as e:
+            logger.error(f"login: EXCEPTION: {type(e).__name__}: {e}")
             logger.error(f"Cronometer authentication failed: {e}")
             raise
 
@@ -200,7 +227,9 @@ class CronometerRPCClient:
             "x-gwt-module-base": GWT_MODULE_BASE,
             "x-gwt-permutation": GWT_PERMUTATION,
         }
+        logger.info(f"_gwt_authenticate: POSTing to {GWT_BASE_URL} with permutation {GWT_PERMUTATION}")
         resp = self.session.post(GWT_BASE_URL, headers=headers, data=GWT_AUTHENTICATE, timeout=30)
+        logger.info(f"_gwt_authenticate: -> {resp.status_code}, body (first 300 chars): {resp.text[:300]!r}")
         resp.raise_for_status()
         self._update_nonce_from_cookies()
         match = GWT_AUTH_RE.search(resp.text)

@@ -80,6 +80,27 @@ async def write_nutrients(conn, owner_type: str, owner_id: int, nutrients: dict)
     )
 
 
+async def write_nutrients_bulk(conn, owner_type: str, owner_nutrients: list[tuple[int, dict]]) -> None:
+    """Bulk equivalent of write_nutrients() for a caller writing many
+    owners' worth of nutrients in one go (e.g. an importer processing
+    hundreds of entries) -- one executemany for every owner's nutrient
+    rows combined, instead of one executemany per owner. Same
+    insert-or-update semantics as write_nutrients(); just batched.
+    `owner_nutrients` is a list of (owner_id, nutrients_dict) pairs."""
+    rows = []
+    for owner_id, nutrients in owner_nutrients:
+        rows.extend(_nutrients_to_rows(owner_type, owner_id, nutrients))
+    if not rows:
+        return
+    await conn.executemany(
+        """INSERT INTO nutrient_facts (owner_type, owner_id, nutrient_name, value, unit)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (owner_type, owner_id, nutrient_name)
+           DO UPDATE SET value = EXCLUDED.value, unit = EXCLUDED.unit""",
+        rows,
+    )
+
+
 async def read_nutrients_bulk(conn, owner_type: str, owner_ids: Iterable[int]) -> dict[int, dict]:
     """Read every owner's nutrients in one query. Returns
     {owner_id: {name: {value, unit}}}, each already in TrackStack's

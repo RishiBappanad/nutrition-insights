@@ -24,7 +24,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from .db import get_pool
-from .nutrient_facts import write_nutrients, delete_nutrient_facts_bulk
+from .nutrient_facts import write_nutrients, write_nutrients_bulk, delete_nutrient_facts_bulk
 from .food_category import FoodCategory, resolve_category
 
 
@@ -146,6 +146,62 @@ async def log_food_entry(user_id: int, entry: FoodLogEntryContract) -> int:
             )
             await write_nutrients(conn, "food_log", food_log_id, entry.nutrients)
     return food_log_id
+
+
+async def log_food_entries_bulk(user_id: int, entries: list[FoodLogEntryContract]) -> list[int]:
+    """Bulk equivalent of log_food_entry() for an importer writing many
+    entries at once (Cronometer sync, currently the only caller). One
+    multi-row INSERT for all food_log rows plus one executemany for all
+    their nutrient_facts rows, instead of N separate
+    acquire+transaction+insert+commit cycles.
+
+    Found necessary the hard way: Cronometer sync's real per-row
+    log_food_entry() calls took several minutes for a real account's
+    ~3000-row servings export -- a genuine N+1 pattern, not a hang, but
+    functionally indistinguishable from one since it blew past Cloud
+    Run's 300s request timeout regardless.
+
+    Returns each entry's new food_log id, in the same order as `entries`
+    -- relies on a single INSERT ... SELECT FROM unnest(...) RETURNING id
+    returning rows in the same order they were inserted, which holds for
+    a plain (non-parallel, no ORDER BY) INSERT's RETURNING clause.
+    Verified directly against a real disposable-branch Postgres before
+    relying on it, not assumed.
+    """
+    if not entries:
+        return []
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
+                       category, serving_size, serving_unit, calories, nutrients_json)
+                   SELECT * FROM unnest(
+                       $1::int[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+                       $7::text[], $8::float8[], $9::text[], $10::float8[], $11::text[]
+                   )
+                   RETURNING id""",
+                [user_id] * len(entries),
+                [e.date for e in entries],
+                [e.meal for e in entries],
+                [e.food_name for e in entries],
+                [e.source for e in entries],
+                [e.source_id for e in entries],
+                [e.category.value if e.category else None for e in entries],
+                [e.serving_size for e in entries],
+                [e.serving_unit for e in entries],
+                [e.calories for e in entries],
+                [json.dumps(e.nutrients) for e in entries],
+            )
+            food_log_ids = [r["id"] for r in rows]
+
+            await write_nutrients_bulk(
+                conn, "food_log",
+                [(food_log_id, entry.nutrients) for food_log_id, entry in zip(food_log_ids, entries)],
+            )
+
+    return food_log_ids
 
 
 async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:

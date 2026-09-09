@@ -333,7 +333,7 @@ async def _sync_diary_entries(cronometer_files: dict, user_id: int) -> int:
 
     Returns the number of entries imported.
     """
-    from ..food_entry_contract import log_food_entry
+    from ..food_entry_contract import log_food_entries_bulk
 
     servings_path = cronometer_files.get("servings")
     if not servings_path:
@@ -344,14 +344,20 @@ async def _sync_diary_entries(cronometer_files: dict, user_id: int) -> int:
         logger.info(f"[DEBUG headers] servings CSV columns: {reader.fieldnames}")
         rows = list(reader)
 
-    count = 0
+    entries = []
     for raw_row in rows:
         entry = _servings_row_to_food_log_entry(raw_row)
         if not entry.date:
             continue
-        await log_food_entry(user_id, entry)
-        count += 1
-    return count
+        entries.append(entry)
+
+    # Bulk insert -- was one log_food_entry() call (its own
+    # acquire+transaction+insert+commit) per row, sequentially awaited.
+    # For a real account's several-thousand-row export that took minutes,
+    # not seconds -- a real N+1 pattern, found only once RPC login itself
+    # was fixed and a sync could actually get this far for the first time.
+    food_log_ids = await log_food_entries_bulk(user_id, entries)
+    return len(food_log_ids)
 
 
 @router.post("/cronometer")
@@ -396,6 +402,29 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
                 raise RuntimeError("Cronometer web login failed")
             return scraper.export_all(start_date, end_date, output_dir=data_dir)
 
+    # Each individual Cronometer HTTP call already has its own timeout
+    # (cronometer_rpc.py's requests calls are all timeout=30/60), but
+    # export_all_to_files chains ~6 of them sequentially (login + 5
+    # per-data-type exports) -- worst case that alone adds up to close to
+    # Cloud Run's 300s request limit, and this endpoint would then ALSO
+    # try the web-scraper fallback on top of that if the RPC path merely
+    # timed out slowly rather than raising quickly. Confirmed in
+    # production logs: real /sync/cronometer requests taking 150-300s+
+    # before failing with a 500 or a bare Cloud Run 504, with no useful
+    # error surfaced to the user either way.
+    #
+    # A firm ceiling on each whole attempt fixes the user-facing half of
+    # this: a slow/hung attempt now fails fast with a clear message
+    # instead of silently eating the request's entire time budget. Note
+    # this can't actually kill the underlying blocking call once started
+    # (asyncio.wait_for abandons the executor future on timeout, but the
+    # thread it's running on keeps executing until it finishes on its
+    # own -- a real Python/asyncio limitation, not something fixable from
+    # the caller side) -- it only bounds how long the HTTP response makes
+    # the user wait.
+    RPC_TIMEOUT_SECONDS = 90
+    WEB_TIMEOUT_SECONDS = 90
+
     try:
         try:
             # requests (RPC client) and Playwright (web scraper fallback)
@@ -407,15 +436,22 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
             # sync request would hang with zero server-side progress
             # visible until the blocking chain finally resolved or timed
             # out on its own.
-            results = await loop.run_in_executor(None, _run_rpc_export)
+            results = await asyncio.wait_for(
+                loop.run_in_executor(None, _run_rpc_export), timeout=RPC_TIMEOUT_SECONDS
+            )
         except Exception as rpc_error:
-            # If RPC export fails (e.g., 403), try web scraper as fallback
+            # If RPC export fails (e.g., 403) OR times out, try web
+            # scraper as fallback -- asyncio.TimeoutError is caught here
+            # like any other failure, same fallback behavior either way.
             logger.warning(f"Cronometer RPC export failed: {rpc_error}. Trying web scraper fallback...")
             try:
-                results = await loop.run_in_executor(None, _run_web_export)
+                results = await asyncio.wait_for(
+                    loop.run_in_executor(None, _run_web_export), timeout=WEB_TIMEOUT_SECONDS
+                )
             except Exception as web_error:
                 logger.error(f"Cronometer web scraper also failed: {web_error}")
-                raise HTTPException(status_code=502, detail=f"Cronometer export unavailable (RPC: {rpc_error}; Web: {web_error})")
+                status_code = 504 if isinstance(web_error, asyncio.TimeoutError) else 502
+                raise HTTPException(status_code=status_code, detail=f"Cronometer export unavailable (RPC: {rpc_error}; Web: {web_error})")
 
         # Processing below must run regardless of which path above produced
         # `results` (RPC success, or web-scraper fallback success) -- this
