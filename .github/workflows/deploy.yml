@@ -1,0 +1,59 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency: deploy-group
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
+env:
+  PROJECT_ID: trackstack-501915
+  REGION: us-east1
+  SERVICE: trackstack-nutrition
+  IMAGE: us-east1-docker.pkg.dev/trackstack-501915/cloud-run-source-deploy/trackstack-nutrition:latest
+  TRACKSTACK_AUTH_URL: https://trackstack-auth-824912246889.us-east1.run.app
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/824912246889/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+          service_account: github-actions-deployer@trackstack-501915.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-east1-docker.pkg.dev --quiet
+
+      - name: Build and push image
+        # Builds directly with Docker instead of `gcloud builds submit` --
+        # sidesteps a Cloud Build source-upload permission wall that
+        # never fully resolved even after several rounds of IAM grants.
+        # Same docker build cloudbuild.yaml already runs, one fewer GCP
+        # service in the path. See trackstack-auth's deploy.yml history
+        # for the full diagnosis.
+        run: |
+          docker build \
+            --build-arg "TRACKSTACK_AUTH_URL=${{ env.TRACKSTACK_AUTH_URL }}" \
+            -t "${{ env.IMAGE }}" .
+
+      - name: Push image
+        run: docker push "${{ env.IMAGE }}"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${{ env.SERVICE }}" \
+            --image="${{ env.IMAGE }}" \
+            --region="${{ env.REGION }}" \
+            --project="${{ env.PROJECT_ID }}"
