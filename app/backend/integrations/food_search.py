@@ -2,6 +2,7 @@
 Unified food search across USDA FoodData Central and Canadian Nutrient File.
 """
 
+import os
 import requests
 import logging
 from typing import List, Dict, Optional
@@ -11,7 +12,26 @@ from app.food_category import map_raw_category
 logger = logging.getLogger(__name__)
 
 USDA_BASE = "https://api.nal.usda.gov/fdc/v1"
-USDA_API_KEY = "DEMO_KEY"  # Replace with real key for production
+USDA_API_KEY = os.getenv("USDA_API_KEY", "DEMO_KEY")
+if USDA_API_KEY == "DEMO_KEY":
+    # DEMO_KEY was hardcoded here with a "replace for production" comment
+    # that nobody ever acted on -- production has been silently running on
+    # it this whole time (confirmed 2026-09-09: no USDA_API_KEY exists in
+    # Secret Manager or on the Cloud Run service). DEMO_KEY's rate limit
+    # is a handful of requests per minute per IP, well below real usage --
+    # USDA starts returning 429s (caught below and turned into empty
+    # results, not a visible error) after just a few searches, which is
+    # exactly the "search works for a few queries then silently returns
+    # nothing" symptom this was root-caused from. Warning loudly here so
+    # this can't silently persist unnoticed the way it did before -- not
+    # failing outright like JWT_SECRET does, since search still partially
+    # works without a real key and this isn't a security-sensitive value.
+    logger.warning(
+        "USDA_API_KEY is not set -- falling back to the public DEMO_KEY, "
+        "which USDA rate-limits after a handful of requests. Get a free "
+        "key at https://fdc.nal.usda.gov/api-key-signup.html and set "
+        "USDA_API_KEY."
+    )
 
 CNF_BASE = "https://food-nutrition.canada.ca/api/canadian-nutrient-file"
 

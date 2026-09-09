@@ -16,11 +16,19 @@ const API_PREFIXES = [
   'preferences', 'exercise', 'events', 'aggregations', 'lifts',
 ]
 
+// Defaults to the native-dev case (this process running on the host,
+// backend also on the host at localhost:8000). When this dev server
+// itself runs inside a container instead (workspace-notes/docker-compose.yml's
+// nutrition-frontend service), `localhost` would resolve to that
+// container, not its nutrition-backend sibling -- VITE_PROXY_TARGET
+// overrides it to the Docker service name in that case.
+const backendTarget = process.env.VITE_PROXY_TARGET || 'http://localhost:8000'
+
 const proxy = {}
 for (const prefix of API_PREFIXES) {
-  proxy[`/${prefix}`] = 'http://localhost:8000'
+  proxy[`/${prefix}`] = backendTarget
   proxy[`/nutrition/${prefix}`] = {
-    target: 'http://localhost:8000',
+    target: backendTarget,
     rewrite: (path) => path.replace('/nutrition', ''),
   }
 }
@@ -35,5 +43,10 @@ export default defineConfig({
   },
   server: {
     proxy,
+    // Binds all interfaces, not just loopback -- required for the
+    // container case (Docker's published port forwards to the
+    // container's network interface, not its loopback), and harmless
+    // for native dev.
+    host: true,
   },
 })
