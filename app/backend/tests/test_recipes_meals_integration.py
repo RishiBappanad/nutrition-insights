@@ -776,7 +776,7 @@ class TestRecipeAsFoodReference:
 
     def test_include_recipes_false_excludes_recipes_from_search(self, client, user_token):
         client.post("/recipes", headers=auth(user_token), json={"name": "Excludable Recipe XYZ", "items": []})
-        r = client.get("/food/search?q=Excludable+Recipe+XYZ&include_own=false", headers=auth(user_token))
+        r = client.get("/food/search?q=Excludable+Recipe+XYZ&sources=USDA,CNF", headers=auth(user_token))
         assert not any(res["source"] == "recipe" for res in r.json()["results"])
 
     def test_recipe_search_scoped_to_owner(self, client, user_token, other_user_token):
@@ -998,7 +998,7 @@ class TestMealAsFoodReference:
 
     def test_include_own_false_excludes_meals_from_search(self, client, user_token):
         client.post("/meals", headers=auth(user_token), json={"name": "Excludable Meal XYZ", "items": []})
-        r = client.get("/food/search?q=Excludable+Meal+XYZ&include_own=false", headers=auth(user_token))
+        r = client.get("/food/search?q=Excludable+Meal+XYZ&sources=USDA,CNF", headers=auth(user_token))
         assert not any(res["source"] == "meal" for res in r.json()["results"])
 
     def test_meal_search_scoped_to_owner(self, client, user_token, other_user_token):
@@ -1039,6 +1039,64 @@ class TestMealAsFoodReference:
     def test_invalid_unit_system_rejected_by_api(self, client, user_token):
         r = client.put("/preferences", headers=auth(user_token), json={"unit_system": "furlongs"})
         assert r.status_code == 422
+
+
+# ── Pantry as a food-search source ──────────────────────────────────────────
+# Added 2026-09-10 alongside the "recipe"/"meal"/"pantry" sources filter on
+# GET /food/search (previously only USDA/CNF were selectable, and
+# recipes/meals were an all-or-nothing include_own toggle -- see
+# _search_user_pantry in routers/food.py and search_pantry_by_name in
+# db/food/query.py).
+
+class TestPantryAsFoodReference:
+    def test_pantry_excluded_from_search_by_default(self, client, user_token):
+        """Unlike recipe/meal, pantry was never part of the default result
+        set before this became a selectable source -- an unfiltered
+        caller shouldn't suddenly see pantry items that weren't there
+        before (see DEFAULT_SEARCH_SOURCES's own comment)."""
+        client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Searchable Pantry Item XYZ", "source": "USDA", "source_id": "pantry-search-1",
+            "tracking_mode": "bulk", "calories": 50,
+        })
+        r = client.get("/food/search?q=Searchable+Pantry+Item+XYZ", headers=auth(user_token))
+        assert r.status_code == 200
+        assert not any(res["source"] == "pantry" for res in r.json()["results"])
+
+    def test_pantry_item_appears_in_search_when_source_requested(self, client, user_token):
+        client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Included Pantry Item XYZ", "source": "USDA", "source_id": "pantry-search-2",
+            "tracking_mode": "bulk", "calories": 75,
+            "nutrients": {"Protein": {"value": 5, "unit": "G"}},
+        })
+        r = client.get("/food/search?q=Included+Pantry+Item+XYZ&sources=pantry", headers=auth(user_token))
+        assert r.status_code == 200
+        results = r.json()["results"]
+        assert len(results) == 1
+        assert results[0]["source"] == "pantry"
+        assert results[0]["name"] == "Included Pantry Item XYZ"
+        assert results[0]["nutrients"]["Energy"]["value"] == 75
+        assert results[0]["nutrients"]["Protein"]["value"] == 5
+
+    def test_pantry_search_scoped_to_owner(self, client, user_token, other_user_token):
+        client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Owner Only Pantry Item ABC", "source": "USDA", "source_id": "pantry-search-3",
+            "tracking_mode": "bulk", "calories": 10,
+        })
+        r = client.get("/food/search?q=Owner+Only+Pantry+Item+ABC&sources=pantry", headers=auth(other_user_token))
+        assert not any(res["source"] == "pantry" for res in r.json()["results"])
+
+    def test_finished_pantry_item_excluded_from_search(self, client, user_token):
+        """Matches list_pantry_items' own 'gone means gone' behavior --
+        searching to log a food you already used up isn't useful."""
+        r = client.post("/pantry", headers=auth(user_token), json={
+            "food_name": "Finished Pantry Item XYZ", "source": "USDA", "source_id": "pantry-search-4",
+            "tracking_mode": "single", "calories": 5,
+        })
+        item_id = r.json()["id"]
+        client.post(f"/pantry/{item_id}/finish", headers=auth(user_token))
+
+        r2 = client.get("/food/search?q=Finished+Pantry+Item+XYZ&sources=pantry", headers=auth(user_token))
+        assert not any(res["source"] == "pantry" for res in r2.json()["results"])
 
 
 # ── Sync / BMR split ─────────────────────────────────────────────────────────

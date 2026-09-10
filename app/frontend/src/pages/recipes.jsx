@@ -4,6 +4,7 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/com
 import { cn } from '@/lib/utils'
 import { Plus, Trash2, Save, CheckCircle, Search, ArrowLeft, ChefHat, X, DownloadCloud, Loader2 } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
+import { useFoodSearch } from '@/hooks/useFoodSearch'
 
 // Protein/carbs/fat/fiber are deliberately NOT here — none of them are
 // macro fields on a recipe item; they're sent/read entirely via the
@@ -499,9 +500,7 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
   const [status, setStatus] = useState('')
 
   // Item search state
-  const [query, setQuery] = useState('')
-  const [results, setResults] = useState([])
-  const [searching, setSearching] = useState(false)
+  const { query, setQuery, results, searching, searchError, sourceChips, clear: clearSearch } = useFoodSearch()
 
   useEffect(() => {
     if (!recipeId) return
@@ -526,22 +525,6 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
       .finally(() => setLoading(false))
   }, [recipeId])
 
-  useEffect(() => {
-    const trimmed = query.trim()
-    if (trimmed.length < 2) {
-      setResults([])
-      return
-    }
-    setSearching(true)
-    const timer = setTimeout(async () => {
-      const res = await api(`/food/search?q=${encodeURIComponent(trimmed)}`)
-      const data = await res.json()
-      setResults(data.results || [])
-      setSearching(false)
-    }, 400)
-    return () => clearTimeout(timer)
-  }, [query])
-
   function addItem(result) {
     const referenceGrams = result.serving_size || 100
     items.push({
@@ -552,8 +535,7 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
       nutrients: result.nutrients,
     })
     setItems([...items])
-    setQuery('')
-    setResults([])
+    clearSearch()
   }
 
   function removeItem(idx) {
@@ -632,6 +614,7 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
           <CardTitle>Ingredients</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
+          {sourceChips}
           <div className="relative">
             <input
               type="text"

@@ -10,16 +10,25 @@ from ..nutrient_groups import order_nutrients
 router = APIRouter()
 
 
+VALID_SEARCH_SOURCES = {"USDA", "CNF", "recipe", "meal", "pantry"}
+# "recipe" and "meal" default on to preserve this endpoint's original
+# behavior (own recipes/meals always included) for any caller not passing
+# `sources` explicitly. "pantry" defaults off -- it was never part of the
+# result set before this became a selectable source (added 2026-09-10 per
+# user request), so an unfiltered caller shouldn't suddenly see pantry
+# items mixed into results they weren't there before.
+DEFAULT_SEARCH_SOURCES = "USDA,CNF,recipe,meal"
+
+
 @router.get("/search")
 async def search_food(
     q: str = Query(..., min_length=2),
-    sources: str = Query("USDA,CNF"),
-    include_own: bool = Query(True),
+    sources: str = Query(DEFAULT_SEARCH_SOURCES),
     user_id: int = Depends(get_current_user),
 ):
     """
-    Search foods across USDA and CNF databases, AND (by default) the
-    user's own saved recipes AND meals — matching Cronometer's own model,
+    Search across USDA, CNF, the user's own saved recipes and meals, and
+    (opt-in) the user's own pantry — matching Cronometer's own model,
     where a recipe/meal is just another searchable, loggable food-like
     entity (see nutrition-diary-design.md: Cronometer's real /food-search
     response includes plain foods and recipes together, distinguished by
@@ -28,32 +37,41 @@ async def search_food(
     every point a plain food is — searchable, loggable to diary, and
     addable to pantry — without any caller needing special-case logic.
 
-    A recipe result has source="recipe", id=<the recipe's own id>.
-    A meal result has source="meal", id=<the meal's own id>. Both use
-    the same (source, source_id) pair already used everywhere else a
-    food reference is stored (food_log, pantry_items, recipe_items,
-    meal_items) — but they resolve differently when actually LOGGED (see
-    routers/pantry.py's consume flow and the frontend's food-log.jsx):
-    a recipe logs as ONE aggregated food_log entry (scaled by servings),
-    a meal logs as MULTIPLE food_log entries (one per item, at face
-    value, matching POST /meals/{id}/log's existing behavior) — a caller
-    that only ever calls POST /food/log directly (bypassing the
+    A recipe result has source="recipe", id=<the recipe's own id>. A meal
+    result has source="meal", id=<the meal's own id>. A pantry result has
+    source="pantry", id=<the pantry item's own id>. All three use the
+    same (source, source_id) pair already used everywhere else a food
+    reference is stored (food_log, pantry_items, recipe_items,
+    meal_items) — but recipe/meal resolve differently when actually
+    LOGGED (see routers/pantry.py's consume flow and the frontend's
+    food-log.jsx): a recipe logs as ONE aggregated food_log entry (scaled
+    by servings), a meal logs as MULTIPLE food_log entries (one per item,
+    at face value, matching POST /meals/{id}/log's existing behavior) —
+    a caller that only ever calls POST /food/log directly (bypassing the
     recipe/meal-specific log endpoints) will NOT get a meal's per-item
     breakdown; it should instead call POST /meals/{id}/log for a
-    source="meal" result, the same way the frontend does.
+    source="meal" result, the same way the frontend does. A pantry
+    result logs like a plain food (POST /food/log directly).
 
-    `include_own=false` restricts to only the external sources (e.g. if
-    a caller specifically wants to exclude the user's own recipes/meals,
-    though no current caller does this).
+    `sources` is a comma-separated subset of {"USDA", "CNF", "recipe",
+    "meal", "pantry"} -- any combination, in any order. Defaults to
+    "USDA,CNF,recipe,meal" (this endpoint's original always-included set,
+    preserved for backward compatibility; "pantry" is opt-in only, see
+    DEFAULT_SEARCH_SOURCES above). An unrecognized value is silently
+    ignored rather than rejected, matching how an empty/all-excluded
+    `sources` already degrades to zero results rather than an error.
     """
     from integrations.food_search import search_foods
 
     source_list = [s.strip() for s in sources.split(",")]
     results = search_foods(q, source_list)
 
-    if include_own:
+    if "recipe" in source_list:
         results.extend(await _search_user_recipes(user_id, q))
+    if "meal" in source_list:
         results.extend(await _search_user_meals(user_id, q))
+    if "pantry" in source_list:
+        results.extend(await _search_user_pantry(user_id, q))
 
     for r in results:
         if "nutrients" in r:
@@ -72,43 +90,48 @@ async def _search_user_recipes(user_id: int, query: str) -> list[dict]:
 
     rows = await food_query.search_recipes_by_name(user_id, query)
 
+    # One connection reused for every matched recipe, not re-acquired per
+    # row -- a real N+1 (one pool.acquire() round-trip per search result)
+    # of the same shape as the Cronometer diary-sync bug fixed elsewhere
+    # in this codebase, just smaller in practice since a search typically
+    # matches a handful of the user's own recipes, not thousands of rows.
     results = []
-    for row in rows:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        for row in rows:
             recipe, items = await _get_recipe_with_items(conn, row["id"], user_id)
-        per_serving_macros, per_serving_nutrients = _recipe_per_serving_nutrition(recipe, items)
-        results.append({
-            "source": "recipe",
-            "id": str(recipe["id"]),
-            "name": recipe["name"],
-            "brand": "",
-            # This used to be the hardcoded string "Recipe" -- a
-            # UI-facing "what kind of result is this" label that
-            # collided with the real food-type category field added
-            # 2026-09-08 (app/food_category.py). The `recipe`/`meal`/
-            # `recipeOrMeal` booleans below already cover "what kind of
-            # result," and confirmed nothing in the frontend reads
-            # `.category`'s string value, so this now carries the
-            # recipe's actual resolved category instead.
-            "category": recipe["category"],
-            "nutrients": {
-                # per_serving_nutrients already carries "Protein",
-                # "Carbohydrate, by difference", "Total lipid (fat)", and
-                # "Fiber, total dietary" (scaled like any other nutrient,
-                # since none of them are top-level macro fields on a
-                # recipe item anymore) — only Energy (calories) needs to
-                # be overlaid, since that's the one field with its own
-                # dedicated top-level column.
-                **per_serving_nutrients,
-                "Energy": {"value": round(per_serving_macros["calories"]), "unit": "KCAL"},
-            },
-            "serving_size": 1,
-            "serving_unit": "serving",
-            "recipe": True,
-            "meal": False,
-            "recipeOrMeal": True,
-        })
+            per_serving_macros, per_serving_nutrients = _recipe_per_serving_nutrition(recipe, items)
+            results.append({
+                "source": "recipe",
+                "id": str(recipe["id"]),
+                "name": recipe["name"],
+                "brand": "",
+                # This used to be the hardcoded string "Recipe" -- a
+                # UI-facing "what kind of result is this" label that
+                # collided with the real food-type category field added
+                # 2026-09-08 (app/food_category.py). The `recipe`/`meal`/
+                # `recipeOrMeal` booleans below already cover "what kind of
+                # result," and confirmed nothing in the frontend reads
+                # `.category`'s string value, so this now carries the
+                # recipe's actual resolved category instead.
+                "category": recipe["category"],
+                "nutrients": {
+                    # per_serving_nutrients already carries "Protein",
+                    # "Carbohydrate, by difference", "Total lipid (fat)", and
+                    # "Fiber, total dietary" (scaled like any other nutrient,
+                    # since none of them are top-level macro fields on a
+                    # recipe item anymore) — only Energy (calories) needs to
+                    # be overlaid, since that's the one field with its own
+                    # dedicated top-level column.
+                    **per_serving_nutrients,
+                    "Energy": {"value": round(per_serving_macros["calories"]), "unit": "KCAL"},
+                },
+                "serving_size": 1,
+                "serving_unit": "serving",
+                "recipe": True,
+                "meal": False,
+                "recipeOrMeal": True,
+            })
     return results
 
 
@@ -140,39 +163,74 @@ async def _search_user_meals(user_id: int, query: str) -> list[dict]:
 
     rows = await food_query.search_meals_by_name(user_id, query)
 
+    # One connection reused for every matched meal, not re-acquired per
+    # row -- see _search_user_recipes's matching comment above; same
+    # N+1-connection anti-pattern, same fix.
     results = []
-    for row in rows:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        for row in rows:
             meal, items = await _get_meal_with_items(conn, row["id"], user_id)
 
-        macros = {"calories": 0.0}
-        nutrients: dict = {}
-        for item in items:
-            macros["calories"] += item.get("calories", 0) or 0
-            # Protein/carbs/fat/fiber are summed here along with every
-            # other non-macro nutrient — calories is the only field with
-            # its own dedicated column on a meal item.
-            for name, info in item.get("nutrients", {}).items():
-                bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
-                bucket["value"] += info["value"]
+            macros = {"calories": 0.0}
+            nutrients: dict = {}
+            for item in items:
+                macros["calories"] += item.get("calories", 0) or 0
+                # Protein/carbs/fat/fiber are summed here along with every
+                # other non-macro nutrient — calories is the only field with
+                # its own dedicated column on a meal item.
+                for name, info in item.get("nutrients", {}).items():
+                    bucket = nutrients.setdefault(name, {"value": 0.0, "unit": info["unit"]})
+                    bucket["value"] += info["value"]
 
+            results.append({
+                "source": "meal",
+                "id": str(meal["id"]),
+                "name": meal["name"],
+                "brand": "",
+                "category": meal["category"],
+                "nutrients": {
+                    **nutrients,
+                    "Energy": {"value": round(macros["calories"]), "unit": "KCAL"},
+                },
+                "serving_size": 1,
+                "serving_unit": "meal",
+                "recipe": False,
+                "meal": True,
+                "recipeOrMeal": True,
+                "item_count": len(items),
+            })
+    return results
+
+
+async def _search_user_pantry(user_id: int, query: str) -> list[dict]:
+    """Match the user's own (unfinished) pantry items by name and shape
+    each as a food-search result. Unlike a recipe/meal result, a pantry
+    result logs like a plain food (no aggregation/per-item breakdown
+    involved) -- POST /food/log directly, same as any USDA/CNF result.
+    No N+1 connection concern here: search_pantry_by_name already reads
+    the matched rows and their nutrients together in one acquired
+    connection, unlike recipes/meals which each need a further per-row
+    fetch (their own items) that the caller (this function) has to loop."""
+    rows, nutrients_by_item = await food_query.search_pantry_by_name(user_id, query)
+
+    results = []
+    for row in rows:
         results.append({
-            "source": "meal",
-            "id": str(meal["id"]),
-            "name": meal["name"],
+            "source": "pantry",
+            "id": str(row["id"]),
+            "name": row["food_name"],
             "brand": "",
-            "category": meal["category"],
+            "category": row["category"],
             "nutrients": {
-                **nutrients,
-                "Energy": {"value": round(macros["calories"]), "unit": "KCAL"},
+                **nutrients_by_item.get(row["id"], {}),
+                "Energy": {"value": round(row["calories"] or 0), "unit": "KCAL"},
             },
-            "serving_size": 1,
-            "serving_unit": "meal",
+            "serving_size": row["serving_size"],
+            "serving_unit": row["serving_unit"],
             "recipe": False,
-            "meal": True,
-            "recipeOrMeal": True,
-            "item_count": len(items),
+            "meal": False,
+            "recipeOrMeal": False,
         })
     return results
 

@@ -6,6 +6,7 @@ import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import { Plus, Trash2, CheckCheck, AlertTriangle, X, Refrigerator, Share2, ChefHat, ChevronDown, ChevronRight } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
+import { useFoodSearch } from '@/hooks/useFoodSearch'
 
 // Protein/carbs/fat/fiber are deliberately NOT here — none of them are
 // macro fields on a pantry item; they're sent/read entirely via the
@@ -522,25 +523,7 @@ function AddItemForm({ onDone, onCancel }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
-  const [query, setQuery] = useState('')
-  const [results, setResults] = useState([])
-  const [searching, setSearching] = useState(false)
-
-  useEffect(() => {
-    const trimmed = query.trim()
-    if (trimmed.length < 2) {
-      setResults([])
-      return
-    }
-    setSearching(true)
-    const timer = setTimeout(async () => {
-      const res = await api(`/food/search?q=${encodeURIComponent(trimmed)}`)
-      const data = await res.json()
-      setResults(data.results || [])
-      setSearching(false)
-    }, 400)
-    return () => clearTimeout(timer)
-  }, [query])
+  const { query, setQuery, results, searching, searchError, sourceChips, clear: clearSearch } = useFoodSearch()
 
   function selectResult(r) {
     // Store nutrition PER the result's own reference serving (serving_size/
@@ -555,8 +538,7 @@ function AddItemForm({ onDone, onCancel }) {
       calories: extractMacro(r.nutrients, 'calories'),
       nutrients: r.nutrients,
     })
-    setQuery('')
-    setResults([])
+    clearSearch()
   }
 
   async function handleSave() {
@@ -602,6 +584,7 @@ function AddItemForm({ onDone, onCancel }) {
         </button>
       </CardHeader>
       <CardContent className="space-y-4">
+        {sourceChips}
         <div className="relative">
           <label className="text-xs font-medium text-muted-foreground">Food (search to auto-fill, or type manually)</label>
           <input

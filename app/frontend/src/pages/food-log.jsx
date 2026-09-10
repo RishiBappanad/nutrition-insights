@@ -1,12 +1,12 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState } from 'react'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import { todayIso } from '@/lib/dates'
 import { Search, Plus, CheckCircle, Info } from 'lucide-react'
+import { useFoodSearch } from '@/hooks/useFoodSearch'
 
 const MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack']
-const SEARCH_DEBOUNCE_MS = 400
 
 // USDA FoodData Central reports macros as regular nutrient entries, not
 // separate fields — "Energy" is the exact nutrient name USDA uses
@@ -43,57 +43,11 @@ function extractMacro(nutrients, key) {
  * never computes scaled nutrients itself.
  */
 export default function FoodLog() {
-  const [query, setQuery] = useState('')
-  const [results, setResults] = useState([])
-  const [searching, setSearching] = useState(false)
-  const [searchError, setSearchError] = useState('')
+  const { query, setQuery, results, searching, searchError, sourceChips } = useFoodSearch()
   const [selected, setSelected] = useState(null)
   const [previewing, setPreviewing] = useState(null)
   const [logging, setLogging] = useState(false)
   const [status, setStatus] = useState('')
-
-  // Guards against a slow earlier request's results overwriting a
-  // newer one's — without this, typing "chi" then quickly "chicken"
-  // could show "chi"'s results last if that request happens to resolve
-  // after "chicken"'s, since fetches aren't guaranteed to resolve in
-  // the order they were sent.
-  const latestQueryRef = useRef('')
-
-  useEffect(() => {
-    const trimmed = query.trim()
-    if (trimmed.length < 2) {
-      setResults([])
-      setSearching(false)
-      setSearchError('')
-      return
-    }
-
-    setSearching(true)
-    setSearchError('')
-    const timer = setTimeout(async () => {
-      latestQueryRef.current = trimmed
-      try {
-        const res = await api(`/food/search?q=${encodeURIComponent(trimmed)}`)
-        if (latestQueryRef.current !== trimmed) return // a newer query has since started
-        if (!res.ok) {
-          setSearchError(`Search failed (${res.status})`)
-          setResults([])
-        } else {
-          const data = await res.json()
-          setResults(data.results || [])
-        }
-      } catch {
-        if (latestQueryRef.current === trimmed) {
-          setSearchError('Network error')
-          setResults([])
-        }
-      } finally {
-        if (latestQueryRef.current === trimmed) setSearching(false)
-      }
-    }, SEARCH_DEBOUNCE_MS)
-
-    return () => clearTimeout(timer)
-  }, [query])
 
   function selectResult(result) {
     // Recipes are returned as search results per-serving (serving_size:
@@ -212,6 +166,8 @@ export default function FoodLog() {
               {searching ? 'Searching...' : ''}
             </div>
           </div>
+
+          {sourceChips}
 
           {results.length > 0 && (
             <div className="space-y-1.5 max-h-80 overflow-y-auto">

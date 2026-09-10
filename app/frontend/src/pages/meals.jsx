@@ -3,6 +3,7 @@ import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Plus, Save, CheckCircle, ArrowLeft, Layers, X } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
+import { useFoodSearch } from '@/hooks/useFoodSearch'
 
 // Protein/carbs/fat/fiber are deliberately NOT here — none of them are
 // macro fields on a meal item; they're sent/read entirely via the
@@ -219,9 +220,7 @@ function MealEditor({ mealId, onDone, onCancel }) {
   const [saving, setSaving] = useState(false)
   const [status, setStatus] = useState('')
 
-  const [query, setQuery] = useState('')
-  const [results, setResults] = useState([])
-  const [searching, setSearching] = useState(false)
+  const { query, setQuery, results, searching, searchError, sourceChips, clear: clearSearch } = useFoodSearch()
 
   useEffect(() => {
     if (!mealId) return
@@ -239,22 +238,6 @@ function MealEditor({ mealId, onDone, onCancel }) {
       .finally(() => setLoading(false))
   }, [mealId])
 
-  useEffect(() => {
-    const trimmed = query.trim()
-    if (trimmed.length < 2) {
-      setResults([])
-      return
-    }
-    setSearching(true)
-    const timer = setTimeout(async () => {
-      const res = await api(`/food/search?q=${encodeURIComponent(trimmed)}`)
-      const data = await res.json()
-      setResults(data.results || [])
-      setSearching(false)
-    }, 400)
-    return () => clearTimeout(timer)
-  }, [query])
-
   function addItem(result) {
     items.push({
       food_name: result.name, source: result.source, source_id: result.id,
@@ -263,8 +246,7 @@ function MealEditor({ mealId, onDone, onCancel }) {
       nutrients: result.nutrients,
     })
     setItems([...items])
-    setQuery('')
-    setResults([])
+    clearSearch()
   }
 
   function removeItem(idx) {
@@ -316,6 +298,7 @@ function MealEditor({ mealId, onDone, onCancel }) {
           <CardTitle>Items</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
+          {sourceChips}
           <div className="relative">
             <input
               type="text"
