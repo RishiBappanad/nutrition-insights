@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils'
 import { todayIso } from '@/lib/dates'
 import { Search, Plus, CheckCircle, Info } from 'lucide-react'
 import { useFoodSearch } from '@/hooks/useFoodSearch'
+import { FoodPreviewCard } from '@/components/ui/food-preview-card'
 
 const MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack']
 
@@ -205,25 +206,11 @@ export default function FoodLog() {
           )}
 
           {previewing && (
-            <div className="rounded-md border border-border p-3 space-y-2">
-              <div className="flex items-center justify-between">
-                <p className="text-sm font-medium text-foreground">{previewing.name} — nutrient breakdown</p>
-                <button onClick={() => setPreviewing(null)} className="text-xs text-muted-foreground hover:text-foreground">
-                  Close
-                </button>
-              </div>
-              <div className="space-y-1 max-h-48 overflow-y-auto">
-                {/* Not re-sorted — GET /food/search already returns
-                    nutrients in TrackStack's canonical display order
-                    (nutrient_groups.order_nutrients). */}
-                {Object.entries(previewing.nutrients || {})
-                  .map(([name, info]) => (
-                    <div key={name} className="flex items-center justify-between text-xs">
-                      <span className="text-foreground">{name}</span>
-                      <span className="font-mono text-muted-foreground">{info.value}{info.unit}</span>
-                    </div>
-                  ))}
-              </div>
+            <div className="space-y-2">
+              <button onClick={() => setPreviewing(null)} className="text-xs text-muted-foreground hover:text-foreground">
+                Close preview
+              </button>
+              <FoodPreviewCard result={previewing} />
             </div>
           )}
 

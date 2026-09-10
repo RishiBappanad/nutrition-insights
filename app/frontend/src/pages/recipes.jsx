@@ -2,9 +2,11 @@ import { useState, useEffect } from 'react'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
-import { Plus, Trash2, Save, CheckCircle, Search, ArrowLeft, ChefHat, X, DownloadCloud, Loader2 } from 'lucide-react'
+import { Plus, Trash2, Save, CheckCircle, Search, ArrowLeft, ChefHat, X, DownloadCloud, Loader2, Info } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
 import { useFoodSearch } from '@/hooks/useFoodSearch'
+import { FOOD_CATEGORIES } from '@/lib/food-categories'
+import { FoodPreviewCard } from '@/components/ui/food-preview-card'
 
 // Protein/carbs/fat/fiber are deliberately NOT here — none of them are
 // macro fields on a recipe item; they're sent/read entirely via the
@@ -470,23 +472,6 @@ function RecipeDetail({ recipeId, onBack, onEdit }) {
   )
 }
 
-// Mirrors app/food_category.py's FoodCategory enum -- kept as plain
-// display labels here since this is just dropdown data, not logic (the
-// actual resolution -- auto-compute vs. override -- happens once,
-// server-side, via food_category.resolve_category()).
-const FOOD_CATEGORIES = [
-  { value: 'produce', label: 'Produce' },
-  { value: 'protein', label: 'Protein' },
-  { value: 'dairy', label: 'Dairy' },
-  { value: 'grains_starches', label: 'Grains & Starches' },
-  { value: 'legumes_nuts', label: 'Legumes & Nuts' },
-  { value: 'fats_oils', label: 'Fats & Oils' },
-  { value: 'beverages', label: 'Beverages' },
-  { value: 'alcohol', label: 'Alcohol' },
-  { value: 'snacks_sweets', label: 'Snacks & Sweets' },
-  { value: 'prepared_restaurant', label: 'Prepared / Restaurant' },
-]
-
 function RecipeEditor({ recipeId, onDone, onCancel }) {
   const [name, setName] = useState('')
   const [servingsPerBatch, setServingsPerBatch] = useState(1)
@@ -501,6 +486,7 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
 
   // Item search state
   const { query, setQuery, results, searching, searchError, sourceChips, clear: clearSearch } = useFoodSearch()
+  const [previewing, setPreviewing] = useState(null)
 
   useEffect(() => {
     if (!recipeId) return
@@ -536,6 +522,7 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
     })
     setItems([...items])
     clearSearch()
+    setPreviewing(null)
   }
 
   function removeItem(idx) {
@@ -627,18 +614,35 @@ function RecipeEditor({ recipeId, onDone, onCancel }) {
               <div className="absolute z-10 mt-1 w-full bg-card border border-border rounded-md shadow-lg max-h-60 overflow-y-auto">
                 {searching && <div className="px-3 py-2 text-xs text-muted-foreground">Searching...</div>}
                 {results.map((r) => (
-                  <button
-                    key={`${r.source}-${r.id}`}
-                    onClick={() => addItem(r)}
-                    className="w-full text-left px-3 py-2 text-sm hover:bg-muted transition-colors flex items-center justify-between gap-2"
-                  >
-                    <span className="truncate">{r.name}</span>
-                    <Plus className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-                  </button>
+                  <div key={`${r.source}-${r.id}`} className="flex items-center gap-1">
+                    <button
+                      onClick={() => addItem(r)}
+                      className="flex-1 text-left px-3 py-2 text-sm hover:bg-muted transition-colors flex items-center justify-between gap-2 min-w-0"
+                    >
+                      <span className="truncate">{r.name}</span>
+                      <Plus className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                    </button>
+                    <button
+                      onClick={() => setPreviewing(previewing === r ? null : r)}
+                      title="Preview"
+                      className="p-2 mr-1 rounded-md text-muted-foreground hover:bg-muted transition-colors flex-shrink-0"
+                    >
+                      <Info className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 ))}
               </div>
             )}
           </div>
+
+          {previewing && (
+            <div className="space-y-2">
+              <button onClick={() => setPreviewing(null)} className="text-xs text-muted-foreground hover:text-foreground">
+                Close preview
+              </button>
+              <FoodPreviewCard result={previewing} />
+            </div>
+          )}
 
           {items.length === 0 ? (
             <p className="text-sm text-muted-foreground">No ingredients added yet.</p>

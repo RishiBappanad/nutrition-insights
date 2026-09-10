@@ -4,9 +4,10 @@ import { api } from '@/lib/api'
 import { usePendingAction } from '@/lib/pending-action'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
-import { Plus, Trash2, CheckCheck, AlertTriangle, X, Refrigerator, Share2, ChefHat, ChevronDown, ChevronRight } from 'lucide-react'
+import { Plus, Trash2, CheckCheck, AlertTriangle, X, Refrigerator, Share2, ChefHat, ChevronDown, ChevronRight, Info } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
 import { useFoodSearch } from '@/hooks/useFoodSearch'
+import { FoodPreviewCard } from '@/components/ui/food-preview-card'
 
 // Protein/carbs/fat/fiber are deliberately NOT here — none of them are
 // macro fields on a pantry item; they're sent/read entirely via the
@@ -524,6 +525,7 @@ function AddItemForm({ onDone, onCancel }) {
   const [error, setError] = useState('')
 
   const { query, setQuery, results, searching, searchError, sourceChips, clear: clearSearch } = useFoodSearch()
+  const [previewing, setPreviewing] = useState(null)
 
   function selectResult(r) {
     // Store nutrition PER the result's own reference serving (serving_size/
@@ -539,6 +541,7 @@ function AddItemForm({ onDone, onCancel }) {
       nutrients: r.nutrients,
     })
     clearSearch()
+    setPreviewing(null)
   }
 
   async function handleSave() {
@@ -598,17 +601,34 @@ function AddItemForm({ onDone, onCancel }) {
             <div className="absolute z-10 mt-1 w-full bg-card border border-border rounded-md shadow-lg max-h-60 overflow-y-auto">
               {searching && <div className="px-3 py-2 text-xs text-muted-foreground">Searching...</div>}
               {results.map((r) => (
-                <button
-                  key={`${r.source}-${r.id}`}
-                  onClick={() => selectResult(r)}
-                  className="w-full text-left px-3 py-2 text-sm hover:bg-muted transition-colors"
-                >
-                  {r.name}
-                </button>
+                <div key={`${r.source}-${r.id}`} className="flex items-center gap-1">
+                  <button
+                    onClick={() => selectResult(r)}
+                    className="flex-1 text-left px-3 py-2 text-sm hover:bg-muted transition-colors min-w-0 truncate"
+                  >
+                    {r.name}
+                  </button>
+                  <button
+                    onClick={() => setPreviewing(previewing === r ? null : r)}
+                    title="Preview"
+                    className="p-2 mr-1 rounded-md text-muted-foreground hover:bg-muted transition-colors flex-shrink-0"
+                  >
+                    <Info className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               ))}
             </div>
           )}
         </div>
+
+        {previewing && (
+          <div className="space-y-2">
+            <button onClick={() => setPreviewing(null)} className="text-xs text-muted-foreground hover:text-foreground">
+              Close preview
+            </button>
+            <FoodPreviewCard result={previewing} />
+          </div>
+        )}
 
         <div className="space-y-1.5">
           <label className="text-xs font-medium text-muted-foreground">Tracking Mode</label>

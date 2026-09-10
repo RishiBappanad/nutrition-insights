@@ -384,8 +384,9 @@ function MicronutrientCardSettings() {
           <CardTitle>"Important to Me" Micronutrients</CardTitle>
         </div>
         <CardDescription>
-          Pick which micronutrients show on your dashboard's "Important to Me" card — everything
-          else is still tracked and visible in the full report, just not front-and-center.
+          Pick which micronutrients show on your dashboard's "Important to Me" card and on every
+          food's quick-preview card (search results across the app) — everything else is still
+          tracked and visible in the full report, just not front-and-center.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">

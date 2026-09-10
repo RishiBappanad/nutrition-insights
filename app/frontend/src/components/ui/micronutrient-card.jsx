@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Link } from 'wouter'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
+import { NutrientBar } from '@/components/ui/nutrient-bar'
 import { ChevronLeft, ChevronRight, ClipboardList, Settings2 } from 'lucide-react'
 
 /**
@@ -35,29 +36,17 @@ export function NutrientRow({ name, entry, colors, sufficiencyThresholdPct }) {
   }
   const status = statusFor(entry, sufficiencyThresholdPct)
   const color = statusStyles[status]
-  const pct = entry?.percent_of_target ?? 0
-  const barWidth = Math.min(pct, 100)
-
-  return (
-    <div className="space-y-1">
-      <div className="flex items-baseline justify-between text-xs">
-        <span className="text-foreground font-medium">{name}</span>
-        <span className="font-mono" style={{ color }}>
-          {Math.round(entry?.actual ?? 0)}
-          {entry?.unit ?? ''}
-          {entry?.daily_target != null && (
-            <span className="text-muted-foreground"> / {Math.round(entry.daily_target)}{entry.unit}</span>
-          )}
-        </span>
-      </div>
-      <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
-        <div
-          className="h-full rounded-full transition-all"
-          style={{ width: `${entry ? barWidth : 0}%`, backgroundColor: color }}
-        />
-      </div>
-    </div>
+  const valueLabel = (
+    <>
+      {Math.round(entry?.actual ?? 0)}
+      {entry?.unit ?? ''}
+      {entry?.daily_target != null && (
+        <span className="text-muted-foreground"> / {Math.round(entry.daily_target)}{entry.unit}</span>
+      )}
+    </>
   )
+
+  return <NutrientBar name={name} valueLabel={valueLabel} percent={entry ? entry.percent_of_target ?? 0 : 0} color={color} />
 }
 
 export function MicronutrientCard({ progress, colors, sufficiencyThresholdPct, importantNutrients, date }) {

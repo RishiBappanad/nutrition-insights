@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
-import { Plus, Save, CheckCircle, ArrowLeft, Layers, X } from 'lucide-react'
+import { Plus, Save, CheckCircle, ArrowLeft, Layers, X, Info } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
 import { useFoodSearch } from '@/hooks/useFoodSearch'
+import { FoodPreviewCard } from '@/components/ui/food-preview-card'
 
 // Protein/carbs/fat/fiber are deliberately NOT here — none of them are
 // macro fields on a meal item; they're sent/read entirely via the
@@ -221,6 +222,7 @@ function MealEditor({ mealId, onDone, onCancel }) {
   const [status, setStatus] = useState('')
 
   const { query, setQuery, results, searching, searchError, sourceChips, clear: clearSearch } = useFoodSearch()
+  const [previewing, setPreviewing] = useState(null)
 
   useEffect(() => {
     if (!mealId) return
@@ -247,6 +249,7 @@ function MealEditor({ mealId, onDone, onCancel }) {
     })
     setItems([...items])
     clearSearch()
+    setPreviewing(null)
   }
 
   function removeItem(idx) {
@@ -311,18 +314,35 @@ function MealEditor({ mealId, onDone, onCancel }) {
               <div className="absolute z-10 mt-1 w-full bg-card border border-border rounded-md shadow-lg max-h-60 overflow-y-auto">
                 {searching && <div className="px-3 py-2 text-xs text-muted-foreground">Searching...</div>}
                 {results.map((r) => (
-                  <button
-                    key={`${r.source}-${r.id}`}
-                    onClick={() => addItem(r)}
-                    className="w-full text-left px-3 py-2 text-sm hover:bg-muted transition-colors flex items-center justify-between gap-2"
-                  >
-                    <span className="truncate">{r.name}</span>
-                    <Plus className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-                  </button>
+                  <div key={`${r.source}-${r.id}`} className="flex items-center gap-1">
+                    <button
+                      onClick={() => addItem(r)}
+                      className="flex-1 text-left px-3 py-2 text-sm hover:bg-muted transition-colors flex items-center justify-between gap-2 min-w-0"
+                    >
+                      <span className="truncate">{r.name}</span>
+                      <Plus className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                    </button>
+                    <button
+                      onClick={() => setPreviewing(previewing === r ? null : r)}
+                      title="Preview"
+                      className="p-2 mr-1 rounded-md text-muted-foreground hover:bg-muted transition-colors flex-shrink-0"
+                    >
+                      <Info className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 ))}
               </div>
             )}
           </div>
+
+          {previewing && (
+            <div className="space-y-2">
+              <button onClick={() => setPreviewing(null)} className="text-xs text-muted-foreground hover:text-foreground">
+                Close preview
+              </button>
+              <FoodPreviewCard result={previewing} />
+            </div>
+          )}
 
           {items.length === 0 ? (
             <p className="text-sm text-muted-foreground">No items added yet.</p>
