@@ -2,12 +2,6 @@ import { useState } from 'react'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '@/components/ui/card'
 import { Apple } from 'lucide-react'
 
-// Identity (registration, login, Google OAuth) is owned by trackstack-auth,
-// not this app's own backend — this page talks to trackstack-auth directly
-// instead of a local /auth/register or /auth/login endpoint, so the same
-// account works across every TrackStack app.
-const TRACKSTACK_AUTH_URL = import.meta.env.VITE_TRACKSTACK_AUTH_URL ?? ''
-
 function GoogleIcon() {
   return (
     <svg className="h-4 w-4" viewBox="0 0 24 24">
@@ -19,7 +13,7 @@ function GoogleIcon() {
   )
 }
 
-export default function Login({ onLogin }) {
+export default function Login({ onLogin, onRegister, onGoogleLogin }) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [isRegister, setIsRegister] = useState(false)
@@ -30,34 +24,23 @@ export default function Login({ onLogin }) {
     e.preventDefault()
     setLoading(true)
     setError('')
-    const endpoint = isRegister ? '/register' : '/login'
     try {
-      const res = await fetch(`${TRACKSTACK_AUTH_URL}${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
-      })
-      const data = await res.json()
-      if (data.token) {
-        localStorage.setItem('token', data.token)
-        onLogin()
-      } else {
-        setError(data.error || 'Failed')
-      }
-    } catch {
-      setError('Network error')
+      // Login/register themselves store the token and flip App's
+      // auth.isAuthenticated (useTrackStackAuth, shared from App.jsx) --
+      // nothing left to do here on success, the app just re-renders into
+      // the authenticated view on its own.
+      await (isRegister ? onRegister(email, password) : onLogin(email, password))
+    } catch (err) {
+      setError(err.message || 'Network error')
     }
     setLoading(false)
   }
 
   async function handleGoogleLogin() {
     try {
-      const returnTo = window.location.origin
-      const res = await fetch(`${TRACKSTACK_AUTH_URL}/google?returnTo=${encodeURIComponent(returnTo)}`)
-      const data = await res.json()
-      if (data.url) window.location.href = data.url
-    } catch {
-      setError('Google login unavailable')
+      await onGoogleLogin(window.location.origin)
+    } catch (err) {
+      setError(err.message || 'Google login unavailable')
     }
   }
 

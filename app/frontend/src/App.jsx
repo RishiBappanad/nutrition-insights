@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useTrackStackAuth } from 'trackstack-ui'
 import { Switch, Route, Router } from 'wouter'
 import { Layout } from '@/components/layout'
 import { PendingActionProvider } from '@/lib/pending-action'
-import { isAuthenticated, logout } from '@/lib/api'
 import Login from '@/pages/login'
 import Dashboard from '@/pages/dashboard'
 import Charts from '@/pages/charts'
@@ -66,20 +66,44 @@ function AppRoutes({ onLogout }) {
 }
 
 export default function App() {
-  const [authed, setAuthed] = useState(isAuthenticated())
+  // One shared useTrackStackAuth instance for the whole app -- Login
+  // needs auth.login/register/loginWithGoogle, AppRoutes needs
+  // auth.logout, and both need to see the SAME auth.isAuthenticated
+  // flip when either happens. A separate useTrackStackAuth() call inside
+  // Login itself would have its own independent token state that
+  // wouldn't reactively update this component (the hook's cross-tab
+  // `storage` listener only fires for OTHER tabs' writes, never this
+  // tab's own), so the hook is called once here and passed down instead.
+  const auth = useTrackStackAuth({ tokenKey: 'token', authBaseUrl: import.meta.env.VITE_TRACKSTACK_AUTH_URL ?? '' })
 
-  if (!authed) {
-    return <Login onLogin={() => setAuthed(true)} />
+  // Single sign-on: before showing the login page, silently check whether
+  // trackstack-auth's own session cookie already authenticates this
+  // browser (e.g. the user logged into a DIFFERENT TrackStack app
+  // earlier). Skipped entirely if a local token already exists -- no
+  // need to round-trip when auth.isAuthenticated is already true.
+  const [ssoChecked, setSsoChecked] = useState(false)
+  useEffect(() => {
+    if (auth.isAuthenticated) {
+      setSsoChecked(true)
+      return
+    }
+    auth.trySilentSSO().finally(() => setSsoChecked(true))
+    // Intentionally mount-only -- trySilentSSO only makes sense once,
+    // before the first render decides which UI to show.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  if (!ssoChecked) {
+    return null
+  }
+
+  if (!auth.isAuthenticated) {
+    return <Login onLogin={auth.login} onRegister={auth.register} onGoogleLogin={auth.loginWithGoogle} />
   }
 
   return (
     <Router base={BASE}>
-      <AppRoutes
-        onLogout={() => {
-          logout()
-          setAuthed(false)
-        }}
-      />
+      <AppRoutes onLogout={auth.logout} />
     </Router>
   )
 }
