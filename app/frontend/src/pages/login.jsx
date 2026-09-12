@@ -38,7 +38,13 @@ export default function Login({ onLogin, onRegister, onGoogleLogin }) {
 
   async function handleGoogleLogin() {
     try {
-      await onGoogleLogin(window.location.origin)
+      // origin alone loses this app's own /nutrition path now that the
+      // gateway puts every tracker on one shared origin -- without the
+      // pathname, trackstack-auth's /google/callback redirect would land
+      // on the gateway's bare root (the home page) instead of back here,
+      // found 2026-09-12 as the reason Google login silently "did
+      // nothing" post-gateway-cutover.
+      await onGoogleLogin(window.location.origin + window.location.pathname)
     } catch (err) {
       setError(err.message || 'Google login unavailable')
     }
