@@ -16,7 +16,18 @@ env:
   REGION: us-east1
   SERVICE: trackstack-nutrition
   IMAGE: us-east1-docker.pkg.dev/trackstack-501915/cloud-run-source-deploy/trackstack-nutrition:latest
-  TRACKSTACK_AUTH_URL: https://trackstack-auth-824912246889.us-east1.run.app
+  # Gateway cutover (2026-09-12): this service is now only meant to be
+  # reached through trackstack-gateway at /nutrition -- BASE_PATH/API_BASE
+  # bake that prefix into the built frontend's own asset/API paths, and
+  # TRACKSTACK_AUTH_URL becomes gateway-relative (same origin) instead of
+  # an absolute cross-origin URL. Visiting this service's own bare Cloud
+  # Run URL directly no longer serves a working frontend as a result
+  # (asset tags reference /nutrition/assets/... with nothing to strip
+  # that prefix outside the gateway) -- the backend/API itself is
+  # completely unaffected, see nutrition-insights' own app/__init__.py.
+  BASE_PATH: /nutrition/
+  API_BASE: /nutrition
+  TRACKSTACK_AUTH_URL: /auth
 
 jobs:
   deploy:
@@ -45,6 +56,8 @@ jobs:
         # for the full diagnosis.
         run: |
           docker build \
+            --build-arg "BASE_PATH=${{ env.BASE_PATH }}" \
+            --build-arg "API_BASE=${{ env.API_BASE }}" \
             --build-arg "TRACKSTACK_AUTH_URL=${{ env.TRACKSTACK_AUTH_URL }}" \
             -t "${{ env.IMAGE }}" .
 
