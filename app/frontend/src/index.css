@@ -49,6 +49,7 @@
   --color-switcher-foreground: hsl(var(--switcher-foreground));
   --color-switcher-border: hsl(var(--switcher-border));
   --color-switcher-active: hsl(var(--switcher-active));
+  --color-switcher-active-foreground: hsl(var(--switcher-active-foreground));
 
   --font-sans: var(--app-font-sans);
   --font-mono: var(--app-font-mono);
@@ -110,6 +111,10 @@
   --switcher-foreground: 210 15% 60%;
   --switcher-border: 220 25% 10%;
   --switcher-active: 210 60% 18%;
+  /* Explicit rather than relying on --primary-foreground happening to
+     also be white -- see AppSwitcher.tsx's doc comment on why that
+     coincidence broke for finance-tracker's dark theme. */
+  --switcher-active-foreground: 0 0% 100%;
 
   --app-font-sans: 'Plus Jakarta Sans', sans-serif;
   --app-font-mono: 'JetBrains Mono', monospace;
