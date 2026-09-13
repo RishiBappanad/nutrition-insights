@@ -13,7 +13,10 @@ not this service. This module only:
   3. Owns nutrition-specific data unrelated to identity, like Hevy/Cronometer
      credentials (see /credentials below).
 """
+import asyncio
 import os
+from typing import Optional
+import requests
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
@@ -47,16 +50,53 @@ async def _ensure_local_user(account_id: int, email: str) -> None:
     await auth_query.ensure_local_user(account_id, email)
 
 
+# trackstack-auth is the only place personal-access-token storage/lookup
+# lives -- a token this service's own JWT verification doesn't recognize is
+# checked against trackstack-auth's POST /tokens/verify instead, mirroring
+# todo-tracker's requireAuth (the first tracker to actually implement this).
+# Despite ACTIONS_CONTRACT_SPEC.md documenting PATs as working "everywhere
+# requireAuth is used," this service never actually had the fallback --
+# confirmed live: a real PAT returned 401 here while working fine against
+# todo-tracker. Uses `requests` (this codebase's only HTTP client) inside
+# asyncio.to_thread rather than calling it directly -- a bare blocking call
+# in an async function is exactly the class of bug already found and fixed
+# once in this codebase's Cronometer sync (see sync.py's history), where a
+# blocking call inside an async def froze the entire event loop, not just
+# the one request.
+TRACKSTACK_AUTH_URL = os.environ.get("TRACKSTACK_AUTH_URL")
+
+
+def _verify_personal_access_token_sync(token: str) -> Optional[dict]:
+    if not TRACKSTACK_AUTH_URL:
+        return None
+    try:
+        res = requests.post(f"{TRACKSTACK_AUTH_URL}/tokens/verify", json={"token": token}, timeout=5)
+        if not res.ok:
+            return None
+        return res.json().get("account")
+    except requests.RequestException:
+        return None
+
+
 async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)) -> int:
-    """Verify a trackstack-auth JWT and return the account id.
-    Ensures a local mirror row exists so downstream FK-dependent queries work."""
+    """Verify a trackstack-auth JWT (or, failing that, a personal access
+    token) and return the account id. Ensures a local mirror row exists so
+    downstream FK-dependent queries work."""
+    account_id = None
+    email = None
     try:
         payload = jwt.decode(creds.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        account_id = payload.get("accountId")
+        email = payload.get("email")
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        pass  # Not a valid JWT -- fall through and try it as a PAT below.
 
-    account_id = payload.get("accountId")
-    email = payload.get("email")
+    if account_id is None or email is None:
+        account = await asyncio.to_thread(_verify_personal_access_token_sync, creds.credentials)
+        if account:
+            account_id = account.get("accountId")
+            email = account.get("email")
+
     if account_id is None or email is None:
         raise HTTPException(status_code=401, detail="Invalid token")
 
