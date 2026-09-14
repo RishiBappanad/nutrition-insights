@@ -106,6 +106,6 @@ async def update_exercise_entry(entry_id: int, req: ExerciseLogUpdateRequest, us
 @router.delete("/{entry_id}")
 async def delete_exercise_entry(entry_id: int, user_id: int = Depends(get_current_user)):
     result = await exercise_query.delete_exercise_entry(entry_id, user_id)
-    if result == "DELETE 0":
+    if result is None:
         raise HTTPException(status_code=404, detail="Exercise entry not found")
     return {"status": "deleted"}

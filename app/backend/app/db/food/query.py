@@ -1,23 +1,29 @@
-from .. import get_pool
+from .. import get_pool, delete_with_ownership_returning
+from ..sql_builder import select_clause, where_clause, order_by_clause
 from ...nutrient_facts import read_nutrients_bulk, delete_nutrient_facts
+from ...domain_events import log_domain_event
 
 
 async def search_recipes_by_name(user_id: int, query: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT id, name, servings_per_batch FROM recipes WHERE user_id = $1 AND name ILIKE $2 ORDER BY name",
-            user_id, f"%{query}%",
+        sql = (
+            select_clause("recipes", ["id", "name", "servings_per_batch"])
+            + where_clause(["user_id = $1", "name ILIKE $2"])
+            + order_by_clause("name")
         )
+        return await conn.fetch(sql, user_id, f"%{query}%")
 
 
 async def search_meals_by_name(user_id: int, query: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT id, name FROM meals WHERE user_id = $1 AND name ILIKE $2 ORDER BY name",
-            user_id, f"%{query}%",
+        sql = (
+            select_clause("meals", ["id", "name"])
+            + where_clause(["user_id = $1", "name ILIKE $2"])
+            + order_by_clause("name")
         )
+        return await conn.fetch(sql, user_id, f"%{query}%")
 
 
 async def search_pantry_by_name(user_id: int, query: str):
@@ -28,12 +34,12 @@ async def search_pantry_by_name(user_id: int, query: str):
     food you already used up isn't useful."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT id, food_name, category, serving_size, serving_unit, calories
-               FROM pantry_items WHERE user_id = $1 AND is_finished = FALSE AND food_name ILIKE $2
-               ORDER BY food_name""",
-            user_id, f"%{query}%",
+        sql = (
+            select_clause("pantry_items", ["id", "food_name", "category", "serving_size", "serving_unit", "calories"])
+            + where_clause(["user_id = $1", "is_finished = FALSE", "food_name ILIKE $2"])
+            + order_by_clause("food_name")
         )
+        rows = await conn.fetch(sql, user_id, f"%{query}%")
         item_ids = [r["id"] for r in rows]
         nutrients_by_item = await read_nutrients_bulk(conn, "pantry_item", item_ids)
     return rows, nutrients_by_item
@@ -44,10 +50,8 @@ async def list_food_log(user_id: int, date: str):
     original call read both within the same acquired connection."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM food_log WHERE user_id = $1 AND date = $2 ORDER BY id",
-            user_id, date,
-        )
+        sql = select_clause("food_log") + where_clause(["user_id = $1", "date = $2"]) + order_by_clause("id")
+        rows = await conn.fetch(sql, user_id, date)
         entry_ids = [r["id"] for r in rows]
         nutrients_by_entry = await read_nutrients_bulk(conn, "food_log", entry_ids)
     return rows, nutrients_by_entry
@@ -56,11 +60,22 @@ async def list_food_log(user_id: int, date: str):
 async def delete_food_entry(entry_id: int, user_id: int) -> None:
     """nutrient_facts has no FK to cascade automatically (see
     app/nutrient_facts.py), so its rows for this entry are deleted
-    explicitly first, in the same transaction as the food_log delete."""
+    explicitly first, in the same transaction as the food_log delete.
+    delete_with_ownership_returning captures the row's own data for the
+    domain event in the same round trip, rather than a separate SELECT
+    before it -- if entry_id didn't belong to user_id, it yields nothing
+    and no event is logged, matching the delete itself being a no-op."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             await delete_nutrient_facts(conn, "food_log", entry_id)
-            await conn.execute(
-                "DELETE FROM food_log WHERE id = $1 AND user_id = $2", entry_id, user_id
+            deleted = await delete_with_ownership_returning(
+                conn, "food_log", entry_id, user_id,
+                ["date", "food_name", "category", "calories", "source", "source_id"],
             )
+            if deleted:
+                await log_domain_event(
+                    conn, user_id, "food_log", entry_id, "deleted",
+                    category=deleted["category"], amount=deleted["calories"], label=deleted["food_name"],
+                    source=deleted["source"], source_id=deleted["source_id"], occurred_at=deleted["date"],
+                )

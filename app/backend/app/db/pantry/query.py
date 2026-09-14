@@ -1,8 +1,10 @@
 import json
 
-from .. import get_pool
+from .. import get_pool, delete_with_ownership_returning, insert_returning, update_with_ownership_returning
+from ..sql_builder import select_clause, where_clause, order_by_clause, update_clause, set_clause, delete_clause
 from ...nutrient_facts import write_nutrients, delete_nutrient_facts
 from ...portion_scaling import scale_macros, scale_nutrients, multiple_based_factor
+from ...domain_events import log_domain_event
 
 
 async def create_pantry_item(
@@ -12,40 +14,49 @@ async def create_pantry_item(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            item_id = await conn.fetchval(
-                """INSERT INTO pantry_items (user_id, food_name, source, source_id, category, serving_size,
-                       serving_unit, tracking_mode, remaining_servings, expiration_date,
-                       calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                   RETURNING id""",
-                user_id, food_name, source, source_id, category, serving_size,
-                serving_unit, tracking_mode, remaining_servings, expiration_date,
-                calories, json.dumps(nutrients),
-            )
+            item_id = await insert_returning(conn, "pantry_items", {
+                "user_id": user_id, "food_name": food_name, "source": source, "source_id": source_id,
+                "category": category, "serving_size": serving_size, "serving_unit": serving_unit,
+                "tracking_mode": tracking_mode, "remaining_servings": remaining_servings,
+                "expiration_date": expiration_date, "calories": calories, "nutrients_json": json.dumps(nutrients),
+            })
             await write_nutrients(conn, "pantry_item", item_id, nutrients)
+            await log_domain_event(
+                conn, user_id, "pantry_item", item_id, "created",
+                category=category.value if category else None, amount=calories, label=food_name,
+                source=source, source_id=source_id,
+                metadata={"tracking_mode": tracking_mode, "remaining_servings": remaining_servings},
+            )
     return item_id
 
 
 async def list_pantry_items(user_id: int):
+    """expiration_date NULLS LAST isn't expressible through
+    order_by_clause's plain "column [ASC|DESC]" shape (NULLS LAST is a
+    third, non-direction modifier) -- passed through as-is here since
+    it's a fixed literal, not a request-derived value."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT * FROM pantry_items WHERE user_id = $1 AND is_finished = FALSE ORDER BY expiration_date NULLS LAST, added_at",
-            user_id,
+        sql = (
+            select_clause("pantry_items")
+            + where_clause(["user_id = $1", "is_finished = FALSE"])
+            + " ORDER BY expiration_date NULLS LAST, added_at"
         )
+        return await conn.fetch(sql, user_id)
 
 
 async def list_expiring_items(user_id: int, cutoff: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetch(
-            """SELECT * FROM pantry_items
-               WHERE user_id = $1 AND is_finished = FALSE
-                 AND expiration_date IS NOT NULL
-                 AND expiration_date <= $2
-               ORDER BY expiration_date""",
-            user_id, cutoff,
+        sql = (
+            select_clause("pantry_items")
+            + where_clause([
+                "user_id = $1", "is_finished = FALSE",
+                "expiration_date IS NOT NULL", "expiration_date <= $2",
+            ])
+            + order_by_clause("expiration_date")
         )
+        return await conn.fetch(sql, user_id, cutoff)
 
 
 async def get_pantry_item_for_update(item_id: int, user_id: int):
@@ -55,23 +66,25 @@ async def get_pantry_item_for_update(item_id: int, user_id: int):
     write; see commit message."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT * FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
-        )
+        sql = select_clause("pantry_items") + where_clause(["id = $1", "user_id = $2"])
+        return await conn.fetchrow(sql, item_id, user_id)
 
 
 async def update_pantry_item(item_id: int, user_id: int, remaining_servings, expiration_date, tracking_mode) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            """UPDATE pantry_items SET
-                   remaining_servings = COALESCE($1, remaining_servings),
-                   expiration_date = COALESCE($2, expiration_date),
-                   tracking_mode = COALESCE($3, tracking_mode),
-                   updated_at = now()
-               WHERE id = $4 AND user_id = $5""",
-            remaining_servings, expiration_date, tracking_mode, item_id, user_id,
-        )
+        async with conn.transaction():
+            row = await update_with_ownership_returning(
+                conn, "pantry_items", item_id, user_id,
+                {"remaining_servings": remaining_servings, "expiration_date": expiration_date, "tracking_mode": tracking_mode},
+                ["food_name", "category", "calories", "source", "source_id"],
+            )
+            if row:
+                await log_domain_event(
+                    conn, user_id, "pantry_item", item_id, "updated",
+                    category=row["category"], amount=row["calories"], label=row["food_name"],
+                    source=row["source"], source_id=row["source_id"],
+                )
 
 
 async def delete_pantry_item(item_id: int, user_id: int) -> None:
@@ -80,15 +93,21 @@ async def delete_pantry_item(item_id: int, user_id: int) -> None:
     row -- nutrient_facts has no user_id column of its own, so calling
     delete_nutrient_facts for an item_id belonging to a different user
     (or not existing) would wipe that other user's row instead of a
-    no-op."""
+    no-op. delete_with_ownership_returning doubles as that same "did this
+    actually delete something" signal for the domain event."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await conn.execute(
-                "DELETE FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
+            deleted = await delete_with_ownership_returning(
+                conn, "pantry_items", item_id, user_id, ["food_name", "category", "calories", "source", "source_id"],
             )
-            if result != "DELETE 0":
+            if deleted:
                 await delete_nutrient_facts(conn, "pantry_item", item_id)
+                await log_domain_event(
+                    conn, user_id, "pantry_item", item_id, "deleted",
+                    category=deleted["category"], amount=deleted["calories"], label=deleted["food_name"],
+                    source=deleted["source"], source_id=deleted["source_id"],
+                )
 
 
 async def finish_pantry_item(item_id: int, user_id: int) -> bool:
@@ -98,12 +117,18 @@ async def finish_pantry_item(item_id: int, user_id: int) -> bool:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await conn.execute(
-                "DELETE FROM pantry_items WHERE id = $1 AND user_id = $2", item_id, user_id
+            deleted = await delete_with_ownership_returning(
+                conn, "pantry_items", item_id, user_id, ["food_name", "category", "calories", "source", "source_id"],
             )
-            if result != "DELETE 0":
+            if deleted:
                 await delete_nutrient_facts(conn, "pantry_item", item_id)
-    return result != "DELETE 0"
+                await log_domain_event(
+                    conn, user_id, "pantry_item", item_id, "deleted",
+                    category=deleted["category"], amount=deleted["calories"], label=deleted["food_name"],
+                    source=deleted["source"], source_id=deleted["source_id"],
+                    metadata={"reason": "finished"},
+                )
+    return deleted is not None
 
 
 async def consume_pantry_item(item_id: int, user_id: int, servings: float, date: str, meal: str) -> dict:
@@ -123,7 +148,7 @@ async def consume_pantry_item(item_id: int, user_id: int, servings: float, date:
     async with pool.acquire() as conn:
         async with conn.transaction():
             item = await conn.fetchrow(
-                "SELECT * FROM pantry_items WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                select_clause("pantry_items") + where_clause(["id = $1", "user_id = $2"]) + " FOR UPDATE",
                 item_id, user_id,
             )
             if item is None:
@@ -138,33 +163,55 @@ async def consume_pantry_item(item_id: int, user_id: int, servings: float, date:
             stored_nutrients = json.loads(item["nutrients_json"]) if item["nutrients_json"] else {}
             nutrients = scale_nutrients(stored_nutrients, factor)
 
-            food_log_id = await conn.fetchval(
-                """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       category, serving_size, serving_unit, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                   RETURNING id""",
-                user_id, date, meal, item["food_name"], item["source"], item["source_id"],
-                item["category"], servings, item["serving_unit"], macros["calories"], json.dumps(nutrients),
-            )
+            food_log_id = await insert_returning(conn, "food_log", {
+                "user_id": user_id, "date": date, "meal": meal, "food_name": item["food_name"],
+                "source": item["source"], "source_id": item["source_id"], "category": item["category"],
+                "serving_size": servings, "serving_unit": item["serving_unit"],
+                "calories": macros["calories"], "nutrients_json": json.dumps(nutrients),
+            })
             await write_nutrients(conn, "food_log", food_log_id, nutrients)
+            await log_domain_event(
+                conn, user_id, "food_log", food_log_id, "created",
+                category=item["category"], amount=macros["calories"], label=item["food_name"],
+                source=item["source"], source_id=item["source_id"],
+                metadata={"meal": meal, "consumed_from_pantry_item": item_id},
+            )
 
             pantry_status = "unchanged"
             if item["tracking_mode"] == "single":
                 await delete_nutrient_facts(conn, "pantry_item", item_id)
-                await conn.execute("DELETE FROM pantry_items WHERE id = $1", item_id)
+                await conn.execute(delete_clause("pantry_items") + where_clause(["id = $1"]), item_id)
                 pantry_status = "removed"
+                await log_domain_event(
+                    conn, user_id, "pantry_item", item_id, "deleted",
+                    category=item["category"], amount=item["calories"], label=item["food_name"],
+                    source=item["source"], source_id=item["source_id"], metadata={"reason": "consumed"},
+                )
             elif item["tracking_mode"] == "countable":
                 new_remaining = item["remaining_servings"] - servings
                 if new_remaining <= 0:
                     await delete_nutrient_facts(conn, "pantry_item", item_id)
-                    await conn.execute("DELETE FROM pantry_items WHERE id = $1", item_id)
+                    await conn.execute(delete_clause("pantry_items") + where_clause(["id = $1"]), item_id)
                     pantry_status = "removed"
+                    await log_domain_event(
+                        conn, user_id, "pantry_item", item_id, "deleted",
+                        category=item["category"], amount=item["calories"], label=item["food_name"],
+                        source=item["source"], source_id=item["source_id"], metadata={"reason": "consumed"},
+                    )
                 else:
                     await conn.execute(
-                        "UPDATE pantry_items SET remaining_servings = $1, updated_at = now() WHERE id = $2",
+                        update_clause("pantry_items")
+                        + set_clause(["remaining_servings = $1", "updated_at = now()"])
+                        + where_clause(["id = $2"]),
                         new_remaining, item_id,
                     )
                     pantry_status = "decremented"
+                    await log_domain_event(
+                        conn, user_id, "pantry_item", item_id, "updated",
+                        category=item["category"], amount=item["calories"], label=item["food_name"],
+                        source=item["source"], source_id=item["source_id"],
+                        metadata={"reason": "consumed", "remaining_servings": new_remaining},
+                    )
 
     return {"food_log_id": food_log_id, "pantry_status": pantry_status}
 
@@ -182,7 +229,7 @@ async def remove_pantry_servings(item_id: int, user_id: int, servings: float) ->
     async with pool.acquire() as conn:
         async with conn.transaction():
             item = await conn.fetchrow(
-                "SELECT * FROM pantry_items WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                select_clause("pantry_items") + where_clause(["id = $1", "user_id = $2"]) + " FOR UPDATE",
                 item_id, user_id,
             )
             if item is None:
@@ -195,13 +242,26 @@ async def remove_pantry_servings(item_id: int, user_id: int, servings: float) ->
             new_remaining = item["remaining_servings"] - servings
             if new_remaining <= 0:
                 await delete_nutrient_facts(conn, "pantry_item", item_id)
-                await conn.execute("DELETE FROM pantry_items WHERE id = $1", item_id)
+                await conn.execute(delete_clause("pantry_items") + where_clause(["id = $1"]), item_id)
                 pantry_status = "removed"
+                await log_domain_event(
+                    conn, user_id, "pantry_item", item_id, "deleted",
+                    category=item["category"], amount=item["calories"], label=item["food_name"],
+                    source=item["source"], source_id=item["source_id"], metadata={"reason": "removed_no_log"},
+                )
             else:
                 await conn.execute(
-                    "UPDATE pantry_items SET remaining_servings = $1, updated_at = now() WHERE id = $2",
+                    update_clause("pantry_items")
+                    + set_clause(["remaining_servings = $1", "updated_at = now()"])
+                    + where_clause(["id = $2"]),
                     new_remaining, item_id,
                 )
                 pantry_status = "decremented"
+                await log_domain_event(
+                    conn, user_id, "pantry_item", item_id, "updated",
+                    category=item["category"], amount=item["calories"], label=item["food_name"],
+                    source=item["source"], source_id=item["source_id"],
+                    metadata={"reason": "removed_no_log", "remaining_servings": new_remaining},
+                )
 
     return {"pantry_status": pantry_status}

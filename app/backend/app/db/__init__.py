@@ -4,6 +4,11 @@ import asyncpg
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
+from .sql_builder import (
+    validate_identifier, where_clause, insert_clause, update_clause,
+    delete_clause, set_clause, returning_clause,
+)
+
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -513,6 +518,55 @@ async def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_exercise_log_user_date ON exercise_log(user_id, date);
 
+            -- Universal Event Contract's actual backing store (2026-09-14),
+            -- generalizing todo-tracker's todo_events pattern (one
+            -- append-only event log per tracker) across every domain
+            -- entity this tracker owns, rather than the previous approach
+            -- of GET /events deriving events live from food_log/
+            -- exercise_log's current rows -- which could only ever show
+            -- "this exists," never "this was updated" or "this was
+            -- deleted after the fact." One polymorphic table (owner_type,
+            -- owner_id) + one shared helper (app/domain_events.py) that
+            -- every mutating route calls into, same reasoning
+            -- CLAUDE.md's nutrient_facts pattern already documents for
+            -- avoiding N hand-rolled per-entity tables. event_type keeps
+            -- the Core Event Shape's existing "<entity>_<action>"
+            -- convention todo-tracker established (e.g. "food_log_created",
+            -- "pantry_item_deleted"), not a repurposed generic action enum.
+            -- occurred_at is the entity's own business date where one
+            -- exists (food_log.date, a user can backdate it) and defaults
+            -- to insert time otherwise (pantry items, todos); logged_at is
+            -- always insert time regardless -- keeping the two separate is
+            -- what lets the Core Event Shape's occurred_at/created_at pair
+            -- mean different things instead of always collapsing to one
+            -- value the way a naive DEFAULT now() on a single column would.
+            CREATE TABLE IF NOT EXISTS domain_events (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
+                owner_type TEXT NOT NULL,
+                owner_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                category TEXT,
+                amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+                label TEXT,
+                source TEXT,
+                source_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                logged_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_domain_events_user_id ON domain_events(user_id);
+            CREATE INDEX IF NOT EXISTS idx_domain_events_owner ON domain_events(owner_type, owner_id);
+
+            -- logged_at was added a short time after domain_events itself
+            -- (still pre-launch, no real rows anywhere yet) to separate
+            -- "row insert time" from occurred_at once occurred_at started
+            -- carrying a real backdatable business date -- IF NOT EXISTS
+            -- guard so this is a no-op everywhere the column already
+            -- exists, same convention as every other migration below.
+            ALTER TABLE domain_events ADD COLUMN IF NOT EXISTS logged_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
             -- One-time migration (2026-08-27): fiber and protein/carbs/fat
             -- used to be denormalized macro columns on food_log/
             -- pantry_items/custom_foods/recipe_items/meal_items, backfilled
@@ -580,3 +634,75 @@ async def close_db():
     if _pool is not None:
         await _pool.close()
         _pool = None
+
+
+async def delete_with_ownership_returning(conn, table: str, row_id: int, user_id: int, returning: list[str]):
+    """DELETE FROM <table> WHERE id = $1 AND user_id = $2 RETURNING
+    <returning columns>, in one round trip -- the exact shape
+    delete_pantry_item/finish_pantry_item/delete_food_entry each wrote out
+    by hand identically (only the table and returned columns differed).
+    Returns None if no matching row existed (wrong id, wrong owner, or
+    both), same as the row simply not being there for the caller to log
+    a domain event for.
+
+    Built from sql_builder's composable clauses rather than an f-string
+    -- `table` and `returning` still must only ever be hardcoded
+    literals, never anything derived from request input, but
+    sql_builder.validate_identifier now rejects anything else at the
+    point of interpolation instead of relying solely on that convention."""
+    sql = delete_clause(table) + where_clause(["id = $1", "user_id = $2"]) + returning_clause(returning)
+    return await conn.fetchrow(sql, row_id, user_id)
+
+
+async def insert_returning(conn, table: str, values: dict, returning: str = "id"):
+    """INSERT INTO <table> (<values' keys>) VALUES (<values' values>)
+    RETURNING <returning> -- the shape every create_* function in this
+    codebase wrote out by hand with its own column list; this just
+    builds that column list/placeholder list from a dict instead, so
+    adding a column means changing the caller's dict, not counting
+    placeholders by hand.
+
+    `table`, the keys of `values`, and `returning` still must only ever
+    be hardcoded literals, never anything derived from request input --
+    validate_identifier (via insert_clause/returning_clause) enforces
+    that at the point of interpolation. Only the VALUES themselves go
+    through as real bound parameters."""
+    columns = list(values.keys())
+    sql = insert_clause(table, columns) + returning_clause([returning])
+    return await conn.fetchval(sql, *values.values())
+
+
+async def update_with_ownership_returning(conn, table: str, row_id: int, user_id: int, values: dict, returning: list[str]):
+    """UPDATE <table> SET <col> = COALESCE($n, <col>), ..., updated_at =
+    now() WHERE id = $.. AND user_id = $.. RETURNING <returning columns>.
+
+    Each entry in `values` is a COALESCE-guarded partial update (a `None`
+    value leaves that column unchanged) -- the same "only overwrite what
+    was actually provided" convention every existing PATCH-style update
+    in this codebase already followed by hand (e.g. pantry's
+    PantryItemUpdateRequest). Returns None if no matching row existed.
+
+    The COALESCE assignment fragments are still built here (not in
+    sql_builder) since they need each column validated AND paired with
+    its own placeholder number, which is specific to this partial-update
+    shape rather than a general SET clause; set_clause just joins the
+    already-validated fragments. `table` and `returning` go through
+    validate_identifier the same as every other builder call."""
+    set_parts = []
+    params: list = []
+    for column, value in values.items():
+        validate_identifier(column)
+        params.append(value)
+        set_parts.append(f"{column} = COALESCE(${len(params)}, {column})")
+    params.append(row_id)
+    id_param = len(params)
+    params.append(user_id)
+    user_param = len(params)
+
+    sql = (
+        update_clause(table)
+        + set_clause(set_parts + ["updated_at = now()"])
+        + where_clause([f"id = ${id_param}", f"user_id = ${user_param}"])
+        + returning_clause(returning)
+    )
+    return await conn.fetchrow(sql, *params)

@@ -19,13 +19,15 @@ meaning any future change to how a food log entry is validated/scaled/
 stored would silently NOT apply to Cronometer-synced entries).
 """
 import json
+from datetime import date
 from typing import Optional
 
 from pydantic import BaseModel
 
-from .db import get_pool
+from .db import get_pool, insert_returning
 from .nutrient_facts import write_nutrients, write_nutrients_bulk, delete_nutrient_facts_bulk
 from .food_category import FoodCategory, resolve_category
+from .domain_events import log_domain_event
 
 
 class FoodLogEntryContract(BaseModel):
@@ -136,15 +138,19 @@ async def log_food_entry(user_id: int, entry: FoodLogEntryContract) -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            food_log_id = await conn.fetchval(
-                """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       category, serving_size, serving_unit, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                   RETURNING id""",
-                user_id, entry.date, entry.meal, entry.food_name, entry.source, entry.source_id,
-                entry.category, entry.serving_size, entry.serving_unit, entry.calories, json.dumps(entry.nutrients),
-            )
+            food_log_id = await insert_returning(conn, "food_log", {
+                "user_id": user_id, "date": entry.date, "meal": entry.meal, "food_name": entry.food_name,
+                "source": entry.source, "source_id": entry.source_id, "category": entry.category,
+                "serving_size": entry.serving_size, "serving_unit": entry.serving_unit,
+                "calories": entry.calories, "nutrients_json": json.dumps(entry.nutrients),
+            })
             await write_nutrients(conn, "food_log", food_log_id, entry.nutrients)
+            await log_domain_event(
+                conn, user_id, "food_log", food_log_id, "created",
+                category=entry.category.value if entry.category else None,
+                amount=entry.calories, label=entry.food_name, source=entry.source, source_id=entry.source_id,
+                metadata={"meal": entry.meal}, occurred_at=entry.date,
+            )
     return food_log_id
 
 
@@ -200,6 +206,28 @@ async def log_food_entries_bulk(user_id: int, entries: list[FoodLogEntryContract
                 conn, "food_log",
                 [(food_log_id, entry.nutrients) for food_log_id, entry in zip(food_log_ids, entries)],
             )
+
+            # Bulk event insert, matching this function's whole reason for
+            # existing (log_food_entry's real per-row cost is exactly the
+            # N+1 pattern that made a ~3000-row Cronometer sync blow past
+            # Cloud Run's request timeout) -- N individual log_domain_event
+            # calls here would reintroduce that same cost for the event
+            # rows alone.
+            if food_log_ids:
+                await conn.executemany(
+                    """INSERT INTO domain_events
+                           (user_id, owner_type, owner_id, event_type, category, amount, label, source, source_id, metadata_json, occurred_at)
+                       VALUES ($1, 'food_log', $2, 'food_log_created', $3, $4, $5, $6, $7, $8, $9)""",
+                    [
+                        (
+                            user_id, food_log_id,
+                            entry.category.value if entry.category else None, entry.calories, entry.food_name,
+                            entry.source, entry.source_id, json.dumps({"meal": entry.meal}),
+                            date.fromisoformat(entry.date),
+                        )
+                        for food_log_id, entry in zip(food_log_ids, entries)
+                    ],
+                )
 
     return food_log_ids
 
@@ -306,11 +334,15 @@ async def log_exercise_entry(user_id: int, entry: ExerciseLogContract) -> tuple[
             if existing_id is not None:
                 return existing_id, False
 
-        entry_id = await conn.fetchval(
-            """INSERT INTO exercise_log (user_id, date, activity_name, duration_minutes, calories_burned, source, source_id, notes)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-               RETURNING id""",
-            user_id, entry.date, entry.activity_name, entry.duration_minutes, entry.calories_burned,
-            entry.source, entry.source_id, entry.notes,
-        )
+        async with conn.transaction():
+            entry_id = await insert_returning(conn, "exercise_log", {
+                "user_id": user_id, "date": entry.date, "activity_name": entry.activity_name,
+                "duration_minutes": entry.duration_minutes, "calories_burned": entry.calories_burned,
+                "source": entry.source, "source_id": entry.source_id, "notes": entry.notes,
+            })
+            await log_domain_event(
+                conn, user_id, "exercise_log", entry_id, "created",
+                amount=entry.calories_burned, label=entry.activity_name, source=entry.source, source_id=entry.source_id,
+                metadata={"duration_minutes": entry.duration_minutes, "notes": entry.notes}, occurred_at=entry.date,
+            )
     return entry_id, True

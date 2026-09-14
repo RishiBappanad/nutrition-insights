@@ -1,45 +1,38 @@
 """
-Universal Event Contract adapter — translates this tracker's real domain
-tables (food_log, exercise_log) into TrackStack's Core Event Shape
-(see workspace-notes/EVENT_CONTRACT_SPEC.md) and back.
+Universal Event Contract adapter — translates this tracker's domain
+mutations into TrackStack's Core Event Shape (see
+workspace-notes/EVENT_CONTRACT_SPEC.md) and back.
 
 This is deliberately an ADDITIONAL layer, not a replacement for the
-domain-specific endpoints (POST /food/log, POST /exercise, etc.), which
-stay exactly as they are and remain the primary way this app's own
-frontend talks to its own backend. This adapter exists so a cross-app
-consumer (trackstack-notifications, a future unified dashboard, a
-to-do-list event matcher) can query ANY tracker through one uniform
-shape/URL pattern (GET /events, POST /events/log, GET /aggregations/...)
-without knowing food_log's or bankTransactions' internal column names —
-see EVENT_CONTRACT_SPEC.md's "Resolved Decisions #4" for why this was
-built as real routes instead of a shape-only convention.
+domain-specific endpoints (POST /food/log, POST /exercise, POST
+/pantry, etc.), which stay exactly as they are and remain the primary
+way this app's own frontend talks to its own backend.
 
-Two event_types are exposed today, proving the design generalizes across
-genuinely different underlying tables, not just one:
-  - "food_entry"       -> food_log (+ food_log_nutrients)
-  - "exercise_activity" -> exercise_log
-
-`category` (see app/food_category.py, implemented 2026-09-08) is
-populated for food_entry events -- resolved from food_log.category,
-which is set at write time from whichever source has real category data
-(Cronometer's CSV Category column, USDA/CNF search results, or a
-recipe/meal's own dominant-by-calories-computed category). It's `null`
-only when a food_log entry genuinely has no source category data (e.g.
-a hand-typed manual entry with no search result behind it) -- an honest
-gap, not an unimplemented one. exercise_activity events always report
-`category: null`: a food-type category (produce/protein/dairy/etc)
-doesn't apply to an activity like "Running," and exercise_log has no
-category concept of its own. `hidden` and `status` are still always
-their defaults (false / null) — neither concept exists in this
-tracker's schema yet.
+As of 2026-09-14, GET /events and GET /aggregations read from
+`domain_events` (see db/__init__.py's table comment and
+app/domain_events.py) instead of deriving events live from food_log/
+exercise_log's CURRENT rows -- the earlier approach could only ever
+answer "this exists right now," never "this was updated" or "this was
+deleted after the fact," which is exactly the gap a user reported: a
+pantry item being consumed down to zero and removed is real,
+contract-worthy information, not something that should just vanish
+from the record. event_type follows the "<entity>_<action>" convention
+todo-tracker's todo_events already established (e.g.
+"food_log_created", "pantry_item_deleted"), generalized here across
+every entity that logs domain_events -- currently food_log,
+exercise_log, and pantry_item; recipes/meals/custom_foods are not yet
+instrumented (see ACTION_ITEMS.md for that follow-up).
 """
+import json
+from datetime import date, timedelta
 from typing import Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
-from ..db.events import query as events_query
+from ..db import get_pool
+from ..db.sql_builder import select_clause, where_clause, order_by_clause
 from ..food_category import FoodCategory
 from ..food_entry_contract import (
     FoodLogEntryContract, ExerciseLogContract, log_food_entry, log_exercise_entry,
@@ -52,7 +45,13 @@ from ..food_entry_contract import (
 router = APIRouter()
 aggregations_router = APIRouter()
 
-VALID_EVENT_TYPES = {"food_entry", "exercise_activity"}
+# Only creatable event_types via the generic POST /events/log -- this
+# endpoint's whole reason for existing (matching finance/todo's own
+# POST /events/log) is "log a new occurrence," never an update/delete,
+# so only the "_created" variants are ever valid input here even though
+# GET /events can return "_updated"/"_deleted" rows too (written by the
+# domain-specific routes' own log_domain_event calls, not through here).
+CREATABLE_EVENT_TYPES = {"food_log_created", "exercise_log_created"}
 
 
 class EventLogRequest(BaseModel):
@@ -66,8 +65,6 @@ class EventLogRequest(BaseModel):
     amount: float = 0
     source: Optional[str] = None
     source_id: Optional[str] = None
-    # Persisted for food_entry (food_log.category); still ignored for
-    # exercise_activity, which has no category concept — see module docstring.
     category: Optional[FoodCategory] = None
     hidden: bool = False            # accepted, NOT persisted — no such column yet
     status: Optional[str] = None    # accepted, NOT persisted — no such column yet
@@ -76,11 +73,7 @@ class EventLogRequest(BaseModel):
 
 class Event(BaseModel):
     """Core Event Shape, as returned by GET /events -- see
-    workspace-notes/EVENT_CONTRACT_SPEC.md. The response-side
-    counterpart to EventLogRequest above: intentionally almost
-    identical (a logged event, read back, looks like what you'd log),
-    plus id/user_id/created_at, which only exist once a row has
-    actually been written."""
+    workspace-notes/EVENT_CONTRACT_SPEC.md."""
     id: int
     user_id: int
     event_type: str
@@ -113,17 +106,15 @@ class AggregationsResponse(BaseModel):
     `total_amount`/`unit` fields. That dynamic key is why this isn't a
     list of a more strictly-typed row model: the field NAME itself
     varies by request, not just its value, which Pydantic can't express
-    as a named field. `dict[str, str | float]` is the honest shape --
-    an object with the group key (string) and total_amount (float) and
-    unit (string)."""
+    as a named field."""
     data: list[dict[str, Union[str, float]]]
 
 
 async def _dispatch_log(user_id: int, req: EventLogRequest) -> dict:
-    if req.event_type == "food_entry":
+    if req.event_type == "food_log_created":
         food_name = req.metadata.get("food_name")
         if not food_name:
-            raise HTTPException(status_code=400, detail="metadata.food_name is required for event_type=food_entry")
+            raise HTTPException(status_code=400, detail="metadata.food_name is required for event_type=food_log_created")
         entry = FoodLogEntryContract(
             date=req.occurred_at,
             meal=req.metadata.get("meal", "Snack"),
@@ -139,10 +130,10 @@ async def _dispatch_log(user_id: int, req: EventLogRequest) -> dict:
         food_log_id = await log_food_entry(user_id, entry)
         return {"id": food_log_id}
 
-    if req.event_type == "exercise_activity":
+    if req.event_type == "exercise_log_created":
         activity_name = req.metadata.get("activity_name")
         if not activity_name:
-            raise HTTPException(status_code=400, detail="metadata.activity_name is required for event_type=exercise_activity")
+            raise HTTPException(status_code=400, detail="metadata.activity_name is required for event_type=exercise_log_created")
         entry_id, _ = await log_exercise_entry(user_id, ExerciseLogContract(
             date=req.occurred_at,
             activity_name=activity_name,
@@ -156,7 +147,7 @@ async def _dispatch_log(user_id: int, req: EventLogRequest) -> dict:
 
     raise HTTPException(
         status_code=400,
-        detail=f"unknown event_type {req.event_type!r} — must be one of {sorted(VALID_EVENT_TYPES)}",
+        detail=f"unknown event_type {req.event_type!r} — must be one of {sorted(CREATABLE_EVENT_TYPES)}",
     )
 
 
@@ -167,59 +158,34 @@ async def log_event(req: EventLogRequest, user_id: int = Depends(get_current_use
     the domain-specific endpoints (POST /food/log, POST /exercise) use —
     this adapter never writes SQL of its own, so a future change to
     storage/validation logic in those shared functions automatically
-    applies here too, the same decoupling rationale food_entry_contract.py
-    already documents for every other caller."""
+    applies here too. Those functions log their own domain_events row,
+    so nothing further is needed here for the event to show up in
+    GET /events."""
     result = await _dispatch_log(user_id, req)
     return {"status": "logged", **result}
 
 
-def _food_row_to_event(r, nutrients: dict) -> dict:
+def _row_to_event(r) -> dict:
     return {
         "id": r["id"],
         "user_id": r["user_id"],
-        "event_type": "food_entry",
+        "event_type": r["event_type"],
         "category": r["category"],
-        "occurred_at": r["date"],
-        "created_at": r["created_at"].isoformat(),
-        "amount": r["calories"],
+        # occurred_at is the entity's own business date (e.g. food_log.date,
+        # which a user can backdate) where one exists, else insert time --
+        # see domain_events.py's log_domain_event docstring. created_at is
+        # always the row's actual insert time (domain_events.logged_at),
+        # so the two genuinely diverge for a backdated entry instead of
+        # always collapsing to the same value.
+        "occurred_at": r["occurred_at"].isoformat(),
+        "created_at": r["logged_at"].isoformat(),
+        "amount": r["amount"],
         "source": r["source"],
         "source_id": r["source_id"],
         "hidden": False,
         "status": None,
-        "metadata": {
-            "food_name": r["food_name"],
-            "meal": r["meal"],
-            "serving_size": r["serving_size"],
-            "serving_unit": r["serving_unit"],
-            "nutrients": nutrients,
-        },
-        # Core Shape's `label` field (added 2026-09-14) -- the food's own
-        # name is the obvious one-line label; a cross-tracker consumer
-        # (e.g. a future calendar) shouldn't need to know this is called
-        # metadata.food_name here versus metadata.merchantName in finance.
-        "label": r["food_name"],
-    }
-
-
-def _exercise_row_to_event(r) -> dict:
-    return {
-        "id": r["id"],
-        "user_id": r["user_id"],
-        "event_type": "exercise_activity",
-        "category": None,  # doesn't apply to activities — see module docstring
-        "occurred_at": r["date"],
-        "created_at": r["created_at"].isoformat(),
-        "amount": r["calories_burned"],
-        "source": r["source"],
-        "source_id": r["source_id"],
-        "hidden": False,
-        "status": None,
-        "metadata": {
-            "activity_name": r["activity_name"],
-            "duration_minutes": r["duration_minutes"],
-            "notes": r["notes"],
-        },
-        "label": r["activity_name"],
+        "metadata": json.loads(r["metadata_json"]),
+        "label": r["label"],
     }
 
 
@@ -231,11 +197,11 @@ async def get_events(
     source: Optional[str] = Query(None, description="Filter to one source; omit for all"),
     user_id: int = Depends(get_current_user),
 ):
-    """Universal event query across every event_type this tracker
-    exposes. No pagination yet (next_page_token in the contract spec is
-    unimplemented) — matches every other list endpoint in this app today
-    (GET /food/log, GET /exercise), none of which paginate either; added
-    if/when a real consumer needs it rather than speculatively."""
+    """Universal event query across every domain_events row this
+    tracker has logged. No pagination yet (next_page_token in the
+    contract spec is unimplemented) — matches every other list endpoint
+    in this app today, none of which paginate either; added if/when a
+    real consumer needs it rather than speculatively."""
     events = await _query_events(user_id, start, end, event_type, source)
     return {"events": events, "total": len(events)}
 
@@ -247,28 +213,35 @@ async def _query_events(
     """Shared query logic behind GET /events and GET /aggregations/{type}
     — isolated here (rather than one route calling the other directly)
     so aggregation can reuse the exact same event set without going
-    through FastAPI's dependency-injection machinery a second time,
-    matching this codebase's existing convention of a private data
-    helper backing one or more route handlers (e.g. routers/recipes.py's
-    _get_recipe_with_items)."""
-    if event_type is not None and event_type not in VALID_EVENT_TYPES:
-        raise HTTPException(status_code=400, detail=f"unknown event_type {event_type!r} — must be one of {sorted(VALID_EVENT_TYPES)}")
+    through FastAPI's dependency-injection machinery a second time.
 
-    events: list[dict] = []
+    No fixed event_type whitelist to validate against here (unlike the
+    old per-table-branching version) -- every event_type value lives in
+    the same domain_events table now, so an unrecognized value is just
+    a WHERE clause that matches nothing, not an error.
 
-    if event_type is None or event_type == "food_entry":
-        food_rows, nutrients_by_entry = await events_query.list_food_log_events(user_id, start, end)
-        events.extend(_food_row_to_event(r, nutrients_by_entry.get(r["id"], {})) for r in food_rows)
-
-    if event_type is None or event_type == "exercise_activity":
-        exercise_rows = await events_query.list_exercise_log_events(user_id, start, end)
-        events.extend(_exercise_row_to_event(r) for r in exercise_rows)
-
+    occurred_at is timestamptz, not a bare date, so `end` (inclusive)
+    is turned into an exclusive upper bound one day later rather than
+    compared directly -- otherwise a row logged any time after midnight
+    on the end date (which is nearly always, since only backdatable
+    entities like food_log/exercise_log ever land on exact midnight)
+    would be wrongly excluded."""
+    start_date = date.fromisoformat(start)
+    end_exclusive = date.fromisoformat(end) + timedelta(days=1)
+    conditions = ["user_id = $1", "occurred_at >= $2", "occurred_at < $3"]
+    params: list = [user_id, start_date, end_exclusive]
+    if event_type is not None:
+        params.append(event_type)
+        conditions.append(f"event_type = ${len(params)}")
     if source is not None:
-        events = [e for e in events if e["source"] == source]
+        params.append(source)
+        conditions.append(f"source = ${len(params)}")
 
-    events.sort(key=lambda e: (e["occurred_at"], e["id"]))
-    return events
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        sql = select_clause("domain_events") + where_clause(conditions) + order_by_clause("occurred_at", "id")
+        rows = await conn.fetch(sql, *params)
+    return [_row_to_event(r) for r in rows]
 
 
 @aggregations_router.get("/{agg_type}", response_model=AggregationsResponse)
@@ -278,16 +251,17 @@ async def get_aggregations(
     end: str = Query(..., description="Inclusive end date, YYYY-MM-DD"),
     user_id: int = Depends(get_current_user),
 ):
-    """Sums `amount` (calories / calories_burned — both kcal, so a single
-    unit across every group is honest here, not a coincidence masking a
-    units bug) grouped by the requested dimension.
-
-    agg_type="by_category" reflects real category data (see
-    app/food_category.py, implemented 2026-09-08) for food_entry events;
-    exercise_activity events always fall into "uncategorized" (category
-    doesn't apply to activities — see module docstring), so a caller
-    mixing both event types will still see an "uncategorized" bucket,
-    just not exclusively one anymore."""
+    """Sums `amount` grouped by the requested dimension, across every
+    domain_events row in range regardless of event_type (created,
+    updated, deleted all count) -- unlike the pre-2026-09-14 version,
+    this can now double-count the "same" real-world food/activity if,
+    say, a pantry item's creation and its later consumption-triggered
+    deletion both fall in the requested range and both carry a
+    calorie-shaped amount. That's an intentional tradeoff of moving to a
+    real CRUD log rather than a live-table snapshot: revisit if a real
+    consumer needs "net" totals instead of "every logged action," which
+    would mean filtering to just *_created (or just *_deleted) events at
+    the call site rather than changing what this endpoint means."""
     if agg_type not in ("by_category", "by_source", "by_event_type"):
         raise HTTPException(status_code=400, detail="agg_type must be one of: by_category, by_source, by_event_type")
 

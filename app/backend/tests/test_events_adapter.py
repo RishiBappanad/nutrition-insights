@@ -3,9 +3,12 @@ Integration tests for the Universal Event Contract adapter
 (routers/events.py) — real HTTP calls through TestClient, following the
 same conventions as test_recipes_meals_integration.py.
 
-Covers both event_types this adapter exposes (food_entry -> food_log,
-exercise_activity -> exercise_log) to prove the design generalizes
-across genuinely different underlying tables, not just one.
+Covers both event_types POST /events/log can create (food_log_created,
+exercise_log_created) to prove the design generalizes across genuinely
+different underlying tables, not just one. As of 2026-09-14, GET
+/events reads from the shared domain_events table (see
+app/domain_events.py) rather than deriving events live from food_log/
+exercise_log's current rows.
 """
 import uuid
 
@@ -52,9 +55,9 @@ def other_user_token():
 
 
 class TestPostEventsLog:
-    def test_food_entry_creates_food_log_row(self, client, user_token):
+    def test_food_log_created_creates_food_log_row(self, client, user_token):
         r = client.post("/events/log", headers=auth(user_token), json={
-            "event_type": "food_entry",
+            "event_type": "food_log_created",
             "occurred_at": TEST_DATE,
             "amount": 150,
             "source": "manual",
@@ -74,18 +77,18 @@ class TestPostEventsLog:
         assert entries[0]["calories"] == 150
         assert entries[0]["nutrients"]["Protein"]["value"] == 5
 
-    def test_food_entry_missing_food_name_rejected(self, client, user_token):
+    def test_food_log_created_missing_food_name_rejected(self, client, user_token):
         r = client.post("/events/log", headers=auth(user_token), json={
-            "event_type": "food_entry",
+            "event_type": "food_log_created",
             "occurred_at": TEST_DATE,
             "amount": 100,
             "metadata": {},
         })
         assert r.status_code == 400
 
-    def test_exercise_activity_creates_exercise_log_row(self, client, user_token):
+    def test_exercise_log_created_creates_exercise_log_row(self, client, user_token):
         r = client.post("/events/log", headers=auth(user_token), json={
-            "event_type": "exercise_activity",
+            "event_type": "exercise_log_created",
             "occurred_at": TEST_DATE,
             "amount": 300,
             "source": "manual",
@@ -100,9 +103,9 @@ class TestPostEventsLog:
         assert entries[0]["calories_burned"] == 300
         assert entries[0]["duration_minutes"] == 30
 
-    def test_exercise_activity_missing_activity_name_rejected(self, client, user_token):
+    def test_exercise_log_created_missing_activity_name_rejected(self, client, user_token):
         r = client.post("/events/log", headers=auth(user_token), json={
-            "event_type": "exercise_activity",
+            "event_type": "exercise_log_created",
             "occurred_at": TEST_DATE,
             "amount": 100,
             "metadata": {},
@@ -125,39 +128,43 @@ class TestGetEvents:
         assert r.status_code == 200
         body = r.json()
         event_types = {e["event_type"] for e in body["events"]}
-        assert "food_entry" in event_types
-        assert "exercise_activity" in event_types
+        assert "food_log_created" in event_types
+        assert "exercise_log_created" in event_types
         assert body["total"] == len(body["events"])
 
-    def test_food_entry_has_core_event_shape(self, client, user_token):
-        r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&event_type=food_entry", headers=auth(user_token))
+    def test_food_log_created_has_core_event_shape(self, client, user_token):
+        r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&event_type=food_log_created", headers=auth(user_token))
         events = r.json()["events"]
-        entry = next(e for e in events if e["metadata"]["food_name"] == "Adapter Test Oatmeal")
-        assert entry["event_type"] == "food_entry"
-        assert entry["occurred_at"] == TEST_DATE
+        # food_name lives in `label`, not `metadata` -- domain_events'
+        # metadata for a food_log_created row is deliberately just
+        # {"meal": ...}; the full nutrient breakdown stays in
+        # nutrient_facts, fetched via the domain-specific GET /food/log,
+        # not duplicated into the generic Event Contract's metadata.
+        entry = next(e for e in events if e["label"] == "Adapter Test Oatmeal")
+        assert entry["event_type"] == "food_log_created"
+        assert entry["occurred_at"].startswith(TEST_DATE)
         assert entry["amount"] == 150
         assert entry["source"] == "manual"
         assert entry["hidden"] is False
         assert entry["status"] is None
-        # Known, tracked gap -- category is not fabricated, always null today
+        # Known, tracked gap -- category is not fabricated, always null
+        # for a manual entry with no search result behind it.
         assert entry["category"] is None
-        assert entry["metadata"]["nutrients"]["Protein"]["value"] == 5
-        assert entry["label"] == "Adapter Test Oatmeal"
+        assert entry["metadata"] == {"meal": "Breakfast"}
 
-    def test_exercise_activity_has_core_event_shape(self, client, user_token):
-        r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&event_type=exercise_activity", headers=auth(user_token))
+    def test_exercise_log_created_has_core_event_shape(self, client, user_token):
+        r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&event_type=exercise_log_created", headers=auth(user_token))
         events = r.json()["events"]
-        entry = next(e for e in events if e["metadata"]["activity_name"] == "Adapter Test Run")
-        assert entry["event_type"] == "exercise_activity"
+        entry = next(e for e in events if e["label"] == "Adapter Test Run")
+        assert entry["event_type"] == "exercise_log_created"
         assert entry["amount"] == 300
         assert entry["category"] is None
         assert entry["metadata"]["duration_minutes"] == 30
-        assert entry["label"] == "Adapter Test Run"
 
     def test_event_type_filter_excludes_other_type(self, client, user_token):
-        r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&event_type=food_entry", headers=auth(user_token))
+        r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&event_type=food_log_created", headers=auth(user_token))
         event_types = {e["event_type"] for e in r.json()["events"]}
-        assert event_types == {"food_entry"}
+        assert event_types == {"food_log_created"}
 
     def test_source_filter(self, client, user_token):
         r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&source=manual", headers=auth(user_token))
@@ -167,9 +174,14 @@ class TestGetEvents:
         r = client.get("/events?start=2020-01-01&end=2020-01-02", headers=auth(user_token))
         assert r.json()["events"] == []
 
-    def test_invalid_event_type_filter_rejected(self, client, user_token):
+    def test_unrecognized_event_type_filter_returns_empty_not_an_error(self, client, user_token):
+        """Unlike the old fixed-table-branching version, an unrecognized
+        event_type is just a WHERE clause that matches nothing now that
+        every event_type lives in one shared domain_events table --
+        not something that needs its own whitelist to reject up front."""
         r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&event_type=bogus", headers=auth(user_token))
-        assert r.status_code == 400
+        assert r.status_code == 200
+        assert r.json()["events"] == []
 
     def test_scoped_to_owner(self, client, user_token, other_user_token):
         r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}", headers=auth(other_user_token))
@@ -182,8 +194,8 @@ class TestGetAggregations:
         r = client.get(f"/aggregations/by_event_type?start={TEST_DATE}&end={TEST_DATE}", headers=auth(user_token))
         assert r.status_code == 200
         data = {row["event_type"]: row["total_amount"] for row in r.json()["data"]}
-        assert data.get("food_entry", 0) >= 150
-        assert data.get("exercise_activity", 0) >= 300
+        assert data.get("food_log_created", 0) >= 150
+        assert data.get("exercise_log_created", 0) >= 300
 
     def test_by_source(self, client, user_token):
         r = client.get(f"/aggregations/by_source?start={TEST_DATE}&end={TEST_DATE}", headers=auth(user_token))
@@ -192,9 +204,10 @@ class TestGetAggregations:
         assert "manual" in sources
 
     def test_by_category_degenerates_to_uncategorized(self, client, user_token):
-        """Known, tracked gap (see routers/events.py's module docstring):
-        category isn't populated yet, so every event falls into a single
-        honest 'uncategorized' bucket rather than a fabricated breakdown."""
+        """Known, tracked gap: category isn't populated for a manual
+        food entry with no search result behind it, and never applies to
+        an exercise activity -- both fall into a single honest
+        'uncategorized' bucket rather than a fabricated breakdown."""
         r = client.get(f"/aggregations/by_category?start={TEST_DATE}&end={TEST_DATE}", headers=auth(user_token))
         assert r.status_code == 200
         data = r.json()["data"]
