@@ -1,9 +1,10 @@
 import json
 
-from .. import get_pool
+from .. import get_pool, insert_returning, delete_with_ownership_returning, update_with_ownership_returning
 from ...nutrient_facts import (
     write_nutrients, read_nutrients_bulk, delete_nutrient_facts, delete_nutrient_facts_bulk,
 )
+from ...domain_events import log_domain_event
 
 # resolve_category(), _aggregate_batch_totals() (pure computation, stays in
 # routers/recipes.py -- food.py imports it from there too, unchanged), and
@@ -110,15 +111,18 @@ async def insert_recipe_log(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            food_log_id = await conn.fetchval(
-                """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       category, serving_size, serving_unit, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, 'recipe', $5, $6, $7, 'serving', $8, $9)
-                   RETURNING id""",
-                user_id, date, meal, recipe_name, recipe_id_str, category, servings,
-                calories, json.dumps(nutrients),
-            )
+            food_log_id = await insert_returning(conn, "food_log", {
+                "user_id": user_id, "date": date, "meal": meal, "food_name": recipe_name,
+                "source": "recipe", "source_id": recipe_id_str, "category": category,
+                "serving_size": servings, "serving_unit": "serving", "calories": calories,
+                "nutrients_json": json.dumps(nutrients),
+            })
             await write_nutrients(conn, "food_log", food_log_id, nutrients)
+            await log_domain_event(
+                conn, user_id, "food_log", food_log_id, "created",
+                category=category, amount=calories, label=recipe_name, source="recipe", source_id=recipe_id_str,
+                metadata={"meal": meal}, occurred_at=date,
+            )
     return food_log_id
 
 
@@ -216,34 +220,55 @@ async def make_recipe(recipe_id: int, user_id: int) -> dict:
 
                 if pantry_item["tracking_mode"] == "single":
                     await delete_nutrient_facts(conn, "pantry_item", pantry_item["id"])
-                    await conn.execute("DELETE FROM pantry_items WHERE id = $1", pantry_item["id"])
+                    await delete_with_ownership_returning(conn, "pantry_items", pantry_item["id"], user_id, ["id"])
                     removed.append(pantry_item["id"])
+                    await log_domain_event(
+                        conn, user_id, "pantry_item", pantry_item["id"], "deleted",
+                        category=pantry_item["category"], amount=pantry_item["calories"], label=pantry_item["food_name"],
+                        source=pantry_item["source"], source_id=pantry_item["source_id"],
+                        metadata={"reason": "used_in_recipe", "recipe_id": recipe_id},
+                    )
                 elif pantry_item["tracking_mode"] == "countable" and entry["requested_servings"] is not None:
                     new_remaining = pantry_item["remaining_servings"] - entry["requested_servings"]
                     if new_remaining <= 0:
                         await delete_nutrient_facts(conn, "pantry_item", pantry_item["id"])
-                        await conn.execute("DELETE FROM pantry_items WHERE id = $1", pantry_item["id"])
+                        await delete_with_ownership_returning(conn, "pantry_items", pantry_item["id"], user_id, ["id"])
                         removed.append(pantry_item["id"])
+                        await log_domain_event(
+                            conn, user_id, "pantry_item", pantry_item["id"], "deleted",
+                            category=pantry_item["category"], amount=pantry_item["calories"], label=pantry_item["food_name"],
+                            source=pantry_item["source"], source_id=pantry_item["source_id"],
+                            metadata={"reason": "used_in_recipe", "recipe_id": recipe_id},
+                        )
                     else:
-                        await conn.execute(
-                            "UPDATE pantry_items SET remaining_servings = $1, updated_at = now() WHERE id = $2",
-                            new_remaining, pantry_item["id"],
+                        await update_with_ownership_returning(
+                            conn, "pantry_items", pantry_item["id"], user_id,
+                            {"remaining_servings": new_remaining}, ["id"],
                         )
                         decremented.append(pantry_item["id"])
+                        await log_domain_event(
+                            conn, user_id, "pantry_item", pantry_item["id"], "updated",
+                            category=pantry_item["category"], amount=pantry_item["calories"], label=pantry_item["food_name"],
+                            source=pantry_item["source"], source_id=pantry_item["source_id"],
+                            metadata={"reason": "used_in_recipe", "recipe_id": recipe_id, "remaining_servings": new_remaining},
+                        )
                 # bulk: presence-only, never decremented -- matches
                 # can-make's own bulk handling (no quantity concept).
 
             per_serving_macros, per_serving_nutrients = _recipe_per_serving_nutrition(recipe, items)
-            pantry_item_id = await conn.fetchval(
-                """INSERT INTO pantry_items (user_id, food_name, source, source_id, category, serving_size,
-                       serving_unit, tracking_mode, remaining_servings,
-                       calories, nutrients_json)
-                   VALUES ($1, $2, 'recipe', $3, $4, 1, 'serving', 'countable', $5, $6, $7)
-                   RETURNING id""",
-                user_id, recipe["name"], str(recipe_id), recipe["category"], recipe["servings_per_batch"],
-                per_serving_macros["calories"], json.dumps(per_serving_nutrients),
-            )
+            pantry_item_id = await insert_returning(conn, "pantry_items", {
+                "user_id": user_id, "food_name": recipe["name"], "source": "recipe", "source_id": str(recipe_id),
+                "category": recipe["category"], "serving_size": 1, "serving_unit": "serving",
+                "tracking_mode": "countable", "remaining_servings": recipe["servings_per_batch"],
+                "calories": per_serving_macros["calories"], "nutrients_json": json.dumps(per_serving_nutrients),
+            })
             await write_nutrients(conn, "pantry_item", pantry_item_id, per_serving_nutrients)
+            await log_domain_event(
+                conn, user_id, "pantry_item", pantry_item_id, "created",
+                category=recipe["category"], amount=per_serving_macros["calories"], label=recipe["name"],
+                source="recipe", source_id=str(recipe_id),
+                metadata={"tracking_mode": "countable", "remaining_servings": recipe["servings_per_batch"]},
+            )
 
     return {
         "pantry_item_id": pantry_item_id,

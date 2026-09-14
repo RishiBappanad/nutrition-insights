@@ -1,9 +1,10 @@
 import json
 
-from .. import get_pool
+from .. import get_pool, insert_returning
 from ...nutrient_facts import (
     write_nutrients, read_nutrients_bulk, delete_nutrient_facts, delete_nutrient_facts_bulk,
 )
+from ...domain_events import log_domain_event
 
 # resolve_category() itself (business logic: what category value to
 # store) deliberately stays a router-side concern, called by routers/meals.py
@@ -126,15 +127,17 @@ async def insert_combined_meal_log(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            food_log_id = await conn.fetchval(
-                """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       category, serving_size, serving_unit, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, 'meal', $5, $6, 1, 'meal', $7, $8)
-                   RETURNING id""",
-                user_id, date, meal_label, meal_name, meal_id_str, category,
-                calories, json.dumps(nutrients),
-            )
+            food_log_id = await insert_returning(conn, "food_log", {
+                "user_id": user_id, "date": date, "meal": meal_label, "food_name": meal_name,
+                "source": "meal", "source_id": meal_id_str, "category": category,
+                "serving_size": 1, "serving_unit": "meal", "calories": calories, "nutrients_json": json.dumps(nutrients),
+            })
             await write_nutrients(conn, "food_log", food_log_id, nutrients)
+            await log_domain_event(
+                conn, user_id, "food_log", food_log_id, "created",
+                category=category, amount=calories, label=meal_name, source="meal", source_id=meal_id_str,
+                metadata={"meal": meal_label}, occurred_at=date,
+            )
     return food_log_id
 
 
@@ -144,16 +147,20 @@ async def insert_exploded_meal_items_log(user_id: int, date: str, meal_label: st
     async with pool.acquire() as conn:
         async with conn.transaction():
             for item in items:
-                food_log_id = await conn.fetchval(
-                    """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                           category, serving_size, serving_unit, calories, nutrients_json)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                       RETURNING id""",
-                    user_id, date, meal_label, item["food_name"], item["source"], item["source_id"],
-                    item["category"], item["serving_size"], item["serving_unit"], item["calories"], json.dumps(item["nutrients"]),
-                )
+                food_log_id = await insert_returning(conn, "food_log", {
+                    "user_id": user_id, "date": date, "meal": meal_label, "food_name": item["food_name"],
+                    "source": item["source"], "source_id": item["source_id"], "category": item["category"],
+                    "serving_size": item["serving_size"], "serving_unit": item["serving_unit"],
+                    "calories": item["calories"], "nutrients_json": json.dumps(item["nutrients"]),
+                })
                 food_log_ids.append(food_log_id)
                 await write_nutrients(conn, "food_log", food_log_id, item["nutrients"])
+                await log_domain_event(
+                    conn, user_id, "food_log", food_log_id, "created",
+                    category=item["category"], amount=item["calories"], label=item["food_name"],
+                    source=item["source"], source_id=item["source_id"], metadata={"meal": meal_label},
+                    occurred_at=date,
+                )
     return food_log_ids
 
 
@@ -177,16 +184,30 @@ async def replace_combined_entry_with_items(food_log_id: int, user_id: int, date
     async with pool.acquire() as conn:
         async with conn.transaction():
             await delete_nutrient_facts(conn, "food_log", food_log_id)
-            await conn.execute("DELETE FROM food_log WHERE id = $1", food_log_id)
-            for item in items:
-                new_id = await conn.fetchval(
-                    """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                           category, serving_size, serving_unit, calories, nutrients_json)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                       RETURNING id""",
-                    user_id, date, meal_label, item["food_name"], item["source"], item["source_id"],
-                    item["category"], item["serving_size"], item["serving_unit"], item["calories"], json.dumps(item["nutrients"]),
+            deleted = await conn.fetchrow(
+                "DELETE FROM food_log WHERE id = $1 RETURNING date, food_name, source, source_id, category, calories",
+                food_log_id,
+            )
+            if deleted:
+                await log_domain_event(
+                    conn, user_id, "food_log", food_log_id, "deleted",
+                    category=deleted["category"], amount=deleted["calories"], label=deleted["food_name"],
+                    source=deleted["source"], source_id=deleted["source_id"], occurred_at=deleted["date"],
+                    metadata={"reason": "exploded_into_items"},
                 )
+            for item in items:
+                new_id = await insert_returning(conn, "food_log", {
+                    "user_id": user_id, "date": date, "meal": meal_label, "food_name": item["food_name"],
+                    "source": item["source"], "source_id": item["source_id"], "category": item["category"],
+                    "serving_size": item["serving_size"], "serving_unit": item["serving_unit"],
+                    "calories": item["calories"], "nutrients_json": json.dumps(item["nutrients"]),
+                })
                 food_log_ids.append(new_id)
                 await write_nutrients(conn, "food_log", new_id, item["nutrients"])
+                await log_domain_event(
+                    conn, user_id, "food_log", new_id, "created",
+                    category=item["category"], amount=item["calories"], label=item["food_name"],
+                    source=item["source"], source_id=item["source_id"], metadata={"meal": meal_label},
+                    occurred_at=date,
+                )
     return food_log_ids
