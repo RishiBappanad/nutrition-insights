@@ -13,14 +13,11 @@ not this service. This module only:
   3. Owns nutrition-specific data unrelated to identity, like Hevy/Cronometer
      credentials (see /credentials below).
 """
-import asyncio
 import os
-from typing import Optional
-import requests
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
 from pydantic import BaseModel
+from trackstack_auth_client import verify_trackstack_token
 
 from ..db import encrypt, decrypt
 from ..db.auth import query as auth_query
@@ -38,7 +35,7 @@ SECRET_KEY = os.environ["JWT_SECRET"]
 # here, but the service itself looked healthy the whole time. Failing
 # loudly at import time (KeyError, not a fallback) matches how
 # trackstack-auth itself already handles this.
-ALGORITHM = "HS256"
+TRACKSTACK_AUTH_URL = os.environ.get("TRACKSTACK_AUTH_URL")
 
 
 class CredentialsRequest(BaseModel):
@@ -50,58 +47,21 @@ async def _ensure_local_user(account_id: int, email: str) -> None:
     await auth_query.ensure_local_user(account_id, email)
 
 
-# trackstack-auth is the only place personal-access-token storage/lookup
-# lives -- a token this service's own JWT verification doesn't recognize is
-# checked against trackstack-auth's POST /tokens/verify instead, mirroring
-# todo-tracker's requireAuth (the first tracker to actually implement this).
-# Despite ACTIONS_CONTRACT_SPEC.md documenting PATs as working "everywhere
-# requireAuth is used," this service never actually had the fallback --
-# confirmed live: a real PAT returned 401 here while working fine against
-# todo-tracker. Uses `requests` (this codebase's only HTTP client) inside
-# asyncio.to_thread rather than calling it directly -- a bare blocking call
-# in an async function is exactly the class of bug already found and fixed
-# once in this codebase's Cronometer sync (see sync.py's history), where a
-# blocking call inside an async def froze the entire event loop, not just
-# the one request.
-TRACKSTACK_AUTH_URL = os.environ.get("TRACKSTACK_AUTH_URL")
-
-
-def _verify_personal_access_token_sync(token: str) -> Optional[dict]:
-    if not TRACKSTACK_AUTH_URL:
-        return None
-    try:
-        res = requests.post(f"{TRACKSTACK_AUTH_URL}/tokens/verify", json={"token": token}, timeout=5)
-        if not res.ok:
-            return None
-        return res.json().get("account")
-    except requests.RequestException:
-        return None
-
-
 async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)) -> int:
     """Verify a trackstack-auth JWT (or, failing that, a personal access
     token) and return the account id. Ensures a local mirror row exists so
-    downstream FK-dependent queries work."""
-    account_id = None
-    email = None
-    try:
-        payload = jwt.decode(creds.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        account_id = payload.get("accountId")
-        email = payload.get("email")
-    except JWTError:
-        pass  # Not a valid JWT -- fall through and try it as a PAT below.
+    downstream FK-dependent queries work.
 
-    if account_id is None or email is None:
-        account = await asyncio.to_thread(_verify_personal_access_token_sync, creds.credentials)
-        if account:
-            account_id = account.get("accountId")
-            email = account.get("email")
-
-    if account_id is None or email is None:
+    JWT-then-PAT verification is the shared, contract-tested
+    trackstack-auth-client package -- this service's own hand-copy of it
+    (added a few commits ago after finding it was silently missing the
+    PAT fallback entirely) is now just a call into that."""
+    account = await verify_trackstack_token(creds.credentials, SECRET_KEY, TRACKSTACK_AUTH_URL)
+    if not account:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    await _ensure_local_user(account_id, email)
-    return account_id
+    await _ensure_local_user(account["accountId"], account["email"])
+    return account["accountId"]
 
 
 @router.post("/credentials")
