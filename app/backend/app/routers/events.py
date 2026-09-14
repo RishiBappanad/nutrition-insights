@@ -93,6 +93,7 @@ class Event(BaseModel):
     hidden: bool = False
     status: Optional[str] = None
     metadata: dict = {}
+    label: Optional[str] = None
 
 
 class LogEventResponse(BaseModel):
@@ -192,6 +193,11 @@ def _food_row_to_event(r, nutrients: dict) -> dict:
             "serving_unit": r["serving_unit"],
             "nutrients": nutrients,
         },
+        # Core Shape's `label` field (added 2026-09-14) -- the food's own
+        # name is the obvious one-line label; a cross-tracker consumer
+        # (e.g. a future calendar) shouldn't need to know this is called
+        # metadata.food_name here versus metadata.merchantName in finance.
+        "label": r["food_name"],
     }
 
 
@@ -213,6 +219,7 @@ def _exercise_row_to_event(r) -> dict:
             "duration_minutes": r["duration_minutes"],
             "notes": r["notes"],
         },
+        "label": r["activity_name"],
     }
 
 

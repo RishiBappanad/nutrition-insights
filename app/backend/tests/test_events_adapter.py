@@ -142,6 +142,7 @@ class TestGetEvents:
         # Known, tracked gap -- category is not fabricated, always null today
         assert entry["category"] is None
         assert entry["metadata"]["nutrients"]["Protein"]["value"] == 5
+        assert entry["label"] == "Adapter Test Oatmeal"
 
     def test_exercise_activity_has_core_event_shape(self, client, user_token):
         r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&event_type=exercise_activity", headers=auth(user_token))
@@ -151,6 +152,7 @@ class TestGetEvents:
         assert entry["amount"] == 300
         assert entry["category"] is None
         assert entry["metadata"]["duration_minutes"] == 30
+        assert entry["label"] == "Adapter Test Run"
 
     def test_event_type_filter_excludes_other_type(self, client, user_token):
         r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}&event_type=food_entry", headers=auth(user_token))
