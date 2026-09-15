@@ -1,7 +1,8 @@
 import json
 
-from .. import get_pool
+from .. import get_pool, insert_returning, update_with_ownership_returning, delete_with_ownership_returning
 from ...nutrient_facts import write_nutrients, read_nutrients, delete_nutrient_facts
+from ...domain_events import log_domain_event
 
 
 async def create_custom_food(
@@ -11,15 +12,17 @@ async def create_custom_food(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            food_id = await conn.fetchval(
-                """INSERT INTO custom_foods (user_id, food_name, brand, reference_amount, reference_unit,
-                       reference_grams, category, calories, nutrients_json)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                   RETURNING id""",
-                user_id, food_name, brand, reference_amount, reference_unit,
-                reference_grams, category, calories, json.dumps(nutrients),
-            )
+            food_id = await insert_returning(conn, "custom_foods", {
+                "user_id": user_id, "food_name": food_name, "brand": brand,
+                "reference_amount": reference_amount, "reference_unit": reference_unit,
+                "reference_grams": reference_grams, "category": category, "calories": calories,
+                "nutrients_json": json.dumps(nutrients),
+            })
             await write_nutrients(conn, "custom_food", food_id, nutrients)
+            await log_domain_event(
+                conn, user_id, "custom_food", food_id, "created",
+                category=category, amount=calories, label=food_name, metadata={"brand": brand},
+            )
     return food_id
 
 
@@ -54,22 +57,25 @@ async def update_custom_food(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            existing = await conn.fetchrow(
-                "SELECT id FROM custom_foods WHERE id = $1 AND user_id = $2", food_id, user_id
+            updated = await update_with_ownership_returning(
+                conn, "custom_foods", food_id, user_id,
+                {
+                    "food_name": food_name, "brand": brand, "reference_amount": reference_amount,
+                    "reference_unit": reference_unit, "reference_grams": reference_grams,
+                    "category": category, "calories": calories, "nutrients_json": json.dumps(nutrients),
+                },
+                ["food_name", "category", "calories"],
             )
-            if existing is None:
+            if updated is None:
                 return False
 
-            await conn.execute(
-                """UPDATE custom_foods SET food_name=$1, brand=$2, reference_amount=$3, reference_unit=$4,
-                       reference_grams=$5, category=$6, calories=$7,
-                       nutrients_json=$8, updated_at=now()
-                   WHERE id = $9""",
-                food_name, brand, reference_amount, reference_unit, reference_grams,
-                category, calories, json.dumps(nutrients), food_id,
-            )
             await delete_nutrient_facts(conn, "custom_food", food_id)
             await write_nutrients(conn, "custom_food", food_id, nutrients)
+            await log_domain_event(
+                conn, user_id, "custom_food", food_id, "updated",
+                category=updated["category"], amount=updated["calories"], label=updated["food_name"],
+                metadata={"brand": brand},
+            )
     return True
 
 
@@ -77,5 +83,12 @@ async def delete_custom_food(food_id: int, user_id: int) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await delete_nutrient_facts(conn, "custom_food", food_id)
-            await conn.execute("DELETE FROM custom_foods WHERE id = $1 AND user_id = $2", food_id, user_id)
+            deleted = await delete_with_ownership_returning(
+                conn, "custom_foods", food_id, user_id, ["food_name", "category", "calories"],
+            )
+            if deleted:
+                await delete_nutrient_facts(conn, "custom_food", food_id)
+                await log_domain_event(
+                    conn, user_id, "custom_food", food_id, "deleted",
+                    category=deleted["category"], amount=deleted["calories"], label=deleted["food_name"],
+                )

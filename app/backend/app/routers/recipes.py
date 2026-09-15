@@ -159,7 +159,7 @@ async def update_recipe(recipe_id: int, req: RecipeRequest, user_id: int = Depen
         req.category, [item.model_dump() for item in req.items], dict(existing),
     )
     await recipes_query.update_recipe(
-        recipe_id, req.name, req.servings_per_batch, resolved_category, category_is_custom, req.items,
+        recipe_id, user_id, req.name, req.servings_per_batch, resolved_category, category_is_custom, req.items,
     )
     return {"status": "updated"}
 

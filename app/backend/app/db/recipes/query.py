@@ -72,15 +72,17 @@ async def get_recipe_for_update(recipe_id: int, user_id: int):
         )
 
 
-async def update_recipe(recipe_id: int, name: str, servings_per_batch: float, resolved_category, category_is_custom, items) -> None:
+async def update_recipe(recipe_id: int, user_id: int, name: str, servings_per_batch: float, resolved_category, category_is_custom, items) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute(
-                """UPDATE recipes SET name = $1, servings_per_batch = $2,
-                       category = $3, category_is_custom = $4, updated_at = now()
-                   WHERE id = $5""",
-                name, servings_per_batch, resolved_category, category_is_custom, recipe_id,
+            updated = await update_with_ownership_returning(
+                conn, "recipes", recipe_id, user_id,
+                {
+                    "name": name, "servings_per_batch": servings_per_batch,
+                    "category": resolved_category, "category_is_custom": category_is_custom,
+                },
+                ["name", "category"],
             )
             old_item_ids = [r["id"] for r in await conn.fetch(
                 "SELECT id FROM recipe_items WHERE recipe_id = $1", recipe_id
@@ -88,6 +90,12 @@ async def update_recipe(recipe_id: int, name: str, servings_per_batch: float, re
             await delete_nutrient_facts_bulk(conn, "recipe_item", old_item_ids)
             await conn.execute("DELETE FROM recipe_items WHERE recipe_id = $1", recipe_id)
             await _save_items(conn, recipe_id, items)
+            if updated:
+                await log_domain_event(
+                    conn, user_id, "recipe", recipe_id, "updated",
+                    category=updated["category"], label=updated["name"],
+                    metadata={"servings_per_batch": servings_per_batch, "item_count": len(items)},
+                )
 
 
 async def delete_recipe(recipe_id: int, user_id: int) -> None:
@@ -101,7 +109,12 @@ async def delete_recipe(recipe_id: int, user_id: int) -> None:
                 recipe_id, user_id,
             )]
             await delete_nutrient_facts_bulk(conn, "recipe_item", item_ids)
-            await conn.execute("DELETE FROM recipes WHERE id = $1 AND user_id = $2", recipe_id, user_id)
+            deleted = await delete_with_ownership_returning(conn, "recipes", recipe_id, user_id, ["name", "category"])
+            if deleted:
+                await log_domain_event(
+                    conn, user_id, "recipe", recipe_id, "deleted",
+                    category=deleted["category"], label=deleted["name"],
+                )
 
 
 async def insert_recipe_log(

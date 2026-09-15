@@ -1,6 +1,6 @@
 import json
 
-from .. import get_pool, insert_returning
+from .. import get_pool, insert_returning, update_with_ownership_returning, delete_with_ownership_returning
 from ...nutrient_facts import (
     write_nutrients, read_nutrients_bulk, delete_nutrient_facts, delete_nutrient_facts_bulk,
 )
@@ -29,11 +29,15 @@ async def create_meal(user_id: int, name: str, resolved_category, category_is_cu
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            meal_id = await conn.fetchval(
-                "INSERT INTO meals (user_id, name, category, category_is_custom) VALUES ($1, $2, $3, $4) RETURNING id",
-                user_id, name, resolved_category, category_is_custom,
-            )
+            meal_id = await insert_returning(conn, "meals", {
+                "user_id": user_id, "name": name, "category": resolved_category,
+                "category_is_custom": category_is_custom,
+            })
             await _save_items(conn, meal_id, items)
+            await log_domain_event(
+                conn, user_id, "meal", meal_id, "created",
+                category=resolved_category, label=name, metadata={"item_count": len(items)},
+            )
     return meal_id
 
 
@@ -84,13 +88,14 @@ async def get_meal_for_update(meal_id: int, user_id: int):
         )
 
 
-async def update_meal(meal_id: int, name: str, resolved_category, category_is_custom, items) -> None:
+async def update_meal(meal_id: int, user_id: int, name: str, resolved_category, category_is_custom, items) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute(
-                "UPDATE meals SET name = $1, category = $2, category_is_custom = $3, updated_at = now() WHERE id = $4",
-                name, resolved_category, category_is_custom, meal_id,
+            updated = await update_with_ownership_returning(
+                conn, "meals", meal_id, user_id,
+                {"name": name, "category": resolved_category, "category_is_custom": category_is_custom},
+                ["name", "category"],
             )
             old_item_ids = [r["id"] for r in await conn.fetch(
                 "SELECT id FROM meal_items WHERE meal_id = $1", meal_id
@@ -98,6 +103,11 @@ async def update_meal(meal_id: int, name: str, resolved_category, category_is_cu
             await delete_nutrient_facts_bulk(conn, "meal_item", old_item_ids)
             await conn.execute("DELETE FROM meal_items WHERE meal_id = $1", meal_id)
             await _save_items(conn, meal_id, items)
+            if updated:
+                await log_domain_event(
+                    conn, user_id, "meal", meal_id, "updated",
+                    category=updated["category"], label=updated["name"], metadata={"item_count": len(items)},
+                )
 
 
 async def delete_meal(meal_id: int, user_id: int) -> None:
@@ -118,7 +128,12 @@ async def delete_meal(meal_id: int, user_id: int) -> None:
                 meal_id, user_id,
             )]
             await delete_nutrient_facts_bulk(conn, "meal_item", item_ids)
-            await conn.execute("DELETE FROM meals WHERE id = $1 AND user_id = $2", meal_id, user_id)
+            deleted = await delete_with_ownership_returning(conn, "meals", meal_id, user_id, ["name", "category"])
+            if deleted:
+                await log_domain_event(
+                    conn, user_id, "meal", meal_id, "deleted",
+                    category=deleted["category"], label=deleted["name"],
+                )
 
 
 async def insert_combined_meal_log(

@@ -93,7 +93,7 @@ async def update_meal(meal_id: int, req: MealRequest, user_id: int = Depends(get
     resolved_category, category_is_custom = resolve_category(
         req.category, [item.model_dump() for item in req.items], dict(existing),
     )
-    await meals_query.update_meal(meal_id, req.name, resolved_category, category_is_custom, req.items)
+    await meals_query.update_meal(meal_id, user_id, req.name, resolved_category, category_is_custom, req.items)
     return {"status": "updated"}
 
 

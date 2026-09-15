@@ -261,7 +261,8 @@ async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
                 recipe.category, [item.model_dump() for item in recipe.items], existing,
             )
 
-            if recipe_id is not None:
+            is_new = recipe_id is None
+            if not is_new:
                 await conn.execute(
                     """UPDATE recipes SET name = $1, servings_per_batch = $2,
                            category = $3, category_is_custom = $4, updated_at = now()
@@ -291,6 +292,12 @@ async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
                     item.amount_grams, item.amount_multiple, item.calories, json.dumps(item.nutrients),
                 )
                 await write_nutrients(conn, "recipe_item", item_id, item.nutrients)
+
+            await log_domain_event(
+                conn, user_id, "recipe", recipe_id, "created" if is_new else "updated",
+                category=resolved_category, label=recipe.name, source=recipe.source, source_id=recipe.source_id,
+                metadata={"servings_per_batch": recipe.servings_per_batch, "item_count": len(recipe.items)},
+            )
     return recipe_id
 
 
