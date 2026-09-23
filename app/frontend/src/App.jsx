@@ -1,9 +1,8 @@
 import { useEffect, useState } from 'react'
-import { useTrackStackAuth } from 'trackstack-ui'
+import { useTrackStackAuth, redirectToLogin } from 'trackstack-ui'
 import { Switch, Route, Router } from 'wouter'
 import { Layout } from '@/components/layout'
 import { PendingActionProvider } from '@/lib/pending-action'
-import Login from '@/pages/login'
 import Dashboard from '@/pages/dashboard'
 import Charts from '@/pages/charts'
 import Log from '@/pages/log'
@@ -11,6 +10,7 @@ import FoodLog from '@/pages/food-log'
 import LiftInsights from '@/pages/lift-insights'
 import Profile from '@/pages/profile'
 import Targets from '@/pages/targets'
+import Goals from '@/pages/goals'
 import Pantry from '@/pages/pantry'
 import Recipes from '@/pages/recipes'
 import Meals from '@/pages/meals'
@@ -32,6 +32,7 @@ import Settings from '@/pages/settings'
 })();
 
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
+const AUTH_BASE_URL = import.meta.env.VITE_TRACKSTACK_AUTH_URL ?? ''
 
 function AppRoutes({ onLogout }) {
   return (
@@ -45,6 +46,7 @@ function AppRoutes({ onLogout }) {
           <Route path="/lift-insights" component={LiftInsights} />
           <Route path="/profile" component={Profile} />
           <Route path="/targets" component={Targets} />
+          <Route path="/goals" component={Goals} />
           <Route path="/pantry" component={Pantry} />
           <Route path="/recipes" component={Recipes} />
           <Route path="/meals" component={Meals} />
@@ -74,11 +76,11 @@ export default function App() {
   // wouldn't reactively update this component (the hook's cross-tab
   // `storage` listener only fires for OTHER tabs' writes, never this
   // tab's own), so the hook is called once here and passed down instead.
-  const auth = useTrackStackAuth({ tokenKey: 'token', authBaseUrl: import.meta.env.VITE_TRACKSTACK_AUTH_URL ?? '' })
+  const auth = useTrackStackAuth({ tokenKey: 'token', authBaseUrl: AUTH_BASE_URL })
 
-  // Single sign-on: before showing the login page, silently check whether
-  // trackstack-auth's own session cookie already authenticates this
-  // browser (e.g. the user logged into a DIFFERENT TrackStack app
+  // Single sign-on: before bouncing to Home's login, silently check
+  // whether trackstack-auth's own session cookie already authenticates
+  // this browser (e.g. the user logged into a DIFFERENT TrackStack app
   // earlier). Skipped entirely if a local token already exists -- no
   // need to round-trip when auth.isAuthenticated is already true.
   const [ssoChecked, setSsoChecked] = useState(false)
@@ -93,17 +95,32 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  if (!ssoChecked) {
+  // There is no local login page anymore -- the only login UI in the
+  // whole system is TrackStack Home's (per-tracker login pages were
+  // scrapped 2026-09-20). Once silent SSO has been tried and there's
+  // still no user, bounce to Home with returnTo set to this exact URL,
+  // so a successful login there sends the browser right back here.
+  useEffect(() => {
+    if (ssoChecked && !auth.isAuthenticated) {
+      redirectToLogin(AUTH_BASE_URL, window.location.href)
+    }
+  }, [ssoChecked, auth.isAuthenticated])
+
+  if (!ssoChecked || !auth.isAuthenticated) {
     return null
   }
 
-  if (!auth.isAuthenticated) {
-    return <Login onLogin={auth.login} onRegister={auth.register} onGoogleLogin={auth.loginWithGoogle} />
+  // No `returnTo` on logout, deliberately -- an explicit logout means the
+  // user chose to leave, so they should land on Home itself to decide
+  // where to go next, not get immediately bounced right back here.
+  const logout = () => {
+    auth.logout()
+    redirectToLogin(AUTH_BASE_URL)
   }
 
   return (
     <Router base={BASE}>
-      <AppRoutes onLogout={auth.logout} />
+      <AppRoutes onLogout={logout} />
     </Router>
   )
 }
