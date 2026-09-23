@@ -13,7 +13,7 @@ import path from 'path'
 const API_PREFIXES = [
   'auth', 'sync', 'data', 'food', 'targets', 'water', 'notes', 'pantry',
   'profile', 'custom-foods', 'recipes', 'meals', 'label-scanner',
-  'preferences', 'exercise', 'events', 'aggregations', 'lifts',
+  'preferences', 'exercise', 'events', 'aggregations', 'lifts', 'goals',
 ]
 
 // Defaults to the native-dev case (this process running on the host,

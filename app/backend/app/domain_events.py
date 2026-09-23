@@ -51,10 +51,23 @@ async def log_domain_event(
     asyncpg's timestamptz codec requires an actual date/datetime
     instance, not a string, once the column resolves to timestamptz."""
     occurred_at_value = date.fromisoformat(occurred_at) if occurred_at else None
-    await conn.execute(
+    event_type = f"{owner_type}_{action}"
+    event_id = await conn.fetchval(
         """INSERT INTO domain_events
                (user_id, owner_type, owner_id, event_type, category, amount, label, source, source_id, metadata_json, occurred_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, now()))""",
-        user_id, owner_type, owner_id, f"{owner_type}_{action}", category, amount, label, source, source_id,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, now()))
+           RETURNING id""",
+        user_id, owner_type, owner_id, event_type, category, amount, label, source, source_id,
         json.dumps(metadata or {}), occurred_at_value,
     )
+
+    # Event-triggered Goals evaluation, in the SAME transaction as the
+    # write above (same `conn`) -- see goals_evaluation.py's own module
+    # doc. Deferred import to avoid a circular import at module load time
+    # (goals_evaluation -> goal_query -> nothing back to this module, but
+    # kept local here anyway to match the "no import cycles between
+    # domain_events and anything downstream of it" invariant this module
+    # already relies on for every OTHER caller).
+    from .goals_evaluation import evaluate_goals_for_event
+
+    await evaluate_goals_for_event(conn, user_id, event_id, category, event_type, owner_type, action)

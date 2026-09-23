@@ -559,6 +559,41 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_domain_events_user_id ON domain_events(user_id);
             CREATE INDEX IF NOT EXISTS idx_domain_events_owner ON domain_events(owner_type, owner_id);
 
+            -- A saved comparison -- measure_query checked against a
+            -- reference (a plain constant OR itself a query over a
+            -- different time window) via comparator. Pure definition:
+            -- no last_status/last_evaluated_period_start columns, same
+            -- "no persisted evaluation state" decision finance-tracker's
+            -- own goals table made (see
+            -- workspace-notes/RECURRING_AND_GOALS_SPEC.md) -- compliance
+            -- is computed live from domain_events' own history every
+            -- time, via app/goals_evaluation.py. measure_query/
+            -- reference_query are JSON-encoded TEXT, this codebase's
+            -- established convention for every JSON-shaped column (see
+            -- domain_events.metadata_json above), not a native JSONB
+            -- column. No UNIQUE constraint on the query shape -- the old
+            -- flat-schema design's UNIQUE(user_id, category, period,
+            -- severity) doesn't survive this generalization either, same
+            -- as finance-tracker's version.
+            CREATE TABLE IF NOT EXISTS goals (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
+                label TEXT,
+                severity TEXT NOT NULL DEFAULT 'target',
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                comparator TEXT NOT NULL,
+                tolerance_percent DOUBLE PRECISION,
+                measure_query TEXT NOT NULL,
+                reference_amount DOUBLE PRECISION,
+                reference_query TEXT,
+                inflation_adjusted BOOLEAN NOT NULL DEFAULT FALSE,
+                notify_on_crossing BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_goals_user_active ON goals(user_id, is_active);
+
             -- logged_at was added a short time after domain_events itself
             -- (still pre-launch, no real rows anywhere yet) to separate
             -- "row insert time" from occurred_at once occurred_at started

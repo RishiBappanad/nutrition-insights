@@ -16,7 +16,7 @@ from pathlib import Path
 # throughout because uvicorn configures its own loggers separately.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-from .routers import auth, sync, data, food, targets, water, notes, pantry, profile, custom_foods, recipes, meals, label_scanner, preferences, exercise, events, lifts
+from .routers import auth, sync, data, food, targets, water, notes, pantry, profile, custom_foods, recipes, meals, label_scanner, preferences, exercise, events, lifts, goals
 from .db import init_db, close_db
 
 app = FastAPI(title="Nutrition Insights API")
@@ -47,6 +47,7 @@ app.include_router(exercise.router, prefix="/exercise", tags=["exercise"])
 app.include_router(events.router, prefix="/events", tags=["events"])
 app.include_router(events.aggregations_router, prefix="/aggregations", tags=["events"])
 app.include_router(lifts.router, prefix="/lifts", tags=["lifts"])
+app.include_router(goals.router, prefix="/goals", tags=["goals"])
 
 
 @app.on_event("startup")
