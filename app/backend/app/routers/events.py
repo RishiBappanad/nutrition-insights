@@ -24,7 +24,7 @@ exercise_log, and pantry_item; recipes/meals/custom_foods are not yet
 instrumented (see ACTION_ITEMS.md for that follow-up).
 """
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -226,8 +226,11 @@ async def _query_events(
     on the end date (which is nearly always, since only backdatable
     entities like food_log/exercise_log ever land on exact midnight)
     would be wrongly excluded."""
-    start_date = date.fromisoformat(start)
-    end_exclusive = date.fromisoformat(end) + timedelta(days=1)
+    # UTC midnights, explicitly -- a bare `date` handed to asyncpg gets
+    # localized in the client process's timezone, which must match how
+    # log_domain_event writes occurred_at (also pinned to UTC midnight).
+    start_date = datetime.combine(date.fromisoformat(start), time.min, tzinfo=timezone.utc)
+    end_exclusive = datetime.combine(date.fromisoformat(end) + timedelta(days=1), time.min, tzinfo=timezone.utc)
     conditions = ["user_id = $1", "occurred_at >= $2", "occurred_at < $3"]
     params: list = [user_id, start_date, end_exclusive]
     if event_type is not None:

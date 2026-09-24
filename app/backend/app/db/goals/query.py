@@ -46,12 +46,17 @@ async def create_goal(
     return _row_to_goal(row)
 
 
-async def list_goals(user_id: int, active_only: bool) -> list[dict]:
-    pool = await get_pool()
+async def list_goals(user_id: int, active_only: bool, include_system: bool = False) -> list[dict]:
+    """`include_system` adds the auto-managed nutrient targets (source
+    'dri_default'/'user_target', ~48 per user) -- omitted by default so the
+    list a person actually browses stays their own goals plus their macro
+    targets, not two pages of RDA rows (those have their own editor)."""
+    conditions = ["user_id = $1"]
     if active_only:
-        rows = await pool.fetch("SELECT * FROM goals WHERE user_id = $1 AND is_active = TRUE ORDER BY created_at", user_id)
-    else:
-        rows = await pool.fetch("SELECT * FROM goals WHERE user_id = $1 ORDER BY created_at", user_id)
+        conditions.append("is_active = TRUE")
+    if not include_system:
+        conditions.append("(source IS NULL OR source = 'macro_target')")
+    rows = await (await get_pool()).fetch(f"SELECT * FROM goals WHERE {' AND '.join(conditions)} ORDER BY created_at, id", user_id)
     return [_row_to_goal(r) for r in rows]
 
 

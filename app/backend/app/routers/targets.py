@@ -10,8 +10,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
-from ..db.targets import query as targets_query
-from ..nutrition_targets import derive_macro_grams, get_nutrient_progress, get_resolved_macro_targets
+from ..nutrition_targets import (
+    derive_macro_grams, get_nutrient_progress, get_resolved_macro_targets, list_nutrient_targets,
+    revert_nutrient_to_dri, set_macro_targets as save_macro_targets, set_nutrient_override,
+)
 from ..nutrient_groups import get_nutrient_groups
 
 router = APIRouter()
@@ -66,10 +68,7 @@ async def set_macro_targets(req: MacroTargetsRequest, user_id: int = Depends(get
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    await targets_query.upsert_macro_targets(
-        user_id, req.mode, req.calorie_target, req.protein_g, req.carbs_g, req.fat_g,
-        req.protein_pct, req.carbs_pct, req.fat_pct,
-    )
+    await save_macro_targets(user_id, resolved)
     resolved["mode"] = req.mode
     return resolved
 
@@ -79,19 +78,7 @@ async def get_nutrient_targets(user_id: int = Depends(get_current_user)):
     """List every tracked micronutrient's current target (DRI default or
     custom override, whichever is active) — the data source for the
     'Advanced' collapsed micronutrient settings section."""
-    rows = await targets_query.list_nutrient_targets(user_id)
-    return {
-        "targets": [
-            {
-                "nutrient_name": r["nutrient_name"],
-                "unit": r["unit"],
-                "daily_target": r["daily_target"],
-                "max_threshold": r["max_threshold"],
-                "is_custom": r["is_custom"],
-            }
-            for r in rows
-        ]
-    }
+    return {"targets": await list_nutrient_targets(user_id)}
 
 
 @router.put("/nutrients/{nutrient_name}")
@@ -106,10 +93,13 @@ async def set_nutrient_target(
     a general-purpose upsert for arbitrary nutrient names, since an
     override with no DRI counterpart has no unit/context to validate
     against."""
-    existing = await targets_query.update_nutrient_target(
-        user_id, nutrient_name, req.daily_target, req.max_threshold, req.is_custom,
-    )
-    if existing is None:
+    if req.is_custom:
+        found = await set_nutrient_override(user_id, nutrient_name, req.daily_target, req.max_threshold)
+    else:
+        if not await revert_nutrient_to_dri(user_id, nutrient_name):
+            raise HTTPException(status_code=400, detail="Set your profile (age + sex) first -- DRI defaults are derived from it")
+        found = True
+    if not found:
         raise HTTPException(
             status_code=404,
             detail=f"Nutrient {nutrient_name!r} not found for this user — run DRI seeding first",

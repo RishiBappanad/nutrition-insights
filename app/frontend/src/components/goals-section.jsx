@@ -2,18 +2,28 @@ import { useEffect, useState } from 'react'
 import { Target, Plus, Trash2, CheckCircle2, AlertTriangle, X } from 'lucide-react'
 import { api } from '@/lib/api'
 import { FOOD_CATEGORIES } from '@/lib/food-categories'
+import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 
-// ── Helpers -- mirrors finance-tracker's own goals/index.tsx, which
-// mirrors workspace-notes/RECURRING_AND_GOALS_SPEC.md's Goal Query shape
-// (the cross-tracker standard every tracker's Goals implementation
-// follows). `amount` on every domain_events row here is calories (this
-// tracker's one universal per-entry number, see app/goal_query.py's
-// module doc) -- the nutrition equivalent of finance's dollars. Richer
-// macro-based goals (protein/carbs grams) aren't expressible yet: those
-// live in nutrient_facts, not on the domain_events row itself, and the
-// Goal Query model only aggregates over `amount` -- a known, accepted
-// limitation, not a bug, same category as finance's own flat-category-
-// vs-receipt-item-splitting note in RECURRING_AND_GOALS_SPEC.md.
+// Goals half of the unified Targets page -- mirrors finance-tracker's own
+// Goals UI (Basic / Presets / Advanced), on the same cross-tracker Goal Query
+// contract (workspace-notes/RECURRING_AND_GOALS_SPEC.md). A goal here
+// measures either calories or any single nutrient (`measureField`,
+// "nutrient:<Name>"), optionally narrowed to food categories, over a daily /
+// weekly / monthly period -- so a daily target and a long-term goal are the
+// same thing at different settings, and both live in the one goals table.
+// The server restricts every goal to logged consumption (owner_type
+// food_log), so nothing here has to.
+
+const NUTRIENT_DISPLAY = {
+  'Carbohydrate, by difference': 'Carbohydrates',
+  'Total lipid (fat)': 'Fat',
+}
+
+function measureName(measureField) {
+  if (!measureField) return 'Calories'
+  const name = measureField.replace('nutrient:', '')
+  return NUTRIENT_DISPLAY[name] ?? name
+}
 
 function categoryFromQuery(query) {
   const filter = query?.filters?.find((f) => f.field === 'category' && (f.operator === 'eq' || f.operator === 'in'))
@@ -42,8 +52,15 @@ function periodLabel(period) {
   }
 }
 
-function formatCalories(n) {
-  return `${Math.round(n)} cal`
+function formatAmount(n, unit) {
+  const value = Math.abs(n) >= 100 ? Math.round(n) : Math.round(n * 10) / 10
+  return unit ? `${value} ${unit}` : `${value}`
+}
+
+function termBadge(goal) {
+  const period = goal.measure_query.timeWindow.period
+  if (goal.reference_query) return 'Trend'
+  return period === 'daily' ? 'Daily' : period === 'weekly' ? 'Weekly' : period === 'monthly' ? 'Monthly' : 'Goal'
 }
 
 function goalSubtitle(goal) {
@@ -69,36 +86,42 @@ function categoryFilters(categories) {
 // ── Goal card ──────────────────────────────────────────────────────────
 
 function GoalCard({ goal, status, onDelete }) {
-  const category = categoryFromQuery(goal.measure_query) ?? 'Every category'
+  const measure = measureName(goal.measure_query.measureField)
+  const category = categoryFromQuery(goal.measure_query)
   const isWarning = goal.severity === 'warning'
+  const managed = goal.source === 'macro_target'
+  const tone = status === undefined ? 'muted' : status.on_track ? 'ok' : isWarning ? 'warn' : 'bad'
+  const iconBg = { muted: 'bg-secondary', ok: 'bg-emerald-500/10', warn: 'bg-amber-500/10', bad: 'bg-destructive/10' }[tone]
+  const iconFg = { muted: 'text-muted-foreground', ok: 'text-emerald-600', warn: 'text-amber-600', bad: 'text-destructive' }[tone]
+  const barFg = { muted: 'bg-secondary', ok: 'bg-emerald-500', warn: 'bg-amber-500', bad: 'bg-destructive' }[tone]
 
   return (
     <div className="bg-card border border-border rounded-lg p-5 relative group">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-start gap-3 min-w-0">
-          <div
-            className={
-              'h-9 w-9 rounded-full flex items-center justify-center shrink-0 ' +
-              (status === undefined ? 'bg-secondary' : status.on_track ? 'bg-emerald-500/10' : isWarning ? 'bg-amber-500/10' : 'bg-destructive/10')
-            }
-          >
-            <Target className={'h-4 w-4 ' + (status === undefined ? 'text-muted-foreground' : status.on_track ? 'text-emerald-600' : isWarning ? 'text-amber-600' : 'text-destructive')} />
+          <div className={'h-9 w-9 rounded-full flex items-center justify-center shrink-0 ' + iconBg}>
+            <Target className={'h-4 w-4 ' + iconFg} />
           </div>
           <div className="min-w-0">
-            <p className="font-medium text-foreground truncate">{goal.label || category}</p>
-            <p className="text-xs text-muted-foreground truncate">{category}</p>
+            <p className="font-medium text-foreground truncate">{goal.label || measure}</p>
+            <p className="text-xs text-muted-foreground truncate">
+              {measure} · {category ?? 'all foods'}
+            </p>
           </div>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
-          <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-border text-muted-foreground">{isWarning ? 'Warning' : 'Target'}</span>
-          <button onClick={() => onDelete(goal.id)} className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-secondary" aria-label="Delete goal">
-            <Trash2 className="h-3.5 w-3.5 text-destructive" />
-          </button>
+          <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-border text-muted-foreground">{termBadge(goal)}</span>
+          {!managed && (
+            <button onClick={() => onDelete(goal.id)} className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-secondary" aria-label="Delete goal">
+              <Trash2 className="h-3.5 w-3.5 text-destructive" />
+            </button>
+          )}
         </div>
       </div>
 
       <p className="text-xs text-muted-foreground mt-3">
-        {comparatorLabel(goal.comparator, goal.tolerance_percent)} {goal.reference_query ? 'a computed baseline' : formatCalories(goal.reference_amount ?? 0)} — {goalSubtitle(goal)}
+        {comparatorLabel(goal.comparator, goal.tolerance_percent)} {goal.reference_query ? 'a computed baseline' : formatAmount(goal.reference_amount ?? 0, goal.unit)} — {goalSubtitle(goal)}
+        {managed && ' · managed by the macro targets above'}
       </p>
 
       <div className="mt-4">
@@ -107,14 +130,14 @@ function GoalCard({ goal, status, onDelete }) {
         ) : (
           <>
             <div className="h-2 w-full bg-secondary rounded-full overflow-hidden">
-              <div className={'h-full rounded-full ' + (status.on_track ? 'bg-emerald-500' : isWarning ? 'bg-amber-500' : 'bg-destructive')} style={{ width: `${Math.min(status.percent, 100)}%` }} />
+              <div className={'h-full rounded-full ' + barFg} style={{ width: `${Math.min(status.percent, 100)}%` }} />
             </div>
             <div className="flex items-center justify-between mt-2">
               <span className="text-sm font-mono">
-                {formatCalories(status.measure_value)} <span className="text-muted-foreground">/ {formatCalories(status.reference_value)}</span>
+                {formatAmount(status.measure_value, goal.unit)} <span className="text-muted-foreground">/ {formatAmount(status.reference_value, goal.unit)}</span>
               </span>
-              <span className={'text-xs font-medium flex items-center gap-1 ' + (status.on_track ? 'text-emerald-600' : isWarning ? 'text-amber-600' : 'text-destructive')}>
-                {status.on_track ? (<><CheckCircle2 className="h-3.5 w-3.5" /> On track</>) : (<><AlertTriangle className="h-3.5 w-3.5" /> {isWarning ? 'Off track' : 'Exceeded'}</>)}
+              <span className={'text-xs font-medium flex items-center gap-1 ' + iconFg}>
+                {status.on_track ? (<><CheckCircle2 className="h-3.5 w-3.5" /> On track</>) : (<><AlertTriangle className="h-3.5 w-3.5" /> {isWarning ? 'Off track' : 'Not met'}</>)}
               </span>
             </div>
           </>
@@ -124,11 +147,12 @@ function GoalCard({ goal, status, onDelete }) {
   )
 }
 
-// ── Category checkbox list -- FOOD_CATEGORIES is a fixed 10-item enum
-// (unlike finance's user-extensible spending categories), so a plain
-// checkbox list covers multi-select without needing a searchable
-// combobox component this codebase doesn't have.
+// ── Form pieces ────────────────────────────────────────────────────────
 
+const INPUT = 'w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background'
+
+// FOOD_CATEGORIES is a fixed 10-item enum, so a checkbox list covers
+// multi-select without a searchable combobox.
 function CategoryCheckboxes({ selected, onChange }) {
   function toggle(value) {
     onChange(selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value])
@@ -145,9 +169,26 @@ function CategoryCheckboxes({ selected, onChange }) {
   )
 }
 
-// ── New Goal modal ─────────────────────────────────────────────────────
+function MeasureSelect({ measures, value, onChange }) {
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)} className={INPUT}>
+      {measures.map((m) => (
+        <option key={m.field ?? 'calories'} value={m.field ?? ''}>{m.label} ({m.unit})</option>
+      ))}
+    </select>
+  )
+}
+
+function unitFor(measures, field) {
+  return measures.find((m) => (m.field ?? '') === field)?.unit ?? 'cal'
+}
+
+// ── New goal modal ─────────────────────────────────────────────────────
+
+const DEFAULT_BASIC = { measure: '', category: '', comparator: 'lte', amount: 2000, period: 'daily', severity: 'target' }
 
 const DEFAULT_ADVANCED = {
+  measure: '',
   measureCategories: [],
   measureAggregation: 'sum',
   measurePercentile: 95,
@@ -179,11 +220,13 @@ function buildReferenceTimeWindow(form) {
 }
 
 function buildAdvancedPayload(form) {
+  const measureField = form.measure ? { measureField: form.measure } : {}
   const measure_query = {
     aggregation: form.measureAggregation,
     ...(form.measureAggregation === 'percentile' ? { percentile: form.measurePercentile } : {}),
     filters: categoryFilters(form.measureCategories),
     timeWindow: { kind: 'current_period', period: form.period },
+    ...measureField,
   }
 
   const base = {
@@ -195,15 +238,14 @@ function buildAdvancedPayload(form) {
     ...(form.comparator === 'within_tolerance_percent' ? { tolerance_percent: form.tolerancePercent } : {}),
   }
 
-  if (form.referenceMode === 'fixed') {
-    return { ...base, reference_amount: form.referenceAmount }
-  }
+  if (form.referenceMode === 'fixed') return { ...base, reference_amount: form.referenceAmount }
 
   const reference_query = {
     aggregation: form.refAggregation,
     ...(form.refAggregation === 'percentile' ? { percentile: form.refPercentile } : {}),
     filters: categoryFilters(form.measureCategories),
     timeWindow: buildReferenceTimeWindow(form),
+    ...measureField,
   }
   return { ...base, reference_query }
 }
@@ -211,7 +253,6 @@ function buildAdvancedPayload(form) {
 function applyPresetToAdvancedForm(preset, category) {
   const form = { ...DEFAULT_ADVANCED, measureCategories: category ? [category] : [] }
   form.comparator = preset.comparator
-  form.severity = 'target'
   if (preset.tolerance_percent !== undefined) form.tolerancePercent = preset.tolerance_percent
   if (preset.measure_query) {
     form.measureAggregation = preset.measure_query.aggregation
@@ -228,8 +269,6 @@ function applyPresetToAdvancedForm(preset, category) {
       if (tw.kind === 'trailing') form.trailingCount = tw.count
       if (tw.kind === 'same_period_last_year') form.yearsBackCount = tw.count
     }
-  } else {
-    form.referenceMode = 'fixed'
   }
   return form
 }
@@ -239,35 +278,24 @@ function NewGoalModal({ onClose, onCreated }) {
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [presets, setPresets] = useState(null)
+  const [measures, setMeasures] = useState([{ field: null, label: 'Calories', unit: 'cal' }])
   const [presetCategory, setPresetCategory] = useState('')
-
-  // Basic tab state
-  const [basicCategory, setBasicCategory] = useState('')
-  const [basicComparator, setBasicComparator] = useState('lte')
-  const [basicAmount, setBasicAmount] = useState(2000)
-  const [basicPeriod, setBasicPeriod] = useState('daily')
-  const [basicSeverity, setBasicSeverity] = useState('target')
-
-  // Advanced tab state
+  const [basic, setBasic] = useState(DEFAULT_BASIC)
   const [advanced, setAdvanced] = useState(DEFAULT_ADVANCED)
 
   useEffect(() => {
     api('/goals/presets').then((r) => r.json()).then(setPresets).catch(() => setPresets({ basic: [], advanced: [] }))
+    api('/goals/measures').then((r) => r.json()).then((d) => setMeasures(d.measures)).catch(() => {})
   }, [])
 
-  function updateAdvanced(patch) {
-    setAdvanced((prev) => ({ ...prev, ...patch }))
-  }
+  const updateBasic = (patch) => setBasic((prev) => ({ ...prev, ...patch }))
+  const updateAdvanced = (patch) => setAdvanced((prev) => ({ ...prev, ...patch }))
 
-  async function submitBasic() {
-    if (!basicCategory) return setError('Pick a category first.')
+  async function post(payload) {
     setSubmitting(true)
     setError(null)
     try {
-      const res = await api('/goals', {
-        method: 'POST',
-        body: JSON.stringify({ category: basicCategory, comparator: basicComparator, target_amount: basicAmount, period: basicPeriod, severity: basicSeverity }),
-      })
+      const res = await api('/goals', { method: 'POST', body: JSON.stringify(payload) })
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Could not create goal')
       onCreated()
     } catch (e) {
@@ -277,33 +305,38 @@ function NewGoalModal({ onClose, onCreated }) {
     }
   }
 
-  async function submitAdvanced() {
-    setSubmitting(true)
-    setError(null)
-    try {
-      const res = await api('/goals', { method: 'POST', body: JSON.stringify(buildAdvancedPayload(advanced)) })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Could not create goal')
-      onCreated()
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setSubmitting(false)
-    }
-  }
+  const submitBasic = () =>
+    post({
+      ...(basic.measure ? { measure_field: basic.measure } : {}),
+      ...(basic.category ? { category: basic.category } : {}),
+      comparator: basic.comparator,
+      target_amount: basic.amount,
+      period: basic.period,
+      severity: basic.severity,
+    })
+
+  const submitAdvanced = () => post(buildAdvancedPayload(advanced))
 
   function applyPreset(preset) {
-    if (!presetCategory) return setError('Pick a category first.')
     if (preset.measure_query || preset.reference_query) {
       setAdvanced(applyPresetToAdvancedForm(preset, presetCategory))
       setTab('advanced')
     } else {
-      setBasicCategory(presetCategory)
-      setBasicComparator(preset.comparator === 'gte' ? 'gte' : 'lte')
-      setBasicPeriod(preset.period ?? 'daily')
+      setBasic({
+        ...DEFAULT_BASIC,
+        measure: preset.measure_field ?? '',
+        category: presetCategory,
+        comparator: preset.comparator,
+        period: preset.period ?? 'daily',
+        amount: preset.amount_hint ?? DEFAULT_BASIC.amount,
+      })
       setTab('basic')
     }
     setError(null)
   }
+
+  const basicUnit = unitFor(measures, basic.measure)
+  const advancedUnit = unitFor(measures, advanced.measure)
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
@@ -312,15 +345,13 @@ function NewGoalModal({ onClose, onCreated }) {
           <h2 className="text-lg font-semibold">New Goal</h2>
           <button onClick={onClose} className="p-1 rounded hover:bg-secondary"><X className="h-4 w-4" /></button>
         </div>
-        <p className="text-xs text-muted-foreground mb-4">Compare your calories against a hardcoded amount or a computed historical baseline.</p>
+        <p className="text-xs text-muted-foreground mb-4">
+          Track calories or any nutrient against a fixed amount or your own history. Daily is a target; weekly and monthly are long-term goals.
+        </p>
 
         <div className="flex gap-1 mb-4 border border-border rounded-md p-1">
           {['basic', 'presets', 'advanced'].map((t) => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={'flex-1 text-sm py-1.5 rounded capitalize ' + (tab === t ? 'bg-secondary font-medium' : 'text-muted-foreground hover:bg-secondary/50')}
-            >
+            <button key={t} onClick={() => setTab(t)} className={'flex-1 text-sm py-1.5 rounded capitalize ' + (tab === t ? 'bg-secondary font-medium' : 'text-muted-foreground hover:bg-secondary/50')}>
               {t}
             </button>
           ))}
@@ -331,39 +362,43 @@ function NewGoalModal({ onClose, onCreated }) {
         {tab === 'basic' && (
           <div className="space-y-3">
             <div>
-              <label className="text-xs text-muted-foreground">Category</label>
-              <select value={basicCategory} onChange={(e) => setBasicCategory(e.target.value)} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
-                <option value="">Choose a category</option>
+              <label className="text-xs text-muted-foreground">Measure</label>
+              <MeasureSelect measures={measures} value={basic.measure} onChange={(v) => updateBasic({ measure: v })} />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground">Food category (optional)</label>
+              <select value={basic.category} onChange={(e) => updateBasic({ category: e.target.value })} className={INPUT}>
+                <option value="">All foods</option>
                 {FOOD_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
               </select>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-xs text-muted-foreground">Comparator</label>
-                <select value={basicComparator} onChange={(e) => setBasicComparator(e.target.value)} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
+                <select value={basic.comparator} onChange={(e) => updateBasic({ comparator: e.target.value })} className={INPUT}>
                   <option value="lte">At most</option>
                   <option value="gte">At least</option>
                   <option value="eq">Exactly</option>
                 </select>
               </div>
               <div>
-                <label className="text-xs text-muted-foreground">Calories</label>
-                <input type="number" value={basicAmount} onChange={(e) => setBasicAmount(Number(e.target.value))} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background" />
+                <label className="text-xs text-muted-foreground">Amount ({basicUnit})</label>
+                <input type="number" value={basic.amount} onChange={(e) => updateBasic({ amount: Number(e.target.value) })} className={INPUT} />
               </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-xs text-muted-foreground">Period</label>
-                <select value={basicPeriod} onChange={(e) => setBasicPeriod(e.target.value)} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
+                <select value={basic.period} onChange={(e) => updateBasic({ period: e.target.value })} className={INPUT}>
                   <option value="daily">Daily</option>
-                  <option value="weekly">Weekly</option>
-                  <option value="monthly">Monthly</option>
+                  <option value="weekly">Weekly (total)</option>
+                  <option value="monthly">Monthly (total)</option>
                 </select>
               </div>
               <div>
                 <label className="text-xs text-muted-foreground">Severity</label>
-                <select value={basicSeverity} onChange={(e) => setBasicSeverity(e.target.value)} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
-                  <option value="target">Target (hard cap)</option>
+                <select value={basic.severity} onChange={(e) => updateBasic({ severity: e.target.value })} className={INPUT}>
+                  <option value="target">Target (hard)</option>
                   <option value="warning">Warning (soft)</option>
                 </select>
               </div>
@@ -377,20 +412,20 @@ function NewGoalModal({ onClose, onCreated }) {
         {tab === 'presets' && (
           <div className="space-y-4">
             <div>
-              <label className="text-xs text-muted-foreground">Apply to category</label>
-              <select value={presetCategory} onChange={(e) => setPresetCategory(e.target.value)} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
-                <option value="">Choose a category</option>
+              <label className="text-xs text-muted-foreground">Limit to a food category (optional)</label>
+              <select value={presetCategory} onChange={(e) => setPresetCategory(e.target.value)} className={INPUT}>
+                <option value="">All foods</option>
                 {FOOD_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
               </select>
             </div>
             {!presets ? (
               <p className="text-sm text-muted-foreground">Loading…</p>
             ) : (
-              <>
-                <div>
-                  <p className="text-xs font-medium text-muted-foreground mb-2 uppercase tracking-wide">Basic</p>
+              [['Basic', presets.basic], ['Advanced', presets.advanced]].map(([title, list]) => (
+                <div key={title}>
+                  <p className="text-xs font-medium text-muted-foreground mb-2 uppercase tracking-wide">{title}</p>
                   <div className="space-y-2">
-                    {presets.basic.map((p) => (
+                    {list.map((p) => (
                       <button key={p.name} onClick={() => applyPreset(p)} className="w-full text-left flex items-center justify-between p-3 border border-border rounded-md hover:bg-secondary/30 transition-colors">
                         <span className="text-sm font-medium">{p.name}</span>
                         <Plus className="h-3.5 w-3.5 text-muted-foreground" />
@@ -398,18 +433,7 @@ function NewGoalModal({ onClose, onCreated }) {
                     ))}
                   </div>
                 </div>
-                <div>
-                  <p className="text-xs font-medium text-muted-foreground mb-2 uppercase tracking-wide">Advanced</p>
-                  <div className="space-y-2">
-                    {presets.advanced.map((p) => (
-                      <button key={p.name} onClick={() => applyPreset(p)} className="w-full text-left flex items-center justify-between p-3 border border-border rounded-md hover:bg-secondary/30 transition-colors">
-                        <span className="text-sm font-medium">{p.name}</span>
-                        <Plus className="h-3.5 w-3.5 text-muted-foreground" />
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </>
+              ))
             )}
           </div>
         )}
@@ -418,22 +442,24 @@ function NewGoalModal({ onClose, onCreated }) {
           <div className="space-y-4">
             <div>
               <label className="text-xs text-muted-foreground">Label (optional)</label>
-              <input value={advanced.label} onChange={(e) => updateAdvanced({ label: e.target.value })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background" />
+              <input value={advanced.label} onChange={(e) => updateAdvanced({ label: e.target.value })} className={INPUT} />
             </div>
 
             <div className="border border-border rounded-md p-3">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-2">What's being measured</p>
-              <label className="text-xs text-muted-foreground">Categories (pick several to cap them combined — none picked means every category)</label>
+              <label className="text-xs text-muted-foreground">Measure</label>
+              <MeasureSelect measures={measures} value={advanced.measure} onChange={(v) => updateAdvanced({ measure: v })} />
+              <label className="text-xs text-muted-foreground mt-3 block">Food categories (pick several to combine — none means all foods)</label>
               <div className="mt-1">
                 <CategoryCheckboxes selected={advanced.measureCategories} onChange={(v) => updateAdvanced({ measureCategories: v })} />
               </div>
               <div className="grid grid-cols-2 gap-3 mt-3">
                 <div>
                   <label className="text-xs text-muted-foreground">Aggregation</label>
-                  <select value={advanced.measureAggregation} onChange={(e) => updateAdvanced({ measureAggregation: e.target.value })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
+                  <select value={advanced.measureAggregation} onChange={(e) => updateAdvanced({ measureAggregation: e.target.value })} className={INPUT}>
                     <option value="sum">Sum</option>
-                    <option value="mean">Average</option>
-                    <option value="median">Median</option>
+                    <option value="mean">Average per entry</option>
+                    <option value="median">Median per entry</option>
                     <option value="min">Min</option>
                     <option value="max">Max</option>
                     <option value="count">Count</option>
@@ -442,7 +468,7 @@ function NewGoalModal({ onClose, onCreated }) {
                 </div>
                 <div>
                   <label className="text-xs text-muted-foreground">This period</label>
-                  <select value={advanced.period} onChange={(e) => updateAdvanced({ period: e.target.value })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
+                  <select value={advanced.period} onChange={(e) => updateAdvanced({ period: e.target.value })} className={INPUT}>
                     <option value="daily">Daily</option>
                     <option value="weekly">Weekly</option>
                     <option value="monthly">Monthly</option>
@@ -452,7 +478,7 @@ function NewGoalModal({ onClose, onCreated }) {
               {advanced.measureAggregation === 'percentile' && (
                 <div className="mt-3">
                   <label className="text-xs text-muted-foreground">Percentile</label>
-                  <input type="number" min="0" max="100" value={advanced.measurePercentile} onChange={(e) => updateAdvanced({ measurePercentile: Number(e.target.value) })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background" />
+                  <input type="number" min="0" max="100" value={advanced.measurePercentile} onChange={(e) => updateAdvanced({ measurePercentile: Number(e.target.value) })} className={INPUT} />
                 </div>
               )}
             </div>
@@ -460,22 +486,23 @@ function NewGoalModal({ onClose, onCreated }) {
             <div className="border border-border rounded-md p-3">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-2">Compared against</p>
               <div className="flex gap-1 border border-border rounded-md p-1 mb-3">
-                <button onClick={() => updateAdvanced({ referenceMode: 'fixed' })} className={'flex-1 text-sm py-1.5 rounded ' + (advanced.referenceMode === 'fixed' ? 'bg-secondary font-medium' : 'text-muted-foreground')}>Fixed amount</button>
-                <button onClick={() => updateAdvanced({ referenceMode: 'computed' })} className={'flex-1 text-sm py-1.5 rounded ' + (advanced.referenceMode === 'computed' ? 'bg-secondary font-medium' : 'text-muted-foreground')}>Computed baseline</button>
+                {[['fixed', 'Fixed amount'], ['computed', 'Computed baseline']].map(([mode, label]) => (
+                  <button key={mode} onClick={() => updateAdvanced({ referenceMode: mode })} className={'flex-1 text-sm py-1.5 rounded ' + (advanced.referenceMode === mode ? 'bg-secondary font-medium' : 'text-muted-foreground')}>{label}</button>
+                ))}
               </div>
 
               {advanced.referenceMode === 'fixed' ? (
                 <div>
-                  <label className="text-xs text-muted-foreground">Calories</label>
-                  <input type="number" value={advanced.referenceAmount} onChange={(e) => updateAdvanced({ referenceAmount: Number(e.target.value) })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background" />
+                  <label className="text-xs text-muted-foreground">Amount ({advancedUnit})</label>
+                  <input type="number" value={advanced.referenceAmount} onChange={(e) => updateAdvanced({ referenceAmount: Number(e.target.value) })} className={INPUT} />
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <p className="text-xs text-muted-foreground">Baseline is computed from the same categories selected above.</p>
+                  <p className="text-xs text-muted-foreground">Baseline uses the same measure and food categories as above.</p>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="text-xs text-muted-foreground">Aggregation</label>
-                      <select value={advanced.refAggregation} onChange={(e) => updateAdvanced({ refAggregation: e.target.value })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
+                      <select value={advanced.refAggregation} onChange={(e) => updateAdvanced({ refAggregation: e.target.value })} className={INPUT}>
                         <option value="sum">Sum</option>
                         <option value="mean">Average</option>
                         <option value="median">Median</option>
@@ -486,7 +513,7 @@ function NewGoalModal({ onClose, onCreated }) {
                     </div>
                     <div>
                       <label className="text-xs text-muted-foreground">Baseline</label>
-                      <select value={advanced.baselineKind} onChange={(e) => updateAdvanced({ baselineKind: e.target.value })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
+                      <select value={advanced.baselineKind} onChange={(e) => updateAdvanced({ baselineKind: e.target.value })} className={INPUT}>
                         <option value="trailing">Trailing periods</option>
                         <option value="same_period_last_year">Same period last year</option>
                         <option value="all_time">All-time</option>
@@ -497,24 +524,24 @@ function NewGoalModal({ onClose, onCreated }) {
                   {advanced.baselineKind === 'trailing' && (
                     <div>
                       <label className="text-xs text-muted-foreground">Trailing how many {periodLabel(advanced.period)}s</label>
-                      <input type="number" min="1" value={advanced.trailingCount} onChange={(e) => updateAdvanced({ trailingCount: Number(e.target.value) })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background" />
+                      <input type="number" min="1" value={advanced.trailingCount} onChange={(e) => updateAdvanced({ trailingCount: Number(e.target.value) })} className={INPUT} />
                     </div>
                   )}
                   {advanced.baselineKind === 'same_period_last_year' && (
                     <div>
                       <label className="text-xs text-muted-foreground">How many years back</label>
-                      <input type="number" min="1" value={advanced.yearsBackCount} onChange={(e) => updateAdvanced({ yearsBackCount: Number(e.target.value) })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background" />
+                      <input type="number" min="1" value={advanced.yearsBackCount} onChange={(e) => updateAdvanced({ yearsBackCount: Number(e.target.value) })} className={INPUT} />
                     </div>
                   )}
                   {advanced.baselineKind === 'fixed_range' && (
                     <div className="grid grid-cols-2 gap-3">
                       <div>
                         <label className="text-xs text-muted-foreground">Start</label>
-                        <input type="date" value={advanced.fixedStart} onChange={(e) => updateAdvanced({ fixedStart: e.target.value })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background" />
+                        <input type="date" value={advanced.fixedStart} onChange={(e) => updateAdvanced({ fixedStart: e.target.value })} className={INPUT} />
                       </div>
                       <div>
                         <label className="text-xs text-muted-foreground">End</label>
-                        <input type="date" value={advanced.fixedEnd} onChange={(e) => updateAdvanced({ fixedEnd: e.target.value })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background" />
+                        <input type="date" value={advanced.fixedEnd} onChange={(e) => updateAdvanced({ fixedEnd: e.target.value })} className={INPUT} />
                       </div>
                     </div>
                   )}
@@ -524,7 +551,7 @@ function NewGoalModal({ onClose, onCreated }) {
               <div className="grid grid-cols-2 gap-3 mt-3">
                 <div>
                   <label className="text-xs text-muted-foreground">Comparator</label>
-                  <select value={advanced.comparator} onChange={(e) => updateAdvanced({ comparator: e.target.value })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background">
+                  <select value={advanced.comparator} onChange={(e) => updateAdvanced({ comparator: e.target.value })} className={INPUT}>
                     <option value="lte">At most</option>
                     <option value="gte">At least</option>
                     <option value="eq">Exactly</option>
@@ -534,7 +561,7 @@ function NewGoalModal({ onClose, onCreated }) {
                 {advanced.comparator === 'within_tolerance_percent' && (
                   <div>
                     <label className="text-xs text-muted-foreground">Tolerance ±%</label>
-                    <input type="number" value={advanced.tolerancePercent} onChange={(e) => updateAdvanced({ tolerancePercent: Number(e.target.value) })} className="w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background" />
+                    <input type="number" value={advanced.tolerancePercent} onChange={(e) => updateAdvanced({ tolerancePercent: Number(e.target.value) })} className={INPUT} />
                   </div>
                 )}
               </div>
@@ -543,7 +570,7 @@ function NewGoalModal({ onClose, onCreated }) {
             <div className="flex items-center justify-between">
               <label className="text-xs text-muted-foreground">Severity</label>
               <select value={advanced.severity} onChange={(e) => updateAdvanced({ severity: e.target.value })} className="border border-border rounded-md px-3 py-2 text-sm bg-background">
-                <option value="target">Target (hard cap)</option>
+                <option value="target">Target (hard)</option>
                 <option value="warning">Warning (soft)</option>
               </select>
             </div>
@@ -563,9 +590,9 @@ function NewGoalModal({ onClose, onCreated }) {
   )
 }
 
-// ── Main page ──────────────────────────────────────────────────────────
+// ── Section ────────────────────────────────────────────────────────────
 
-export default function Goals() {
+export function GoalsSection({ reloadKey = 0 }) {
   const [goals, setGoals] = useState([])
   const [statuses, setStatuses] = useState({})
   const [loading, setLoading] = useState(true)
@@ -573,6 +600,7 @@ export default function Goals() {
 
   function load() {
     setLoading(true)
+    setStatuses({})
     api('/goals?active=true').then((r) => r.json()).then((rows) => {
       setGoals(rows)
       setLoading(false)
@@ -582,7 +610,7 @@ export default function Goals() {
     }).catch(() => setLoading(false))
   }
 
-  useEffect(load, [])
+  useEffect(load, [reloadKey])
 
   async function handleDelete(id) {
     setGoals((prev) => prev.filter((g) => g.id !== id))
@@ -590,33 +618,33 @@ export default function Goals() {
   }
 
   return (
-    <div className="max-w-4xl">
-      <div className="flex items-center justify-between mb-1">
-        <h1 className="text-2xl font-bold">Goals</h1>
-        <button onClick={() => setShowModal(true)} className="flex items-center gap-1.5 bg-primary text-primary-foreground rounded-md px-3 py-1.5 text-sm font-medium">
-          <Plus className="h-4 w-4" /> New Goal
-        </button>
-      </div>
-      <p className="text-muted-foreground mb-6 text-sm">Set a target, hardcoded or computed from your own history, and get flagged the moment it's crossed.</p>
-
-      {loading ? (
-        <p className="text-sm text-muted-foreground">Loading…</p>
-      ) : goals.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No active goals yet.</p>
-      ) : (
-        <div className="grid gap-4 sm:grid-cols-2">
-          {goals.map((g) => (
-            <GoalCard key={g.id} goal={g} status={statuses[g.id]} onDelete={handleDelete} />
-          ))}
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <CardTitle>Goals</CardTitle>
+            <CardDescription>
+              Daily targets and long-term goals for calories or any nutrient — fixed amounts or compared against your own history. Live progress is for the current period.
+            </CardDescription>
+          </div>
+          <button onClick={() => setShowModal(true)} className="shrink-0 flex items-center gap-1.5 bg-primary text-primary-foreground rounded-md px-3 py-1.5 text-sm font-medium">
+            <Plus className="h-4 w-4" /> New Goal
+          </button>
         </div>
-      )}
+      </CardHeader>
+      <CardContent>
+        {loading ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : goals.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No goals yet.</p>
+        ) : (
+          <div className="grid gap-4 sm:grid-cols-2">
+            {goals.map((g) => <GoalCard key={g.id} goal={g} status={statuses[g.id]} onDelete={handleDelete} />)}
+          </div>
+        )}
+      </CardContent>
 
-      {showModal && (
-        <NewGoalModal
-          onClose={() => setShowModal(false)}
-          onCreated={() => { setShowModal(false); load() }}
-        />
-      )}
-    </div>
+      {showModal && <NewGoalModal onClose={() => setShowModal(false)} onCreated={() => { setShowModal(false); load() }} />}
+    </Card>
   )
 }

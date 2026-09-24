@@ -152,41 +152,11 @@ async def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_nutrient_facts_owner ON nutrient_facts(owner_type, owner_id);
 
-            -- One row per (user, nutrient). Seeded from DRI defaults on
-            -- account setup; is_custom distinguishes a user override from
-            -- the still-current DRI default, so re-running the DRI seed
-            -- (e.g. if age/sex profile changes) can update only the
-            -- non-overridden rows without clobbering explicit user choices.
-            CREATE TABLE IF NOT EXISTS nutrition_targets (
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
-                nutrient_name TEXT NOT NULL,
-                unit TEXT NOT NULL,
-                daily_target DOUBLE PRECISION,
-                max_threshold DOUBLE PRECISION,
-                is_custom BOOLEAN NOT NULL DEFAULT FALSE,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (user_id, nutrient_name)
-            );
-
-            -- One row per user. mode="fixed": calorie_target/protein_g/
-            -- carbs_g/fat_g are absolute daily targets. mode="ratio":
-            -- calorie_target + protein_pct/carbs_pct/fat_pct (must sum to
-            -- 100), grams are derived (protein/carbs = 4 kcal/g, fat =
-            -- 9 kcal/g) rather than stored, so they stay in sync if the
-            -- calorie target changes — same behavior Cronometer's "Macro
-            -- Ratios" mode has.
-            CREATE TABLE IF NOT EXISTS macro_target_settings (
-                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
-                mode TEXT NOT NULL DEFAULT 'fixed',
-                calorie_target DOUBLE PRECISION,
-                protein_g DOUBLE PRECISION,
-                carbs_g DOUBLE PRECISION,
-                fat_g DOUBLE PRECISION,
-                protein_pct DOUBLE PRECISION,
-                carbs_pct DOUBLE PRECISION,
-                fat_pct DOUBLE PRECISION,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
+            -- nutrition_targets and macro_target_settings no longer exist here:
+            -- unified into `goals` (see the one-time migration at the end of
+            -- this script, and app/nutrition_targets.py). Deliberately NOT
+            -- re-created with IF NOT EXISTS -- that would resurrect two
+            -- empty tables on every startup after the migration drops them.
 
             -- Profile fields for DRI lookup + sex-based water goal default.
             -- One row per user, created/updated via account setup.
@@ -594,6 +564,15 @@ async def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_goals_user_active ON goals(user_id, is_active);
 
+            -- Who/what created this goal. NULL = user-authored via the
+            -- Goals/Targets UI. 'dri_default' = auto-seeded DRI nutrient
+            -- target (refreshed on profile change, never touched once the
+            -- user customizes it -> 'user_target'). 'macro_target' = the
+            -- calorie/protein/carbs/fat rows written by PUT /targets/macros.
+            -- Additive, generically named column -- nothing about it is
+            -- nutrition-specific, so another tracker could use it too.
+            ALTER TABLE goals ADD COLUMN IF NOT EXISTS source TEXT;
+
             -- logged_at was added a short time after domain_events itself
             -- (still pre-launch, no real rows anywhere yet) to separate
             -- "row insert time" from occurred_at once occurred_at started
@@ -661,6 +640,114 @@ async def init_db():
                     DROP TABLE meal_item_nutrients;
                 END IF;
             END $$;
+
+            -- One-time migration (2026-09-24): Targets and Goals unified onto
+            -- the `goals` table. nutrition_targets (per-nutrient DRI/custom
+            -- daily_target + max_threshold) and macro_target_settings
+            -- (calorie/macro targets, fixed or ratio) become goals rows in
+            -- the Goal Query shape -- a floor (gte) and a ceiling (lte) goal
+            -- per nutrient, and calorie/protein/carbs/fat goals for macros --
+            -- then both tables are dropped. Ratio-mode macros are resolved to
+            -- concrete grams at migration time (same math as
+            -- nutrition_targets.derive_macro_grams).
+            --
+            -- Also backfills domain_events for food_log rows that predate
+            -- the event log (22k+ of them at migration time): goals/targets
+            -- now read consumption from domain_events, so without this every
+            -- historical date would read as zero. Backfilled events use
+            -- occurred_at = the entry's own date at UTC midnight and
+            -- logged_at = its created_at, matching what log_domain_event
+            -- writes for a live entry.
+            --
+            -- Idempotent and race-safe: an advisory lock serializes
+            -- concurrent startups (Cloud Run can boot several instances at
+            -- once), the existence check runs AFTER the lock, and the DROPs
+            -- at the end make every later startup a no-op.
+            DO $$
+            BEGIN
+                PERFORM pg_advisory_xact_lock(872001);
+
+                IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'nutrition_targets') THEN
+                    INSERT INTO domain_events
+                        (user_id, owner_type, owner_id, event_type, category, amount, label, source, source_id, metadata_json, occurred_at, logged_at)
+                    SELECT fl.user_id, 'food_log', fl.id, 'food_log_created', fl.category, COALESCE(fl.calories, 0),
+                           fl.food_name, fl.source, fl.source_id, jsonb_build_object('meal', fl.meal)::text,
+                           (fl.date::date)::timestamp AT TIME ZONE 'UTC', fl.created_at
+                    FROM food_log fl
+                    WHERE fl.date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                      AND NOT EXISTS (SELECT 1 FROM domain_events de WHERE de.owner_type = 'food_log' AND de.owner_id = fl.id);
+
+                    -- Repair: events already in the log whose occurred_at
+                    -- doesn't match their food_log entry's own date. Pantry
+                    -- "consume" logged its event without the entry's date
+                    -- (occurred_at defaulted to click time), and some events
+                    -- were written at host-local rather than UTC midnight.
+                    -- Consumption is bucketed by occurred_at, so both would
+                    -- misfile entries by a day (or, for the pantry case, by
+                    -- years when backdated/future-dated).
+                    UPDATE domain_events de
+                    SET occurred_at = (fl.date::date)::timestamp AT TIME ZONE 'UTC'
+                    FROM food_log fl
+                    WHERE de.owner_type = 'food_log' AND de.owner_id = fl.id
+                      AND fl.date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                      AND de.occurred_at <> (fl.date::date)::timestamp AT TIME ZONE 'UTC';
+
+                    INSERT INTO goals (user_id, label, severity, comparator, measure_query, reference_amount, notify_on_crossing, source)
+                    SELECT nt.user_id, nt.nutrient_name, 'target', 'gte',
+                           jsonb_build_object(
+                               'aggregation', 'sum',
+                               'filters', jsonb_build_array(jsonb_build_object('field', 'owner_type', 'operator', 'eq', 'value', 'food_log')),
+                               'timeWindow', jsonb_build_object('kind', 'current_period', 'period', 'daily'),
+                               'measureField', 'nutrient:' || nt.nutrient_name)::text,
+                           nt.daily_target, FALSE, CASE WHEN nt.is_custom THEN 'user_target' ELSE 'dri_default' END
+                    FROM nutrition_targets nt WHERE nt.daily_target IS NOT NULL;
+
+                    INSERT INTO goals (user_id, label, severity, comparator, measure_query, reference_amount, notify_on_crossing, source)
+                    SELECT nt.user_id, nt.nutrient_name || ' (max)', 'target', 'lte',
+                           jsonb_build_object(
+                               'aggregation', 'sum',
+                               'filters', jsonb_build_array(jsonb_build_object('field', 'owner_type', 'operator', 'eq', 'value', 'food_log')),
+                               'timeWindow', jsonb_build_object('kind', 'current_period', 'period', 'daily'),
+                               'measureField', 'nutrient:' || nt.nutrient_name)::text,
+                           nt.max_threshold, FALSE, CASE WHEN nt.is_custom THEN 'user_target' ELSE 'dri_default' END
+                    FROM nutrition_targets nt WHERE nt.max_threshold IS NOT NULL;
+
+                    DROP TABLE nutrition_targets;
+                END IF;
+
+                IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'macro_target_settings') THEN
+                    INSERT INTO goals (user_id, label, severity, comparator, tolerance_percent, measure_query, reference_amount, notify_on_crossing, source)
+                    SELECT m.user_id, 'Calories', 'target', 'within_tolerance_percent', 10,
+                           jsonb_build_object(
+                               'aggregation', 'sum',
+                               'filters', jsonb_build_array(jsonb_build_object('field', 'owner_type', 'operator', 'eq', 'value', 'food_log')),
+                               'timeWindow', jsonb_build_object('kind', 'current_period', 'period', 'daily'))::text,
+                           m.calorie_target, FALSE, 'macro_target'
+                    FROM macro_target_settings m WHERE m.calorie_target IS NOT NULL;
+
+                    INSERT INTO goals (user_id, label, severity, comparator, tolerance_percent, measure_query, reference_amount, notify_on_crossing, source)
+                    SELECT m.user_id, v.label, 'target', v.comparator, v.tolerance,
+                           jsonb_build_object(
+                               'aggregation', 'sum',
+                               'filters', jsonb_build_array(jsonb_build_object('field', 'owner_type', 'operator', 'eq', 'value', 'food_log')),
+                               'timeWindow', jsonb_build_object('kind', 'current_period', 'period', 'daily'),
+                               'measureField', v.measure_field)::text,
+                           v.grams, FALSE, 'macro_target'
+                    FROM macro_target_settings m
+                    CROSS JOIN LATERAL (VALUES
+                        ('Protein', 'gte', NULL::double precision, 'nutrient:Protein',
+                            CASE WHEN m.mode = 'ratio' THEN round((m.calorie_target * m.protein_pct / 100 / 4)::numeric, 1)::double precision ELSE m.protein_g END),
+                        ('Carbs', 'within_tolerance_percent', 10::double precision, 'nutrient:Carbohydrate, by difference',
+                            CASE WHEN m.mode = 'ratio' THEN round((m.calorie_target * m.carbs_pct / 100 / 4)::numeric, 1)::double precision ELSE m.carbs_g END),
+                        ('Fat', 'within_tolerance_percent', 10::double precision, 'nutrient:Total lipid (fat)',
+                            CASE WHEN m.mode = 'ratio' THEN round((m.calorie_target * m.fat_pct / 100 / 9)::numeric, 1)::double precision ELSE m.fat_g END)
+                    ) AS v(label, comparator, tolerance, measure_field, grams)
+                    WHERE v.grams IS NOT NULL;
+
+                    DROP TABLE macro_target_settings;
+                END IF;
+            END $$;
+
         """)
 
 

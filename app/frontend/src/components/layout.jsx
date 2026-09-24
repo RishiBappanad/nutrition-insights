@@ -13,7 +13,6 @@ import {
   User,
   Target,
   Refrigerator,
-  Flag,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { AppSwitcher, MobileAppSwitcher } from 'trackstack-ui'
@@ -30,8 +29,7 @@ const CURRENT_APP_ID = 'nutrition'
 const navItems = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/pantry', label: 'Pantry', icon: Refrigerator },
-  { href: '/targets', label: 'Targets', icon: Target },
-  { href: '/goals', label: 'Goals', icon: Flag },
+  { href: '/targets', label: 'Targets & Goals', icon: Target },
   { href: '/charts', label: 'Charts', icon: BarChart3 },
   { href: '/log', label: 'Log', icon: ClipboardList },
   { href: '/lift-insights', label: 'Lifts', icon: Dumbbell },

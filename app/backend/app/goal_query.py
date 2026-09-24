@@ -65,6 +65,13 @@ def _is_date_string(value) -> bool:
     return isinstance(value, str) and bool(_DATE_RE.match(value))
 
 
+_MEASURE_FIELD_RE = re.compile(r"^nutrient:.+$")
+
+
+def is_valid_measure_field(value) -> bool:
+    return value is None or (isinstance(value, str) and bool(_MEASURE_FIELD_RE.match(value)))
+
+
 @dataclass
 class FilterCondition:
     field: str
@@ -87,6 +94,18 @@ class GoalQuery:
     filters: list[FilterCondition] = dc_field(default_factory=list)
     time_window: Optional[TimeWindow] = None
     percentile: Optional[float] = None
+    # None (the default) aggregates over domain_events.amount, same as
+    # every finance-tracker goal and this tracker's own calorie-based
+    # goals. "nutrient:<Name>" instead aggregates over nutrient_facts.value
+    # for that nutrient name, joined to domain_events by (owner_type,
+    # owner_id) -- the extension that makes macro/micronutrient targets
+    # (protein grams, sodium mg, etc.) expressible, since those live in
+    # nutrient_facts, not on the domain_events row itself (see
+    # RECURRING_AND_GOALS_SPEC.md's 2026-09-23 "known limitation" note,
+    # closed 2026-09-24 by this field). Additive and backward-compatible:
+    # every existing goal (finance's, and this tracker's own pre-existing
+    # calorie goals) simply never sets it and behaves exactly as before.
+    measure_field: Optional[str] = None
 
 
 def _validate_filter(f: dict, index: int) -> Optional[str]:
@@ -157,11 +176,16 @@ def parse_goal_query(value) -> Union[GoalQuery, str]:
     if tw_err:
         return tw_err
 
+    measure_field = value.get("measureField")
+    if not is_valid_measure_field(measure_field):
+        return "measureField must be \"nutrient:<Name>\" or omitted"
+
     return GoalQuery(
         aggregation=aggregation,
         percentile=percentile if aggregation == "percentile" else None,
         filters=[FilterCondition(field=f["field"], operator=f["operator"], value=f["value"]) for f in filters],
         time_window=TimeWindow(**{k: v for k, v in raw_tw.items() if k in ("kind", "period", "count", "start", "end")}),
+        measure_field=measure_field,
     )
 
 
@@ -175,16 +199,18 @@ def goal_query_to_json(q: GoalQuery) -> dict:
     }
     if q.percentile is not None:
         out["percentile"] = q.percentile
+    if q.measure_field is not None:
+        out["measureField"] = q.measure_field
     return out
 
 
 # ── Filter -> SQL condition translation ─────────────────────────────────
 
 _DIRECT_COLUMNS = {
-    "category": "category",
-    "event_type": "event_type",
-    "owner_type": "owner_type",
-    "amount": "amount",
+    "category": "de.category",
+    "event_type": "de.event_type",
+    "owner_type": "de.owner_type",
+    "amount": "de.amount",
 }
 
 _SQL_OPERATORS = {"eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
@@ -214,7 +240,7 @@ def _build_filter_sql(f: FilterCondition, params: list) -> str:
                 params.append(v)
                 placeholders.append(f"${len(params)}")
             cast = "::numeric" if is_numeric_op else ""
-            expr = f"(metadata_json::jsonb ->> ${key_idx}){cast}"
+            expr = f"(de.metadata_json::jsonb ->> ${key_idx}){cast}"
             return f"{expr} IN ({', '.join(placeholders)})"
         else:
             column = _DIRECT_COLUMNS[f.field]
@@ -229,7 +255,7 @@ def _build_filter_sql(f: FilterCondition, params: list) -> str:
             params.append(key)
             key_idx = len(params)
             params.append(f"%{f.value}%")
-            return f"(metadata_json::jsonb ->> ${key_idx}) ILIKE ${len(params)}"
+            return f"(de.metadata_json::jsonb ->> ${key_idx}) ILIKE ${len(params)}"
         column = _DIRECT_COLUMNS[f.field]
         params.append(f"%{f.value}%")
         return f"{column} ILIKE ${len(params)}"
@@ -240,7 +266,7 @@ def _build_filter_sql(f: FilterCondition, params: list) -> str:
         key_idx = len(params)
         cast = "::numeric" if is_numeric_op else ""
         params.append(f.value)
-        return f"(metadata_json::jsonb ->> ${key_idx}){cast} {sql_op} ${len(params)}"
+        return f"(de.metadata_json::jsonb ->> ${key_idx}){cast} {sql_op} ${len(params)}"
     column = _DIRECT_COLUMNS[f.field]
     params.append(f.value)
     return f"{column} {sql_op} ${len(params)}"
@@ -375,29 +401,62 @@ async def compute_aggregate_for_range(
     params.append(range_.to)
     to_idx = len(params)
 
-    conditions = [f"user_id = $1", f"occurred_at >= ${from_idx}", f"occurred_at < ${to_idx}"]
+    conditions = [f"de.user_id = $1", f"de.occurred_at >= ${from_idx}", f"de.occurred_at < ${to_idx}"]
     for f in query.filters:
         conditions.append(_build_filter_sql(f, params))
     where_sql = " AND ".join(conditions)
 
+    # measure_field selects WHAT gets aggregated: domain_events.amount by
+    # default (every finance goal, this tracker's own calorie goals), or
+    # a nutrient_facts.value join for "nutrient:<Name>" (macro/micronutrient
+    # targets -- see GoalQuery.measure_field's own doc). The CTE-deduped
+    # `domain_events` relation is aliased `de` either way so both branches
+    # share one FROM clause shape; nutrient_facts is joined on the SAME
+    # (owner_type, owner_id) pair the dedup CTE already resolved to each
+    # owner's single latest surviving row, so an edited entry's nutrient
+    # values can't double-count any more than its calories can.
+    from_sql = "FROM domain_events de"
+    value_expr = "de.amount"
+    if query.measure_field and query.measure_field.startswith("nutrient:"):
+        nutrient_name = query.measure_field[len("nutrient:"):]
+        params.append(nutrient_name)
+        nutrient_idx = len(params)
+        from_sql += f" JOIN nutrient_facts nf ON nf.owner_type = de.owner_type AND nf.owner_id = de.owner_id AND nf.nutrient_name = ${nutrient_idx}"
+        value_expr = "nf.value"
+
     if query.aggregation == "count":
         select_expr = "count(*)"
     elif query.aggregation == "sum":
-        select_expr = "coalesce(sum(amount), 0)"
+        select_expr = f"coalesce(sum({value_expr}), 0)"
     elif query.aggregation == "mean":
-        select_expr = "coalesce(avg(amount), 0)"
+        select_expr = f"coalesce(avg({value_expr}), 0)"
     elif query.aggregation == "min":
-        select_expr = "coalesce(min(amount), 0)"
+        select_expr = f"coalesce(min({value_expr}), 0)"
     elif query.aggregation == "max":
-        select_expr = "coalesce(max(amount), 0)"
+        select_expr = f"coalesce(max({value_expr}), 0)"
     else:
         fraction = 0.5 if query.aggregation == "median" else query.percentile / 100
         params.append(fraction)
-        select_expr = f"coalesce(percentile_cont(${len(params)}) within group (order by amount), 0)"
+        select_expr = f"coalesce(percentile_cont(${len(params)}) within group (order by {value_expr}), 0)"
 
-    sql = f"WITH {cte} SELECT {select_expr} AS v FROM domain_events WHERE {where_sql}"
+    sql = f"WITH {cte} SELECT {select_expr} AS v {from_sql} WHERE {where_sql}"
     row = await conn.fetchrow(sql, *params)
     return float(row["v"]) if row and row["v"] is not None else 0.0
+
+
+async def compute_measure_for_date(conn, user_id: int, query: GoalQuery, date_str: str, exclude_event_id: Optional[int] = None) -> float:
+    """Evaluates a GoalQuery's measure over exactly one calendar date,
+    ignoring the query's OWN configured time window entirely -- the
+    dashboard's per-date progress view (routers/targets.py's GET
+    /progress, rewired 2026-09-24 to read from goals) needs "how much of
+    X happened on THIS specific date" for a date the user is actively
+    navigating to (today, yesterday, any day), which is a different
+    question from a goal's own "current period relative to now" framing
+    that evaluate_goal_query answers. Reuses compute_aggregate_for_range
+    directly with an explicit single-day range instead."""
+    start = datetime.fromisoformat(f"{date_str}T00:00:00+00:00")
+    range_ = DateRange(from_=start, to=start + timedelta(days=1))
+    return await compute_aggregate_for_range(conn, user_id, query, range_, exclude_event_id)
 
 
 @dataclass
@@ -438,3 +497,26 @@ def could_match_event(query: GoalQuery, category: Optional[str], event_type: str
         if f.operator == "in" and actual not in f.value:
             return False
     return True
+
+
+async def compute_nutrient_totals_for_date(conn, user_id: int, date_str: str) -> dict[str, float]:
+    """Every nutrient's total consumed on one calendar date, in a single
+    query -- the dashboard's progress view needs ~24 nutrients per
+    request, and running compute_measure_for_date once per nutrient would
+    mean ~24 passes over the dedup CTE. Same semantics as a
+    `measureField: "nutrient:<Name>"` goal restricted to
+    owner_type = 'food_log' (which is what every DRI/user-target goal's
+    measure_query filters on -- pantry stock, recipes, and custom foods
+    also carry nutrient_facts rows but aren't consumption), just grouped
+    by nutrient instead of filtered to one."""
+    start = datetime.fromisoformat(f"{date_str}T00:00:00+00:00")
+    end = start + timedelta(days=1)
+    cte = _current_state_cte(1, None)
+    sql = f"""WITH {cte}
+        SELECT nf.nutrient_name, coalesce(sum(nf.value), 0) AS total
+        FROM domain_events de
+        JOIN nutrient_facts nf ON nf.owner_type = de.owner_type AND nf.owner_id = de.owner_id
+        WHERE de.user_id = $1 AND de.owner_type = 'food_log' AND de.occurred_at >= $2 AND de.occurred_at < $3
+        GROUP BY nf.nutrient_name"""
+    rows = await conn.fetch(sql, user_id, start, end)
+    return {r["nutrient_name"]: float(r["total"]) for r in rows}

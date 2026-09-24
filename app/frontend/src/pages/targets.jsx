@@ -3,32 +3,44 @@ import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import { Save, CheckCircle, ChevronDown, ChevronRight, RotateCcw } from 'lucide-react'
+import { GoalsSection } from '@/components/goals-section'
 
 /**
- * Macro + micronutrient target settings. Macros get a simple,
- * always-visible editor (fixed calories/protein/carbs/fat, or a
- * calorie+ratio mode where grams are derived server-side). Micronutrients
- * get a collapsed "Advanced" section — the full DRI-seeded list, with a
- * per-nutrient override toggle — matching Cronometer's actual UX split
- * (see nutrition-diary-design.md) rather than putting ~25 nutrient
+ * Targets and Goals, unified (2026-09-24): both are rows in the one goals
+ * table. A macro target is a daily goal, a micronutrient target is a daily
+ * floor/ceiling goal, and everything else -- weekly/monthly totals, trends
+ * against your own history, any nutrient by food category -- is a goal made
+ * in the Goals section below with the same Basic / Presets / Advanced form
+ * finance-tracker uses.
+ *
+ * Macros get a simple, always-visible editor (fixed calories/protein/carbs/
+ * fat, or a calorie+ratio mode where grams are derived server-side).
+ * Micronutrients get a collapsed "Advanced" section -- the full DRI-seeded
+ * list, with a per-nutrient override toggle -- matching Cronometer's actual
+ * UX split (see nutrition-diary-design.md) rather than putting ~25 nutrient
  * fields on the main screen.
  */
 export default function Targets() {
+  // Saving macro targets rewrites their goals; bump this so the Goals
+  // section below re-fetches instead of showing stale amounts.
+  const [goalsReloadKey, setGoalsReloadKey] = useState(0)
+
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Nutrition Targets</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Targets & Goals</h1>
         <p className="text-muted-foreground text-sm mt-1">
-          Set your daily calorie and macro goals, and fine-tune individual micronutrients
+          Set your daily calorie and macro targets, fine-tune individual micronutrients, and add long-term goals
         </p>
       </div>
-      <MacroTargets />
+      <MacroTargets onSaved={() => setGoalsReloadKey((k) => k + 1)} />
+      <GoalsSection reloadKey={goalsReloadKey} />
       <MicronutrientTargets />
     </div>
   )
 }
 
-function MacroTargets() {
+function MacroTargets({ onSaved }) {
   const [mode, setMode] = useState('fixed')
   const [fixed, setFixed] = useState({ calorie_target: '', protein_g: '', carbs_g: '', fat_g: '' })
   const [ratio, setRatio] = useState({ calorie_target: '', protein_pct: '', carbs_pct: '', fat_pct: '' })
@@ -79,6 +91,7 @@ function MacroTargets() {
       }
       setStatus('saved')
       setTimeout(() => setStatus(''), 3000)
+      onSaved?.()
     } else {
       const data = await res.json().catch(() => ({}))
       setStatus(data.detail || `Failed (${res.status})`)

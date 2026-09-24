@@ -19,7 +19,7 @@ meaning any future change to how a food log entry is validated/scaled/
 stored would silently NOT apply to Cronometer-synced entries).
 """
 import json
-from datetime import date
+from datetime import date, datetime, time, timezone
 from typing import Optional
 
 from pydantic import BaseModel
@@ -223,7 +223,7 @@ async def log_food_entries_bulk(user_id: int, entries: list[FoodLogEntryContract
                             user_id, food_log_id,
                             entry.category.value if entry.category else None, entry.calories, entry.food_name,
                             entry.source, entry.source_id, json.dumps({"meal": entry.meal}),
-                            date.fromisoformat(entry.date),
+                            datetime.combine(date.fromisoformat(entry.date), time.min, tzinfo=timezone.utc),
                         )
                         for food_log_id, entry in zip(food_log_ids, entries)
                     ],

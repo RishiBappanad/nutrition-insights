@@ -12,7 +12,7 @@ SAME transaction as its actual write -- pass the already-open `conn`
 so a rolled-back mutation can never leave an orphaned event behind.
 """
 import json
-from datetime import date
+from datetime import date, datetime, time, timezone
 from typing import Optional
 
 
@@ -50,7 +50,14 @@ async def log_domain_event(
     column -- occurred_at is parsed into a real date object here because
     asyncpg's timestamptz codec requires an actual date/datetime
     instance, not a string, once the column resolves to timestamptz."""
-    occurred_at_value = date.fromisoformat(occurred_at) if occurred_at else None
+    # UTC midnight, explicitly: passing a bare `date` lets asyncpg localize
+    # it in the *client process's* timezone (found 2026-09-24 -- a dev
+    # machine in US Eastern wrote 04:00 UTC), which would make per-day
+    # bucketing (Goals/Targets read this column in UTC days) depend on
+    # wherever the write happened to run.
+    occurred_at_value = (
+        datetime.combine(date.fromisoformat(occurred_at), time.min, tzinfo=timezone.utc) if occurred_at else None
+    )
     event_type = f"{owner_type}_{action}"
     event_id = await conn.fetchval(
         """INSERT INTO domain_events

@@ -19,18 +19,23 @@ from .auth import get_current_user
 from ..db.goals import query as goals_query
 from ..db import get_pool
 from ..goal_query import (
-    parse_goal_query, is_valid_period, GOAL_QUERY_PERIODS, goal_query_to_json,
+    parse_goal_query, is_valid_period, is_valid_measure_field, GOAL_QUERY_PERIODS, goal_query_to_json,
 )
 from ..goals_evaluation import (
     is_valid_comparator, is_valid_severity, compute_goal_status,
 )
+from ..nutrition_targets import nutrient_unit, DRI_TABLE
 
 router = APIRouter()
 
 
 class GoalInput(BaseModel):
-    # Shorthand fields (basic goal)
+    # Shorthand fields (basic goal). `category` (a food category) and
+    # `measure_field` ("nutrient:<Name>", omitted = calories) are both
+    # optional narrowing choices; target_amount + period are what make it
+    # shorthand.
     category: Optional[str] = None
+    measure_field: Optional[str] = None
     target_amount: Optional[float] = None
     period: Optional[str] = None
     # Full-form fields (advanced goal)
@@ -55,6 +60,7 @@ class GoalUpdateInput(BaseModel):
     inflation_adjusted: Optional[bool] = None
     notify_on_crossing: Optional[bool] = None
     category: Optional[str] = None
+    measure_field: Optional[str] = None
     target_amount: Optional[float] = None
     period: Optional[str] = None
     measure_query: Optional[dict] = None
@@ -63,20 +69,45 @@ class GoalUpdateInput(BaseModel):
 
 
 def _is_shorthand(body: GoalInput) -> bool:
-    return body.category is not None and body.target_amount is not None and body.period is not None and body.measure_query is None
+    return body.target_amount is not None and body.period is not None and body.measure_query is None
 
 
-def _expand_shorthand(category: str, target_amount: float, period: str) -> tuple[dict, float]:
+_CONSUMPTION_FILTER = {"field": "owner_type", "operator": "eq", "value": "food_log"}
+
+
+def _ensure_consumption_filter(query: dict) -> dict:
+    """A nutrition goal measures what was EATEN. domain_events here also
+    carries pantry stock, recipes, meals, custom foods, and exercise --
+    all with `amount`/nutrient_facts of their own -- so an unfiltered
+    query would count a pantry restock, or calories burned, toward a
+    calorie goal. Added server-side (unless the caller already filters on
+    owner_type themselves) so no client has to remember it."""
+    if any(f.get("field") == "owner_type" for f in query["filters"]):
+        return query
+    return {**query, "filters": [*query["filters"], dict(_CONSUMPTION_FILTER)]}
+
+
+def _expand_shorthand(category: Optional[str], measure_field: Optional[str], target_amount: float, period: str) -> tuple[dict, float]:
     """Expands the flat shorthand into the same stored shape the full
     form uses -- see RECURRING_AND_GOALS_SPEC.md's "Basic goals stay
     simple" section. A basic goal never requires hand-building the full
     query JSON."""
+    filters = [dict(_CONSUMPTION_FILTER)]
+    if category:
+        filters.append({"field": "category", "operator": "eq", "value": category})
     measure_query = {
         "aggregation": "sum",
-        "filters": [{"field": "category", "operator": "eq", "value": category}],
+        "filters": filters,
         "timeWindow": {"kind": "current_period", "period": period},
     }
+    if measure_field:
+        measure_query["measureField"] = measure_field
     return measure_query, target_amount
+
+
+def _goal_unit(measure_query: dict) -> str:
+    field = measure_query.get("measureField")
+    return nutrient_unit(field[len("nutrient:"):]) if field else "cal"
 
 
 def _serialize_goal(g: dict) -> dict:
@@ -92,6 +123,8 @@ def _serialize_goal(g: dict) -> dict:
         "reference_query": g["reference_query"],
         "inflation_adjusted": g["inflation_adjusted"],
         "notify_on_crossing": g["notify_on_crossing"],
+        "source": g.get("source"),
+        "unit": _goal_unit(g["measure_query"]),
         "created_at": g["created_at"].isoformat(),
         "updated_at": g["updated_at"].isoformat(),
     }
@@ -102,14 +135,16 @@ def _parse_goal_input(body: Union[GoalInput, GoalUpdateInput]) -> tuple[Optional
     Shared by create and update: accepts either shorthand
     (category/target_amount/period) or full-form (measure_query/
     reference_amount/reference_query) input."""
-    if body.category is not None or body.target_amount is not None or body.period is not None:
+    if body.category is not None or body.measure_field is not None or body.target_amount is not None or body.period is not None:
         if body.measure_query is not None:
-            return None, None, None, "cannot mix shorthand (category/target_amount/period) with measure_query"
-        if body.category is None or body.target_amount is None or body.period is None:
-            return None, None, None, "shorthand requires category, target_amount, and period together"
+            return None, None, None, "cannot mix shorthand (category/measure_field/target_amount/period) with measure_query"
+        if body.target_amount is None or body.period is None:
+            return None, None, None, "shorthand requires target_amount and period"
         if not is_valid_period(body.period):
             return None, None, None, f"period must be one of: {', '.join(GOAL_QUERY_PERIODS)}"
-        measure_query, reference_amount = _expand_shorthand(body.category, body.target_amount, body.period)
+        if body.measure_field is not None and not is_valid_measure_field(body.measure_field):
+            return None, None, None, "measure_field must be \"nutrient:<Name>\" or omitted"
+        measure_query, reference_amount = _expand_shorthand(body.category, body.measure_field, body.target_amount, body.period)
         return measure_query, reference_amount, None, None
 
     if body.measure_query is None:
@@ -131,12 +166,14 @@ def _parse_goal_input(body: Union[GoalInput, GoalUpdateInput]) -> tuple[Optional
             return None, None, None, f"reference_query: {reference_query}"
         reference_query = goal_query_to_json(reference_query)
 
-    return goal_query_to_json(measure_query), (body.reference_amount if not has_query else None), reference_query, None
+    if reference_query is not None:
+        reference_query = _ensure_consumption_filter(reference_query)
+    return _ensure_consumption_filter(goal_query_to_json(measure_query)), (body.reference_amount if not has_query else None), reference_query, None
 
 
 @router.get("")
-async def list_goals(active: Optional[str] = None, user_id: int = Depends(get_current_user)):
-    rows = await goals_query.list_goals(user_id, active_only=(active == "true"))
+async def list_goals(active: Optional[str] = None, include_system: Optional[str] = None, user_id: int = Depends(get_current_user)):
+    rows = await goals_query.list_goals(user_id, active_only=(active == "true"), include_system=(include_system == "true"))
     return [_serialize_goal(g) for g in rows]
 
 
@@ -197,7 +234,7 @@ async def update_goal(goal_id: int, body: GoalUpdateInput, user_id: int = Depend
     if body.notify_on_crossing is not None:
         updates["notify_on_crossing"] = body.notify_on_crossing
 
-    has_query_edit = any([body.measure_query, body.reference_amount is not None, body.reference_query, body.category, body.target_amount is not None, body.period])
+    has_query_edit = any([body.measure_query, body.reference_amount is not None, body.reference_query, body.category, body.measure_field, body.target_amount is not None, body.period])
     if has_query_edit:
         measure_query, reference_amount, reference_query, err = _parse_goal_input(body)
         if err:
@@ -241,18 +278,44 @@ async def _read_goal_status(goal: dict) -> dict:
     }
 
 
+@router.get("/measures")
+async def get_measures():
+    """Everything a goal can measure: calories (domain_events.amount), or
+    any nutrient (nutrient_facts, via measureField "nutrient:<Name>") --
+    the macros plus every DRI-tracked micronutrient. Static reference
+    data, not user-scoped, so any client builds the same picker."""
+    measures = [
+        {"field": None, "label": "Calories", "unit": "cal"},
+        {"field": "nutrient:Protein", "label": "Protein", "unit": "g"},
+        {"field": "nutrient:Carbohydrate, by difference", "label": "Carbohydrates", "unit": "g"},
+        {"field": "nutrient:Total lipid (fat)", "label": "Fat", "unit": "g"},
+    ]
+    seen = {m["field"] for m in measures}
+    for name, info in DRI_TABLE.items():
+        field = f"nutrient:{name}"
+        if field not in seen:
+            measures.append({"field": field, "label": name, "unit": info["unit"]})
+    return {"measures": measures}
+
+
 @router.get("/presets")
 async def get_presets():
     """Named starter configs, both basic (shorthand) and advanced (full
     measure_query/reference_query) tiers -- pre-filled request bodies
     only, no new server-side concept, so this list can grow without a
-    schema change. Mirrors finance-tracker's own presets, substituting
-    calories (this tracker's one universal per-entry numeric amount, see
-    goal_query.py's module doc) wherever finance's used dollars."""
+    schema change. A basic preset may carry `measure_field` (a nutrient
+    instead of calories) and `amount_hint` (a sensible starting number);
+    the user still picks/edits the amount and, optionally, a food
+    category. The advanced tier is where long-term goals live: weekly and
+    monthly periods, trailing baselines, month-over-month comparisons."""
     return {
         "basic": [
-            {"name": "Daily calorie cap", "comparator": "lte", "period": "daily"},
-            {"name": "Weekly average cap", "comparator": "lte", "period": "weekly"},
+            {"name": "Daily calorie cap", "comparator": "lte", "period": "daily", "amount_hint": 2000},
+            {"name": "Weekly calorie budget", "comparator": "lte", "period": "weekly", "amount_hint": 14000},
+            {"name": "Daily protein floor", "comparator": "gte", "period": "daily", "measure_field": "nutrient:Protein", "amount_hint": 120},
+            {"name": "Daily fiber floor", "comparator": "gte", "period": "daily", "measure_field": "nutrient:Fiber, total dietary", "amount_hint": 30},
+            {"name": "Daily sodium ceiling", "comparator": "lte", "period": "daily", "measure_field": "nutrient:Sodium, Na", "amount_hint": 2300},
+            {"name": "Weekly protein total", "comparator": "gte", "period": "weekly", "measure_field": "nutrient:Protein", "amount_hint": 840},
         ],
         "advanced": [
             {
@@ -263,17 +326,31 @@ async def get_presets():
                 "reference_query": {"aggregation": "mean", "filters": [], "timeWindow": {"kind": "trailing", "period": "daily", "count": 7}},
             },
             {
-                "name": "Outlier watch (95th percentile this year)",
-                "comparator": "lte",
-                "measure_query": {"aggregation": "percentile", "percentile": 95, "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}},
-                "reference_query": {"aggregation": "percentile", "percentile": 95, "filters": [], "timeWindow": {"kind": "all_time"}},
-            },
-            {
                 "name": "Week-over-week trend, ±10%",
                 "comparator": "within_tolerance_percent",
                 "tolerance_percent": 10,
                 "measure_query": {"aggregation": "sum", "filters": [], "timeWindow": {"kind": "current_period", "period": "weekly"}},
                 "reference_query": {"aggregation": "mean", "filters": [], "timeWindow": {"kind": "trailing", "period": "weekly", "count": 1}},
+            },
+            {
+                "name": "Month-over-month calories, ±10%",
+                "comparator": "within_tolerance_percent",
+                "tolerance_percent": 10,
+                "measure_query": {"aggregation": "sum", "filters": [], "timeWindow": {"kind": "current_period", "period": "monthly"}},
+                "reference_query": {"aggregation": "mean", "filters": [], "timeWindow": {"kind": "trailing", "period": "monthly", "count": 1}},
+            },
+            {
+                "name": "This month vs. trailing 3-month average, ±10%",
+                "comparator": "within_tolerance_percent",
+                "tolerance_percent": 10,
+                "measure_query": {"aggregation": "sum", "filters": [], "timeWindow": {"kind": "current_period", "period": "monthly"}},
+                "reference_query": {"aggregation": "mean", "filters": [], "timeWindow": {"kind": "trailing", "period": "monthly", "count": 3}},
+            },
+            {
+                "name": "Outlier watch (95th percentile)",
+                "comparator": "lte",
+                "measure_query": {"aggregation": "percentile", "percentile": 95, "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}},
+                "reference_query": {"aggregation": "percentile", "percentile": 95, "filters": [], "timeWindow": {"kind": "all_time"}},
             },
         ],
     }

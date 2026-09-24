@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useTrackStackAuth, redirectToLogin } from 'trackstack-ui'
-import { Switch, Route, Router } from 'wouter'
+import { Switch, Route, Router, Redirect } from 'wouter'
 import { Layout } from '@/components/layout'
 import { PendingActionProvider } from '@/lib/pending-action'
 import Dashboard from '@/pages/dashboard'
@@ -10,7 +10,6 @@ import FoodLog from '@/pages/food-log'
 import LiftInsights from '@/pages/lift-insights'
 import Profile from '@/pages/profile'
 import Targets from '@/pages/targets'
-import Goals from '@/pages/goals'
 import Pantry from '@/pages/pantry'
 import Recipes from '@/pages/recipes'
 import Meals from '@/pages/meals'
@@ -46,7 +45,7 @@ function AppRoutes({ onLogout }) {
           <Route path="/lift-insights" component={LiftInsights} />
           <Route path="/profile" component={Profile} />
           <Route path="/targets" component={Targets} />
-          <Route path="/goals" component={Goals} />
+          <Route path="/goals"><Redirect to="/targets" /></Route>
           <Route path="/pantry" component={Pantry} />
           <Route path="/recipes" component={Recipes} />
           <Route path="/meals" component={Meals} />

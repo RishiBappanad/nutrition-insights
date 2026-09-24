@@ -152,7 +152,15 @@ async def evaluate_goal_transition(conn, goal: dict, triggering_event_id: int) -
 
 
 async def evaluate_goals_for_event(conn, user_id: int, event_id: int, category: Optional[str], event_type: str, owner_type: str, action: str) -> None:
-    """Called from domain_events.py's log_domain_event, right after every
+    """Only goals with notify_on_crossing set are evaluated for transitions
+    -- the crossing events exist to be notified on, and skipping the rest
+    matters for cost: DRI-seeded nutrient targets are ~48 goals per user,
+    each needing two aggregate queries per triggering event, all for
+    goal_met/goal_exceeded rows nobody asked to hear about. (Live status
+    reads, GET /goals/:id/status and the dashboard's progress, don't go
+    through this path and are unaffected.)
+
+    Called from domain_events.py's log_domain_event, right after every
     event is written (same open `conn`/transaction) -- narrows to this
     user's active goals, then to those whose measure_query's cheap eq/in
     filters could plausibly match this event (could_match_event,
@@ -161,7 +169,7 @@ async def evaluate_goals_for_event(conn, user_id: int, event_id: int, category: 
     from .goal_query import could_match_event
 
     rows = await conn.fetch(
-        "SELECT * FROM goals WHERE user_id = $1 AND is_active = TRUE",
+        "SELECT * FROM goals WHERE user_id = $1 AND is_active = TRUE AND notify_on_crossing = TRUE",
         user_id,
     )
     for row in rows:
