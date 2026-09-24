@@ -64,13 +64,17 @@ def percent_of_reference(measure: float, reference: float) -> float:
 
 @dataclass
 class EvaluatedGoal:
-    measure_value: float
+    measure_value: Optional[float]  # None = no readings yet (a "last" measure over an empty window)
     reference_value: float
     comparator: str
     tolerance_percent: Optional[float]
     percent: float
     is_compliant: bool
     severity: str
+
+    @property
+    def has_data(self) -> bool:
+        return self.measure_value is not None
 
 
 def _parse_stored_query(raw, label: str) -> GoalQuery:
@@ -109,6 +113,13 @@ async def compute_goal_status(conn, goal: dict, exclude_event_id: Optional[int] 
         reference_value = goal["reference_amount"]
 
     comparator = goal["comparator"]
+    if measure.value is None or reference_value is None:
+        # No readings at all: not compliant (there's nothing to be
+        # compliant with), and no percent to show.
+        return EvaluatedGoal(
+            measure_value=None, reference_value=round(reference_value or 0, 2), comparator=comparator,
+            tolerance_percent=goal["tolerance_percent"], percent=0.0, is_compliant=False, severity=goal["severity"],
+        )
     return EvaluatedGoal(
         measure_value=measure.value,
         reference_value=round(reference_value, 2),

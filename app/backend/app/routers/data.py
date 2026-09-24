@@ -1,3 +1,4 @@
+import datetime
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -61,6 +62,10 @@ async def log_weight(req: WeightLogRequest, user_id: int = Depends(get_current_u
     only shows up on the chart but never affects BMR."""
     if req.weight_lbs <= 0:
         raise HTTPException(status_code=400, detail="weight_lbs must be positive")
+    try:
+        datetime.date.fromisoformat(req.date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
     await upsert_daily_nutrition(user_id, req.date, {"Weight (lbs)": req.weight_lbs})
     await upsert_tdee_log(user_id, req.date, weight_lbs=req.weight_lbs)
     return {"status": "logged"}

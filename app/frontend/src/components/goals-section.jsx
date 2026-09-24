@@ -1,36 +1,32 @@
-import { useEffect, useState } from 'react'
-import { Target, Plus, Trash2, CheckCircle2, AlertTriangle, X } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { Target, Plus, Trash2, CheckCircle2, AlertTriangle, X, Pencil, RotateCcw, Scale } from 'lucide-react'
 import { api } from '@/lib/api'
-import { FOOD_CATEGORIES } from '@/lib/food-categories'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 
-// Goals half of the unified Targets page -- mirrors finance-tracker's own
+// The Goals half of the unified Targets page -- mirrors finance-tracker's own
 // Goals UI (Basic / Presets / Advanced), on the same cross-tracker Goal Query
-// contract (workspace-notes/RECURRING_AND_GOALS_SPEC.md). A goal here
-// measures either calories or any single nutrient (`measureField`,
-// "nutrient:<Name>"), optionally narrowed to food categories, over a daily /
-// weekly / monthly period -- so a daily target and a long-term goal are the
-// same thing at different settings, and both live in the one goals table.
-// The server restricts every goal to logged consumption (owner_type
-// food_log), so nothing here has to.
+// contract (workspace-notes/RECURRING_AND_GOALS_SPEC.md).
+//
+// What a goal is asserted on, and how it's organized:
+//   - a NUTRIENT total (calories or any nutrient), grouped Macros / Vitamins /
+//     Minerals / Other by what the nutrient IS -- not by the food's category
+//     (fruit, dairy...). Every goal shows its standard unit (g / mg / µg / kcal).
+//   - a VITAL (weight, body fat): the latest reading.
+// The DRI micronutrient targets live in this same list as autofilled presets:
+// edit the amount in place, or reset it to the default. Two goals asserting the
+// same thing (two daily protein floors) are refused by the server; this UI
+// surfaces that as "you already have this".
 
-const NUTRIENT_DISPLAY = {
-  'Carbohydrate, by difference': 'Carbohydrates',
-  'Total lipid (fat)': 'Fat',
-}
+const INPUT = 'w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background'
+const SMALL_INPUT = 'w-24 border border-border rounded-md px-2 py-1 text-sm bg-background'
 
-function measureName(measureField) {
-  if (!measureField) return 'Calories'
-  const name = measureField.replace('nutrient:', '')
-  return NUTRIENT_DISPLAY[name] ?? name
-}
+const GROUPS = ['Macros', 'Vitamins', 'Minerals', 'Other', 'Vitals']
 
-function categoryFromQuery(query) {
-  const filter = query?.filters?.find((f) => f.field === 'category' && (f.operator === 'eq' || f.operator === 'in'))
-  if (!filter) return null
-  const label = (v) => FOOD_CATEGORIES.find((c) => c.value === v)?.label ?? v
-  if (Array.isArray(filter.value)) return filter.value.map(label).join(' + ')
-  return typeof filter.value === 'string' ? label(filter.value) : null
+async function errorMessage(res, fallback) {
+  const body = await res.json().catch(() => ({}))
+  const detail = body.detail
+  if (typeof detail === 'string') return detail
+  return detail?.message || fallback
 }
 
 function comparatorLabel(comparator, tolerancePercent) {
@@ -53,18 +49,22 @@ function periodLabel(period) {
 }
 
 function formatAmount(n, unit) {
+  if (n === null || n === undefined) return '—'
   const value = Math.abs(n) >= 100 ? Math.round(n) : Math.round(n * 10) / 10
   return unit ? `${value} ${unit}` : `${value}`
 }
 
 function termBadge(goal) {
-  const period = goal.measure_query.timeWindow.period
+  if (goal.vital) return 'Latest'
+  const window = goal.measure_query.timeWindow
   if (goal.reference_query) return 'Trend'
-  return period === 'daily' ? 'Daily' : period === 'weekly' ? 'Weekly' : period === 'monthly' ? 'Monthly' : 'Goal'
+  return window.period === 'daily' ? 'Daily' : window.period === 'weekly' ? 'Weekly' : window.period === 'monthly' ? 'Monthly' : 'Goal'
 }
 
 function goalSubtitle(goal) {
-  const period = goal.measure_query.timeWindow.period
+  const mq = goal.measure_query
+  if (goal.vital && !goal.reference_query) return 'latest reading'
+  const period = mq.timeWindow.period
   if (goal.reference_query) {
     const ref = goal.reference_query
     const baselineDesc =
@@ -72,61 +72,136 @@ function goalSubtitle(goal) {
       : ref.timeWindow.kind === 'same_period_last_year' ? `same ${periodLabel(ref.timeWindow.period)} ${ref.timeWindow.count === 1 ? 'last year' : `${ref.timeWindow.count} years back`}`
       : ref.timeWindow.kind === 'all_time' ? 'all-time'
       : 'a fixed range'
-    return `${goal.measure_query.aggregation} per ${periodLabel(period)}, vs. ${baselineDesc}`
+    return `${mq.aggregation} ${period ? `per ${periodLabel(period)}` : 'overall'}, vs. ${baselineDesc}`
   }
-  return `${goal.measure_query.aggregation} per ${periodLabel(period)}`
-}
-
-function categoryFilters(categories) {
-  if (categories.length === 0) return []
-  if (categories.length === 1) return [{ field: 'category', operator: 'eq', value: categories[0] }]
-  return [{ field: 'category', operator: 'in', value: categories }]
+  return `${mq.aggregation} per ${periodLabel(period)}`
 }
 
 // ── Goal card ──────────────────────────────────────────────────────────
 
-function GoalCard({ goal, status, onDelete }) {
-  const measure = measureName(goal.measure_query.measureField)
-  const category = categoryFromQuery(goal.measure_query)
+function GoalCard({ goal, status, onSaveAmount, onReset, onDelete, onLogVital }) {
   const isWarning = goal.severity === 'warning'
-  const managed = goal.source === 'macro_target'
-  const tone = status === undefined ? 'muted' : status.on_track ? 'ok' : isWarning ? 'warn' : 'bad'
+  const tone = status === undefined ? 'muted' : !status.has_data ? 'muted' : status.on_track ? 'ok' : isWarning ? 'warn' : 'bad'
   const iconBg = { muted: 'bg-secondary', ok: 'bg-emerald-500/10', warn: 'bg-amber-500/10', bad: 'bg-destructive/10' }[tone]
   const iconFg = { muted: 'text-muted-foreground', ok: 'text-emerald-600', warn: 'text-amber-600', bad: 'text-destructive' }[tone]
   const barFg = { muted: 'bg-secondary', ok: 'bg-emerald-500', warn: 'bg-amber-500', bad: 'bg-destructive' }[tone]
+  const Icon = goal.vital ? Scale : Target
+
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [reading, setReading] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+
+  const editable = goal.reference_query === null
+  const title = goal.label || goal.measure_label
+
+  async function run(action) {
+    setBusy(true)
+    setError(null)
+    try {
+      await action()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const saveAmount = () => run(async () => {
+    const value = Number(draft)
+    if (draft === '' || Number.isNaN(value) || value < 0) throw new Error('Enter a number')
+    await onSaveAmount(goal, value)
+    setEditing(false)
+  })
+
+  const logReading = () => run(async () => {
+    const value = Number(reading)
+    if (reading === '' || Number.isNaN(value) || value <= 0) throw new Error('Enter a reading')
+    await onLogVital(goal, value)
+    setReading('')
+  })
 
   return (
-    <div className="bg-card border border-border rounded-lg p-5 relative group">
+    <div className="bg-card border border-border rounded-lg p-4 relative group">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-start gap-3 min-w-0">
           <div className={'h-9 w-9 rounded-full flex items-center justify-center shrink-0 ' + iconBg}>
-            <Target className={'h-4 w-4 ' + iconFg} />
+            <Icon className={'h-4 w-4 ' + iconFg} />
           </div>
           <div className="min-w-0">
-            <p className="font-medium text-foreground truncate">{goal.label || measure}</p>
+            <p className="font-medium text-foreground truncate">{title}</p>
             <p className="text-xs text-muted-foreground truncate">
-              {measure} · {category ?? 'all foods'}
+              {goal.group}
+              {goal.is_preset && (goal.is_modified ? ' · Customized preset' : ' · Preset')}
             </p>
           </div>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-border text-muted-foreground">{termBadge(goal)}</span>
-          {!managed && (
-            <button onClick={() => onDelete(goal.id)} className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-secondary" aria-label="Delete goal">
+          {goal.is_modified && (
+            <button
+              onClick={() => run(() => onReset(goal))}
+              disabled={busy}
+              title={`Reset to the default (${formatAmount(goal.preset_amount, goal.unit)})`}
+              className="p-1 rounded hover:bg-secondary"
+              aria-label="Reset to default"
+            >
+              <RotateCcw className="h-3.5 w-3.5 text-muted-foreground" />
+            </button>
+          )}
+          {!goal.is_preset && (
+            <button onClick={() => run(() => onDelete(goal))} className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-secondary" aria-label="Delete goal">
               <Trash2 className="h-3.5 w-3.5 text-destructive" />
             </button>
           )}
         </div>
       </div>
 
-      <p className="text-xs text-muted-foreground mt-3">
-        {comparatorLabel(goal.comparator, goal.tolerance_percent)} {goal.reference_query ? 'a computed baseline' : formatAmount(goal.reference_amount ?? 0, goal.unit)} — {goalSubtitle(goal)}
-        {managed && ' · managed by the macro targets above'}
-      </p>
+      <div className="text-xs text-muted-foreground mt-3 flex items-center flex-wrap gap-x-1.5 gap-y-1">
+        {editing ? (
+          <>
+            <span>{comparatorLabel(goal.comparator, goal.tolerance_percent)}</span>
+            <input
+              type="number" min="0" autoFocus value={draft} onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') saveAmount(); if (e.key === 'Escape') setEditing(false) }}
+              className={SMALL_INPUT}
+            />
+            <span>{goal.unit}</span>
+            <button onClick={saveAmount} disabled={busy} className="text-primary font-medium hover:underline">Save</button>
+            <button onClick={() => setEditing(false)} className="hover:underline">Cancel</button>
+          </>
+        ) : (
+          <>
+            <span>
+              {comparatorLabel(goal.comparator, goal.tolerance_percent)}{' '}
+              {goal.reference_query ? 'a computed baseline' : formatAmount(goal.reference_amount ?? 0, goal.unit)} — {goalSubtitle(goal)}
+            </span>
+            {editable && (
+              <button
+                onClick={() => { setDraft(String(goal.reference_amount ?? '')); setEditing(true); setError(null) }}
+                className="p-0.5 rounded hover:bg-secondary" aria-label="Edit amount"
+              >
+                <Pencil className="h-3 w-3" />
+              </button>
+            )}
+          </>
+        )}
+      </div>
 
-      <div className="mt-4">
+      {goal.duplicate_of && (
+        <p className="text-xs text-amber-600 mt-2 flex items-start gap-1">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-px" />
+          Duplicate of another goal asserting the same thing{goal.is_preset ? '' : ' — delete this one'}.
+        </p>
+      )}
+      {error && <p className="text-xs text-destructive mt-2">{error}</p>}
+
+      <div className="mt-3">
         {status === undefined ? (
           <div className="h-2 w-full bg-secondary rounded-full animate-pulse" />
+        ) : !status.has_data ? (
+          <p className="text-sm text-muted-foreground">No readings yet — log your first below.</p>
         ) : (
           <>
             <div className="h-2 w-full bg-secondary rounded-full overflow-hidden">
@@ -143,53 +218,65 @@ function GoalCard({ goal, status, onDelete }) {
           </>
         )}
       </div>
+
+      {goal.vital && (
+        <div className="mt-3 flex items-center gap-2">
+          <input
+            type="number" min="0" step="0.1" placeholder={`Today's ${goal.measure_label.toLowerCase()}`} value={reading}
+            onChange={(e) => setReading(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') logReading() }}
+            className={SMALL_INPUT + ' flex-1'}
+          />
+          <span className="text-xs text-muted-foreground">{goal.unit}</span>
+          <button onClick={logReading} disabled={busy} className="text-xs font-medium border border-border rounded-md px-2 py-1 hover:bg-secondary">Log</button>
+        </div>
+      )}
     </div>
   )
 }
 
-// ── Form pieces ────────────────────────────────────────────────────────
+// ── Measure picker (category → measure) ────────────────────────────────
 
-const INPUT = 'w-full mt-1 border border-border rounded-md px-3 py-2 text-sm bg-background'
+function measureKey(m) {
+  return m.kind === 'vital' ? `vital:${m.vital}` : (m.field ?? 'calories')
+}
 
-// FOOD_CATEGORIES is a fixed 10-item enum, so a checkbox list covers
-// multi-select without a searchable combobox.
-function CategoryCheckboxes({ selected, onChange }) {
-  function toggle(value) {
-    onChange(selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value])
-  }
+// Pick a category (Macros / Vitamins / Minerals / Other / Vitals) and then a
+// specific measure inside it. Categories come from what the nutrient is, so
+// "Vitamins" narrows the list to vitamins, and every option shows its unit.
+function MeasurePicker({ measures, value, onChange }) {
+  const current = measures.find((m) => measureKey(m) === value) ?? measures[0]
+  const groups = GROUPS.filter((g) => measures.some((m) => m.group === g))
   return (
-    <div className="grid grid-cols-2 gap-1.5 max-h-40 overflow-y-auto border border-border rounded-md p-2">
-      {FOOD_CATEGORIES.map((c) => (
-        <label key={c.value} className="flex items-center gap-1.5 text-sm cursor-pointer">
-          <input type="checkbox" checked={selected.includes(c.value)} onChange={() => toggle(c.value)} className="rounded border-border" />
-          {c.label}
-        </label>
-      ))}
+    <div className="grid grid-cols-2 gap-3">
+      <div>
+        <label className="text-xs text-muted-foreground">Category</label>
+        <select
+          value={current?.group ?? ''}
+          onChange={(e) => onChange(measureKey(measures.find((m) => m.group === e.target.value)))}
+          className={INPUT}
+        >
+          {groups.map((g) => <option key={g} value={g}>{g}</option>)}
+        </select>
+      </div>
+      <div>
+        <label className="text-xs text-muted-foreground">Measure</label>
+        <select value={measureKey(current ?? {})} onChange={(e) => onChange(e.target.value)} className={INPUT}>
+          {measures.filter((m) => m.group === current?.group).map((m) => (
+            <option key={measureKey(m)} value={measureKey(m)}>{m.label} ({m.unit})</option>
+          ))}
+        </select>
+      </div>
     </div>
   )
-}
-
-function MeasureSelect({ measures, value, onChange }) {
-  return (
-    <select value={value} onChange={(e) => onChange(e.target.value)} className={INPUT}>
-      {measures.map((m) => (
-        <option key={m.field ?? 'calories'} value={m.field ?? ''}>{m.label} ({m.unit})</option>
-      ))}
-    </select>
-  )
-}
-
-function unitFor(measures, field) {
-  return measures.find((m) => (m.field ?? '') === field)?.unit ?? 'cal'
 }
 
 // ── New goal modal ─────────────────────────────────────────────────────
 
-const DEFAULT_BASIC = { measure: '', category: '', comparator: 'lte', amount: 2000, period: 'daily', severity: 'target' }
+const DEFAULT_BASIC = { measure: 'calories', comparator: 'lte', amount: 2000, period: 'daily', severity: 'target' }
 
 const DEFAULT_ADVANCED = {
-  measure: '',
-  measureCategories: [],
+  measure: 'calories',
   measureAggregation: 'sum',
   measurePercentile: 95,
   period: 'daily',
@@ -209,24 +296,44 @@ const DEFAULT_ADVANCED = {
   label: '',
 }
 
+// A vital is read as "the latest reading" by default, so its advanced form
+// starts on that; a nutrient is a period total.
+function advancedDefaultsFor(measure) {
+  return measure.startsWith('vital:')
+    ? { measureAggregation: 'last', period: 'all_time', referenceAmount: 0 }
+    : { measureAggregation: 'sum', period: 'daily' }
+}
+
 function buildReferenceTimeWindow(form) {
+  const period = form.period === 'all_time' ? 'weekly' : form.period
   switch (form.baselineKind) {
-    case 'trailing': return { kind: 'trailing', period: form.period, count: form.trailingCount }
-    case 'same_period_last_year': return { kind: 'same_period_last_year', period: form.period, count: form.yearsBackCount }
+    case 'trailing': return { kind: 'trailing', period, count: form.trailingCount }
+    case 'same_period_last_year': return { kind: 'same_period_last_year', period, count: form.yearsBackCount }
     case 'all_time': return { kind: 'all_time' }
     case 'fixed_range': return { kind: 'fixed_range', start: form.fixedStart, end: form.fixedEnd }
-    default: return { kind: 'trailing', period: form.period, count: 1 }
+    default: return { kind: 'trailing', period, count: 1 }
   }
 }
 
+function measureScope(measure) {
+  if (measure.startsWith('vital:')) {
+    return {
+      filters: [
+        { field: 'owner_type', operator: 'eq', value: 'vital' },
+        { field: 'category', operator: 'eq', value: measure.slice('vital:'.length) },
+      ],
+    }
+  }
+  return { filters: [], ...(measure !== 'calories' ? { measureField: measure } : {}) }
+}
+
 function buildAdvancedPayload(form) {
-  const measureField = form.measure ? { measureField: form.measure } : {}
+  const scope = measureScope(form.measure)
   const measure_query = {
     aggregation: form.measureAggregation,
     ...(form.measureAggregation === 'percentile' ? { percentile: form.measurePercentile } : {}),
-    filters: categoryFilters(form.measureCategories),
-    timeWindow: { kind: 'current_period', period: form.period },
-    ...measureField,
+    ...scope,
+    timeWindow: form.period === 'all_time' ? { kind: 'all_time' } : { kind: 'current_period', period: form.period },
   }
 
   const base = {
@@ -243,15 +350,14 @@ function buildAdvancedPayload(form) {
   const reference_query = {
     aggregation: form.refAggregation,
     ...(form.refAggregation === 'percentile' ? { percentile: form.refPercentile } : {}),
-    filters: categoryFilters(form.measureCategories),
+    ...scope,
     timeWindow: buildReferenceTimeWindow(form),
-    ...measureField,
   }
   return { ...base, reference_query }
 }
 
-function applyPresetToAdvancedForm(preset, category) {
-  const form = { ...DEFAULT_ADVANCED, measureCategories: category ? [category] : [] }
+function applyPresetToAdvancedForm(preset) {
+  const form = { ...DEFAULT_ADVANCED }
   form.comparator = preset.comparator
   if (preset.tolerance_percent !== undefined) form.tolerancePercent = preset.tolerance_percent
   if (preset.measure_query) {
@@ -273,13 +379,17 @@ function applyPresetToAdvancedForm(preset, category) {
   return form
 }
 
+function presetMeasureKey(preset) {
+  if (preset.vital) return `vital:${preset.vital}`
+  return preset.measure_field ?? 'calories'
+}
+
 function NewGoalModal({ onClose, onCreated }) {
   const [tab, setTab] = useState('basic')
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [presets, setPresets] = useState(null)
-  const [measures, setMeasures] = useState([{ field: null, label: 'Calories', unit: 'cal' }])
-  const [presetCategory, setPresetCategory] = useState('')
+  const [measures, setMeasures] = useState([{ field: null, kind: 'nutrient', group: 'Macros', label: 'Calories', unit: 'kcal' }])
   const [basic, setBasic] = useState(DEFAULT_BASIC)
   const [advanced, setAdvanced] = useState(DEFAULT_ADVANCED)
 
@@ -296,7 +406,7 @@ function NewGoalModal({ onClose, onCreated }) {
     setError(null)
     try {
       const res = await api('/goals', { method: 'POST', body: JSON.stringify(payload) })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Could not create goal')
+      if (!res.ok) throw new Error(await errorMessage(res, 'Could not create goal'))
       onCreated()
     } catch (e) {
       setError(e.message)
@@ -305,27 +415,26 @@ function NewGoalModal({ onClose, onCreated }) {
     }
   }
 
-  const submitBasic = () =>
-    post({
-      ...(basic.measure ? { measure_field: basic.measure } : {}),
-      ...(basic.category ? { category: basic.category } : {}),
-      comparator: basic.comparator,
-      target_amount: basic.amount,
+  const submitBasic = () => {
+    const shared = { comparator: basic.comparator, target_amount: basic.amount, severity: basic.severity }
+    if (basic.measure.startsWith('vital:')) return post({ ...shared, vital: basic.measure.slice('vital:'.length) })
+    return post({
+      ...shared,
+      ...(basic.measure !== 'calories' ? { measure_field: basic.measure } : {}),
       period: basic.period,
-      severity: basic.severity,
     })
+  }
 
   const submitAdvanced = () => post(buildAdvancedPayload(advanced))
 
   function applyPreset(preset) {
     if (preset.measure_query || preset.reference_query) {
-      setAdvanced(applyPresetToAdvancedForm(preset, presetCategory))
+      setAdvanced(applyPresetToAdvancedForm(preset))
       setTab('advanced')
     } else {
       setBasic({
         ...DEFAULT_BASIC,
-        measure: preset.measure_field ?? '',
-        category: presetCategory,
+        measure: presetMeasureKey(preset),
         comparator: preset.comparator,
         period: preset.period ?? 'daily',
         amount: preset.amount_hint ?? DEFAULT_BASIC.amount,
@@ -335,8 +444,10 @@ function NewGoalModal({ onClose, onCreated }) {
     setError(null)
   }
 
-  const basicUnit = unitFor(measures, basic.measure)
-  const advancedUnit = unitFor(measures, advanced.measure)
+  const unitOf = (key) => measures.find((m) => measureKey(m) === key)?.unit ?? 'kcal'
+  const basicIsVital = basic.measure.startsWith('vital:')
+  const advancedIsVital = advanced.measure.startsWith('vital:')
+  const advancedUnit = unitOf(advanced.measure)
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
@@ -346,7 +457,7 @@ function NewGoalModal({ onClose, onCreated }) {
           <button onClick={onClose} className="p-1 rounded hover:bg-secondary"><X className="h-4 w-4" /></button>
         </div>
         <p className="text-xs text-muted-foreground mb-4">
-          Track calories or any nutrient against a fixed amount or your own history. Daily is a target; weekly and monthly are long-term goals.
+          Set a goal on calories, any nutrient, or a vital like weight or body fat. Daily is a target; weekly and monthly are long-term goals.
         </p>
 
         <div className="flex gap-1 mb-4 border border-border rounded-md p-1">
@@ -361,17 +472,7 @@ function NewGoalModal({ onClose, onCreated }) {
 
         {tab === 'basic' && (
           <div className="space-y-3">
-            <div>
-              <label className="text-xs text-muted-foreground">Measure</label>
-              <MeasureSelect measures={measures} value={basic.measure} onChange={(v) => updateBasic({ measure: v })} />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">Food category (optional)</label>
-              <select value={basic.category} onChange={(e) => updateBasic({ category: e.target.value })} className={INPUT}>
-                <option value="">All foods</option>
-                {FOOD_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
-              </select>
-            </div>
+            <MeasurePicker measures={measures} value={basic.measure} onChange={(v) => updateBasic({ measure: v })} />
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-xs text-muted-foreground">Comparator</label>
@@ -382,19 +483,23 @@ function NewGoalModal({ onClose, onCreated }) {
                 </select>
               </div>
               <div>
-                <label className="text-xs text-muted-foreground">Amount ({basicUnit})</label>
+                <label className="text-xs text-muted-foreground">Amount ({unitOf(basic.measure)})</label>
                 <input type="number" value={basic.amount} onChange={(e) => updateBasic({ amount: Number(e.target.value) })} className={INPUT} />
               </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-xs text-muted-foreground">Period</label>
-                <select value={basic.period} onChange={(e) => updateBasic({ period: e.target.value })} className={INPUT}>
-                  <option value="daily">Daily</option>
-                  <option value="weekly">Weekly (total)</option>
-                  <option value="monthly">Monthly (total)</option>
-                </select>
-              </div>
+              {basicIsVital ? (
+                <p className="text-xs text-muted-foreground self-end pb-2">Checked against your latest reading.</p>
+              ) : (
+                <div>
+                  <label className="text-xs text-muted-foreground">Period</label>
+                  <select value={basic.period} onChange={(e) => updateBasic({ period: e.target.value })} className={INPUT}>
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly (total)</option>
+                    <option value="monthly">Monthly (total)</option>
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="text-xs text-muted-foreground">Severity</label>
                 <select value={basic.severity} onChange={(e) => updateBasic({ severity: e.target.value })} className={INPUT}>
@@ -411,13 +516,10 @@ function NewGoalModal({ onClose, onCreated }) {
 
         {tab === 'presets' && (
           <div className="space-y-4">
-            <div>
-              <label className="text-xs text-muted-foreground">Limit to a food category (optional)</label>
-              <select value={presetCategory} onChange={(e) => setPresetCategory(e.target.value)} className={INPUT}>
-                <option value="">All foods</option>
-                {FOOD_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
-              </select>
-            </div>
+            <p className="text-xs text-muted-foreground">
+              Pick a starting point — it fills in the form so you can change any of it (amount, comparator, period) before creating.
+              Presets you already have are marked; edit those from the goals list instead.
+            </p>
             {!presets ? (
               <p className="text-sm text-muted-foreground">Loading…</p>
             ) : (
@@ -425,12 +527,23 @@ function NewGoalModal({ onClose, onCreated }) {
                 <div key={title}>
                   <p className="text-xs font-medium text-muted-foreground mb-2 uppercase tracking-wide">{title}</p>
                   <div className="space-y-2">
-                    {list.map((p) => (
-                      <button key={p.name} onClick={() => applyPreset(p)} className="w-full text-left flex items-center justify-between p-3 border border-border rounded-md hover:bg-secondary/30 transition-colors">
-                        <span className="text-sm font-medium">{p.name}</span>
-                        <Plus className="h-3.5 w-3.5 text-muted-foreground" />
-                      </button>
-                    ))}
+                    {list.map((p) => {
+                      const have = p.existing_goal_id != null
+                      return (
+                        <button
+                          key={p.name}
+                          onClick={() => !have && applyPreset(p)}
+                          disabled={have}
+                          className="w-full text-left flex items-center justify-between p-3 border border-border rounded-md hover:bg-secondary/30 transition-colors disabled:opacity-60 disabled:hover:bg-transparent"
+                        >
+                          <span>
+                            <span className="text-sm font-medium block">{p.name}</span>
+                            {p.group && <span className="text-xs text-muted-foreground">{p.group}{p.unit ? ` · ${p.unit}` : ''}</span>}
+                          </span>
+                          {have ? <span className="text-xs text-muted-foreground">Already added</span> : <Plus className="h-3.5 w-3.5 text-muted-foreground" />}
+                        </button>
+                      )
+                    })}
                   </div>
                 </div>
               ))
@@ -447,28 +560,35 @@ function NewGoalModal({ onClose, onCreated }) {
 
             <div className="border border-border rounded-md p-3">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-2">What's being measured</p>
-              <label className="text-xs text-muted-foreground">Measure</label>
-              <MeasureSelect measures={measures} value={advanced.measure} onChange={(v) => updateAdvanced({ measure: v })} />
-              <label className="text-xs text-muted-foreground mt-3 block">Food categories (pick several to combine — none means all foods)</label>
-              <div className="mt-1">
-                <CategoryCheckboxes selected={advanced.measureCategories} onChange={(v) => updateAdvanced({ measureCategories: v })} />
-              </div>
+              <MeasurePicker measures={measures} value={advanced.measure} onChange={(v) => updateAdvanced({ measure: v, ...(v.startsWith('vital:') !== advancedIsVital ? advancedDefaultsFor(v) : {}) })} />
               <div className="grid grid-cols-2 gap-3 mt-3">
                 <div>
                   <label className="text-xs text-muted-foreground">Aggregation</label>
                   <select value={advanced.measureAggregation} onChange={(e) => updateAdvanced({ measureAggregation: e.target.value })} className={INPUT}>
-                    <option value="sum">Sum</option>
-                    <option value="mean">Average per entry</option>
-                    <option value="median">Median per entry</option>
-                    <option value="min">Min</option>
-                    <option value="max">Max</option>
-                    <option value="count">Count</option>
-                    <option value="percentile">Percentile</option>
+                    {advancedIsVital ? (
+                      <>
+                        <option value="last">Latest reading</option>
+                        <option value="mean">Average</option>
+                        <option value="min">Min</option>
+                        <option value="max">Max</option>
+                      </>
+                    ) : (
+                      <>
+                        <option value="sum">Sum</option>
+                        <option value="mean">Average per entry</option>
+                        <option value="median">Median per entry</option>
+                        <option value="min">Min</option>
+                        <option value="max">Max</option>
+                        <option value="count">Count</option>
+                        <option value="percentile">Percentile</option>
+                      </>
+                    )}
                   </select>
                 </div>
                 <div>
                   <label className="text-xs text-muted-foreground">This period</label>
                   <select value={advanced.period} onChange={(e) => updateAdvanced({ period: e.target.value })} className={INPUT}>
+                    {advancedIsVital && <option value="all_time">Any time (latest overall)</option>}
                     <option value="daily">Daily</option>
                     <option value="weekly">Weekly</option>
                     <option value="monthly">Monthly</option>
@@ -498,11 +618,12 @@ function NewGoalModal({ onClose, onCreated }) {
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <p className="text-xs text-muted-foreground">Baseline uses the same measure and food categories as above.</p>
+                  <p className="text-xs text-muted-foreground">Baseline uses the same measure as above.</p>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="text-xs text-muted-foreground">Aggregation</label>
                       <select value={advanced.refAggregation} onChange={(e) => updateAdvanced({ refAggregation: e.target.value })} className={INPUT}>
+                        {advancedIsVital && <option value="last">Latest reading</option>}
                         <option value="sum">Sum</option>
                         <option value="mean">Average</option>
                         <option value="median">Median</option>
@@ -523,7 +644,7 @@ function NewGoalModal({ onClose, onCreated }) {
                   </div>
                   {advanced.baselineKind === 'trailing' && (
                     <div>
-                      <label className="text-xs text-muted-foreground">Trailing how many {periodLabel(advanced.period)}s</label>
+                      <label className="text-xs text-muted-foreground">Trailing how many {periodLabel(advanced.period === 'all_time' ? 'weekly' : advanced.period)}s</label>
                       <input type="number" min="1" value={advanced.trailingCount} onChange={(e) => updateAdvanced({ trailingCount: Number(e.target.value) })} className={INPUT} />
                     </div>
                   )}
@@ -592,30 +713,82 @@ function NewGoalModal({ onClose, onCreated }) {
 
 // ── Section ────────────────────────────────────────────────────────────
 
-export function GoalsSection({ reloadKey = 0 }) {
+export function GoalsSection({ reloadKey = 0, onChanged }) {
   const [goals, setGoals] = useState([])
   const [statuses, setStatuses] = useState({})
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
+  const [tab, setTab] = useState('Macros')
+  const [notice, setNotice] = useState(null)
+
+  function loadStatuses() {
+    api('/goals/statuses').then((r) => r.json()).then((d) => setStatuses(d.statuses ?? {})).catch(() => {})
+  }
 
   function load() {
     setLoading(true)
     setStatuses({})
-    api('/goals?active=true').then((r) => r.json()).then((rows) => {
+    api('/goals?active=true&include_system=true').then((r) => r.json()).then((rows) => {
       setGoals(rows)
       setLoading(false)
-      rows.forEach((g) => {
-        api(`/goals/${g.id}/status`).then((r) => r.json()).then((s) => setStatuses((prev) => ({ ...prev, [g.id]: s }))).catch(() => {})
-      })
+      loadStatuses()
     }).catch(() => setLoading(false))
   }
 
   useEffect(load, [reloadKey])
 
-  async function handleDelete(id) {
-    setGoals((prev) => prev.filter((g) => g.id !== id))
-    await api(`/goals/${id}`, { method: 'DELETE' }).catch(() => {})
+  const replaceGoal = (updated) => setGoals((prev) => prev.map((g) => (g.id === updated.id ? { ...g, ...updated } : g)))
+
+  async function saveAmount(goal, amount) {
+    const res = await api(`/goals/${goal.id}`, { method: 'PATCH', body: JSON.stringify({ reference_amount: amount }) })
+    if (!res.ok) throw new Error(await errorMessage(res, 'Could not save'))
+    replaceGoal(await res.json())
+    loadStatuses()
+    onChanged?.()
   }
+
+  async function resetGoal(goal) {
+    const res = await api(`/goals/${goal.id}/reset`, { method: 'POST' })
+    if (!res.ok) throw new Error(await errorMessage(res, 'Could not reset'))
+    replaceGoal(await res.json())
+    loadStatuses()
+    onChanged?.()
+  }
+
+  async function deleteGoal(goal) {
+    const res = await api(`/goals/${goal.id}`, { method: 'DELETE' })
+    if (!res.ok) throw new Error(await errorMessage(res, 'Could not delete'))
+    setGoals((prev) => prev.filter((g) => g.id !== goal.id))
+    onChanged?.()
+  }
+
+  async function logVital(goal, value) {
+    const res = await api('/vitals', { method: 'POST', body: JSON.stringify({ metric: goal.vital, value }) })
+    if (!res.ok) throw new Error(await errorMessage(res, 'Could not log reading'))
+    loadStatuses()
+  }
+
+  async function resetAll() {
+    setNotice(null)
+    const res = await api('/goals/presets/reset', { method: 'POST' })
+    if (!res.ok) {
+      setNotice(await errorMessage(res, 'Could not reset presets'))
+      return
+    }
+    const { reset } = await res.json()
+    setNotice(reset ? `Reset ${reset} preset${reset === 1 ? '' : 's'} to their defaults.` : 'Every preset is already at its default.')
+    load()
+    onChanged?.()
+  }
+
+  const counts = useMemo(() => {
+    const c = { All: goals.length }
+    GROUPS.forEach((g) => { c[g] = goals.filter((x) => x.group === g).length })
+    return c
+  }, [goals])
+  const tabs = ['All', ...GROUPS.filter((g) => counts[g] > 0)]
+  const visible = tab === 'All' ? goals : goals.filter((g) => g.group === tab)
+  const anyModified = goals.some((g) => g.is_modified)
 
   return (
     <Card>
@@ -624,27 +797,53 @@ export function GoalsSection({ reloadKey = 0 }) {
           <div>
             <CardTitle>Goals</CardTitle>
             <CardDescription>
-              Daily targets and long-term goals for calories or any nutrient — fixed amounts or compared against your own history. Live progress is for the current period.
+              Your nutrient and vital goals, by category. Presets are filled in from your profile — edit any amount, or reset it to the default. Live progress is for the current period.
             </CardDescription>
           </div>
-          <button onClick={() => setShowModal(true)} className="shrink-0 flex items-center gap-1.5 bg-primary text-primary-foreground rounded-md px-3 py-1.5 text-sm font-medium">
-            <Plus className="h-4 w-4" /> New Goal
-          </button>
+          <div className="shrink-0 flex items-center gap-2">
+            {anyModified && (
+              <button onClick={resetAll} className="flex items-center gap-1.5 border border-border rounded-md px-3 py-1.5 text-sm hover:bg-secondary" title="Put every customized preset back to its default">
+                <RotateCcw className="h-3.5 w-3.5" /> Reset presets
+              </button>
+            )}
+            <button onClick={() => setShowModal(true)} className="flex items-center gap-1.5 bg-primary text-primary-foreground rounded-md px-3 py-1.5 text-sm font-medium">
+              <Plus className="h-4 w-4" /> New Goal
+            </button>
+          </div>
         </div>
       </CardHeader>
       <CardContent>
+        {notice && <p className="text-xs text-muted-foreground mb-3">{notice}</p>}
         {loading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
         ) : goals.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No goals yet.</p>
+          <p className="text-sm text-muted-foreground">No goals yet. Set your profile (age + sex) to autofill nutrient presets, or add your own.</p>
         ) : (
-          <div className="grid gap-4 sm:grid-cols-2">
-            {goals.map((g) => <GoalCard key={g.id} goal={g} status={statuses[g.id]} onDelete={handleDelete} />)}
-          </div>
+          <>
+            <div className="flex flex-wrap gap-1.5 mb-4">
+              {tabs.map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className={'text-sm px-3 py-1 rounded-full border ' + (tab === t ? 'bg-secondary font-medium border-border' : 'border-transparent text-muted-foreground hover:bg-secondary/50')}
+                >
+                  {t} <span className="text-xs text-muted-foreground">{counts[t]}</span>
+                </button>
+              ))}
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              {visible.map((g) => (
+                <GoalCard
+                  key={g.id} goal={g} status={statuses[g.id]}
+                  onSaveAmount={saveAmount} onReset={resetGoal} onDelete={deleteGoal} onLogVital={logVital}
+                />
+              ))}
+            </div>
+          </>
         )}
       </CardContent>
 
-      {showModal && <NewGoalModal onClose={() => setShowModal(false)} onCreated={() => { setShowModal(false); load() }} />}
+      {showModal && <NewGoalModal onClose={() => setShowModal(false)} onCreated={() => { setShowModal(false); load(); onChanged?.() }} />}
     </Card>
   )
 }

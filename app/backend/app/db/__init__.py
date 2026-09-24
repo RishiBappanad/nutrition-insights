@@ -748,6 +748,47 @@ async def init_db():
                 END IF;
             END $$;
 
+            -- Vitals for Goals (2026-09-24). Weight already lives in
+            -- daily_nutrition ("Weight (lbs)": Charts, Cronometer sync,
+            -- POST /data/weight); to make a reading a goal-able domain_event
+            -- (owner_type 'vital') each row needs an integer identity, which
+            -- its composite primary key doesn't provide. A SERIAL column adds
+            -- one (existing rows are numbered by the ALTER itself).
+            ALTER TABLE daily_nutrition ADD COLUMN IF NOT EXISTS id SERIAL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_nutrition_id ON daily_nutrition(id);
+
+            -- Backfill one vital_created event per existing vital reading
+            -- (occurred_at = the reading's own date at UTC midnight). Guarded
+            -- by NOT EXISTS so every later startup is a no-op; the advisory
+            -- lock keeps two booting instances from both inserting.
+            DO $$
+            BEGIN
+                PERFORM pg_advisory_xact_lock(872002);
+                INSERT INTO domain_events
+                    (user_id, owner_type, owner_id, event_type, category, amount, label, source, metadata_json, occurred_at)
+                SELECT dn.user_id, 'vital', dn.id, 'vital_created',
+                       CASE dn.metric WHEN 'Weight (lbs)' THEN 'weight' WHEN 'Body Fat (%)' THEN 'body_fat' END,
+                       dn.value, dn.metric, 'daily_nutrition', '{}',
+                       (dn.date::date)::timestamp AT TIME ZONE 'UTC'
+                FROM daily_nutrition dn
+                WHERE dn.metric IN ('Weight (lbs)', 'Body Fat (%)')
+                  AND dn.date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                  AND NOT EXISTS (SELECT 1 FROM domain_events e WHERE e.owner_type = 'vital' AND e.owner_id = dn.id);
+            END $$;
+
+            -- One protein floor, not two (2026-09-24). A user who set macro
+            -- targets also had the auto-seeded DRI protein floor: two goals
+            -- asserting the same thing. The macro target is the one the user
+            -- chose, so any DRI-sourced goal that duplicates a macro_target
+            -- goal (same measure + comparator, daily food_log sum) is dropped.
+            -- Idempotent: once removed there's nothing left to match.
+            DELETE FROM goals d
+            USING goals m
+            WHERE d.user_id = m.user_id
+              AND m.source = 'macro_target' AND d.source IN ('dri_default', 'user_target')
+              AND d.comparator = m.comparator
+              AND d.measure_query::jsonb = m.measure_query::jsonb;
+
         """)
 
 

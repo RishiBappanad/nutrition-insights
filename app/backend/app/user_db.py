@@ -6,21 +6,56 @@ Isolation is enforced via a user_id column + WHERE clause on every query
 import asyncpg
 
 from .db import get_pool
+from .domain_events import log_domain_event
+from .vitals import VITALS, VITAL_OWNER_TYPE, vital_key_for_metric
 
 
 async def upsert_daily_nutrition(user_id: int, date: str, metrics: dict):
-    """Insert/replace nutrition metrics for a date. metrics = {metric_name: value}"""
+    """Insert/replace nutrition metrics for a date. metrics = {metric_name: value}
+
+    Vital metrics (weight, body fat -- see vitals.py) additionally append a
+    domain_event when the reading is new or changed, so Goals can target
+    them; an idempotent re-sync of the same value logs nothing."""
     pool = await get_pool()
     rows = [(user_id, date, k, v) for k, v in metrics.items() if v is not None]
     if not rows:
         return
+    plain = [r for r in rows if vital_key_for_metric(r[2]) is None]
+    vitals = [r for r in rows if vital_key_for_metric(r[2]) is not None]
     async with pool.acquire() as conn:
-        await conn.executemany(
-            """INSERT INTO daily_nutrition (user_id, date, metric, value)
-               VALUES ($1, $2, $3, $4)
-               ON CONFLICT (user_id, date, metric) DO UPDATE SET value = EXCLUDED.value""",
-            rows,
+        if plain:
+            await conn.executemany(
+                """INSERT INTO daily_nutrition (user_id, date, metric, value)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (user_id, date, metric) DO UPDATE SET value = EXCLUDED.value""",
+                plain,
+            )
+        for _uid, _date, metric, value in vitals:
+            async with conn.transaction():
+                await _upsert_vital(conn, user_id, date, metric, value)
+
+
+async def _upsert_vital(conn, user_id: int, date: str, metric: str, value: float) -> None:
+    key = vital_key_for_metric(metric)
+    existing = await conn.fetchrow(
+        "SELECT id, value FROM daily_nutrition WHERE user_id = $1 AND date = $2 AND metric = $3 FOR UPDATE",
+        user_id, date, metric,
+    )
+    if existing is None:
+        row_id = await conn.fetchval(
+            "INSERT INTO daily_nutrition (user_id, date, metric, value) VALUES ($1, $2, $3, $4) RETURNING id",
+            user_id, date, metric, value,
         )
+        action = "created"
+    elif existing["value"] != value:
+        await conn.execute("UPDATE daily_nutrition SET value = $4 WHERE user_id = $1 AND date = $2 AND metric = $3", user_id, date, metric, value)
+        row_id, action = existing["id"], "updated"
+    else:
+        return
+    await log_domain_event(
+        conn, user_id, VITAL_OWNER_TYPE, row_id, action,
+        category=key, amount=value, label=VITALS[key]["label"], source="daily_nutrition", occurred_at=date,
+    )
 
 
 def compute_orm(weight: float, reps: int) -> float:

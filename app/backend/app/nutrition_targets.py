@@ -21,8 +21,10 @@ from typing import Optional
 
 from .db import get_pool
 from .db.targets import query as targets_query
+from .db.goals import query as goals_query
 from .db.profile import query as profile_query
 from .goal_query import compute_nutrient_totals_for_date
+from .goal_signature import signature_of_goal, goal_signature
 
 # dri_reference.py lives at the backend root (sibling of app/), not inside
 # the app package -- same sys.path pattern already used by
@@ -67,7 +69,13 @@ _COMPARATOR_FIELD = {"gte": "daily_target", "lte": "max_threshold"}
 
 # Carbohydrate/fat are macros the DRI table has no RDA row for, but goals
 # and macro targets measure them all the same.
-_EXTRA_NUTRIENT_UNITS = {"Carbohydrate, by difference": "g", "Total lipid (fat)": "g"}
+_EXTRA_NUTRIENT_UNITS = {
+    "Carbohydrate, by difference": "g", "Total lipid (fat)": "g",
+    "Sugars, total": "g", "Starch": "g",
+    "Fatty acids, total saturated": "g", "Fatty acids, total monounsaturated": "g",
+    "Fatty acids, total polyunsaturated": "g", "Fatty acids, total trans": "g",
+    "Cholesterol": "mg", "Alcohol, ethyl": "g", "Water": "g", "Caffeine": "mg",
+}
 
 
 def nutrient_unit(nutrient_name: str) -> str:
@@ -90,6 +98,13 @@ async def seed_dri_targets(user_id: int, sex: str, age: int) -> int:
     """
     targets = get_targets_for(sex, age)
     existing = {(r["nutrient_name"], r["comparator"]): r for r in await targets_query.list_nutrient_target_goals(user_id)}
+    # A goal the user wrote themselves that already asserts the same thing
+    # (their own daily protein floor) means seeding the default beside it
+    # would be a duplicate -- theirs wins, the preset is simply not added.
+    taken = {
+        signature_of_goal(g) for g in await goals_query.list_active_goals_for_signatures(user_id)
+        if g["source"] not in targets_query.NUTRIENT_TARGET_SOURCES
+    }
 
     inserts, updates, deletes = [], [], []
     for name, info in targets.items():
@@ -100,8 +115,11 @@ async def seed_dri_targets(user_id: int, sex: str, age: int) -> int:
                 if current is not None and current["source"] == "dri_default":
                     deletes.append(current["id"])
             elif current is None:
+                query = daily_target_query(f"nutrient:{name}")
+                if goal_signature(query, None, comparator, "target") in taken:
+                    continue
                 label = name if comparator == "gte" else f"{name} (max)"
-                inserts.append((label, comparator, daily_target_query(f"nutrient:{name}"), value, "dri_default"))
+                inserts.append((label, comparator, query, value, "dri_default"))
             elif current["source"] == "dri_default" and current["reference_amount"] != value:
                 updates.append((current["id"], value, "dri_default"))
 
@@ -140,10 +158,12 @@ async def set_nutrient_override(user_id: int, nutrient_name: str, daily_target: 
     for comparator, value in (("gte", daily_target), ("lte", max_threshold)):
         current = existing.get(comparator)
         if value is None:
-            if current is not None:
+            if current is not None and current["source"] != "macro_target":
                 deletes.append(current["id"])
         elif current is not None:
-            updates.append((current["id"], value, "user_target"))
+            # A macro target (Protein's floor) stays a macro target; only a
+            # DRI preset flips to "customized".
+            updates.append((current["id"], value, "macro_target" if current["source"] == "macro_target" else "user_target"))
         else:
             label = nutrient_name if comparator == "gte" else f"{nutrient_name} (max)"
             inserts.append((label, comparator, daily_target_query(f"nutrient:{nutrient_name}"), value, "user_target"))

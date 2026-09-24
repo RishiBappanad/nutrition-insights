@@ -29,7 +29,14 @@ from typing import Optional, Union
 
 from .db import get_pool
 
-AGGREGATIONS = ("sum", "mean", "median", "min", "max", "count", "percentile")
+# "last" is the newest reading in the window (by occurred_at) -- for
+# point-in-time measurements like body weight, where summing or averaging
+# a day's worth of readings isn't the question, "what is it now" is.
+# Additive to the cross-tracker allow-list (finance-tracker has no such
+# measurements and simply never sets it). Unlike every other aggregation,
+# an empty window is "no data" (None), not 0: a weight of 0 lb would
+# otherwise satisfy an "at most" goal before anything was ever logged.
+AGGREGATIONS = ("sum", "mean", "median", "min", "max", "count", "percentile", "last")
 FILTER_OPERATORS = ("eq", "ne", "gt", "gte", "lt", "lte", "in", "contains")
 DIRECT_FILTER_FIELDS = ("category", "event_type", "owner_type", "amount")
 TIME_WINDOW_KINDS = ("current_period", "trailing", "same_period_last_year", "fixed_range", "all_time")
@@ -380,7 +387,7 @@ def _current_state_cte(user_id_param: int, exclude_event_id_param: Optional[int]
 
 async def compute_aggregate_for_range(
     conn, user_id: int, query: GoalQuery, range_: DateRange, exclude_event_id: Optional[int] = None
-) -> float:
+) -> Optional[float]:
     """Runs one aggregation over one date range, for one user, with the
     query's filters applied -- the only place that actually issues a SQL
     query in this module. Reads through the deduplicated CTE view, never
@@ -434,6 +441,8 @@ async def compute_aggregate_for_range(
         select_expr = f"coalesce(min({value_expr}), 0)"
     elif query.aggregation == "max":
         select_expr = f"coalesce(max({value_expr}), 0)"
+    elif query.aggregation == "last":
+        select_expr = f"(array_agg({value_expr} ORDER BY de.occurred_at DESC, de.id DESC))[1]"
     else:
         fraction = 0.5 if query.aggregation == "median" else query.percentile / 100
         params.append(fraction)
@@ -441,7 +450,9 @@ async def compute_aggregate_for_range(
 
     sql = f"WITH {cte} SELECT {select_expr} AS v {from_sql} WHERE {where_sql}"
     row = await conn.fetchrow(sql, *params)
-    return float(row["v"]) if row and row["v"] is not None else 0.0
+    if row is None or row["v"] is None:
+        return None if query.aggregation == "last" else 0.0
+    return float(row["v"])
 
 
 async def compute_measure_for_date(conn, user_id: int, query: GoalQuery, date_str: str, exclude_event_id: Optional[int] = None) -> float:
@@ -461,7 +472,7 @@ async def compute_measure_for_date(conn, user_id: int, query: GoalQuery, date_st
 
 @dataclass
 class EvaluatedQuery:
-    value: float
+    value: Optional[float]  # None only when a "last" query found no readings
     ranges: list[DateRange]
 
 
@@ -471,8 +482,10 @@ async def evaluate_goal_query(conn, user_id: int, query: GoalQuery, now: Optiona
     separately, and averages the per-range results together."""
     ranges = resolve_time_window(query.time_window, now)
     values = [await compute_aggregate_for_range(conn, user_id, query, r, exclude_event_id) for r in ranges]
-    value = sum(values) / len(values)
-    return EvaluatedQuery(value=round(value, 2), ranges=ranges)
+    present = [v for v in values if v is not None]
+    if not present:
+        return EvaluatedQuery(value=None, ranges=ranges)
+    return EvaluatedQuery(value=round(sum(present) / len(present), 2), ranges=ranges)
 
 
 def could_match_event(query: GoalQuery, category: Optional[str], event_type: str, owner_type: str, action: str) -> bool:

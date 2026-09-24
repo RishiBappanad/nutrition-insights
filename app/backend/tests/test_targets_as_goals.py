@@ -129,7 +129,7 @@ class TestMacroTargetsAreGoals:
         goals = {g["label"]: g for g in client.get("/goals", headers=auth(user_token)).json()}
         assert set(goals) == {"Calories", "Protein", "Carbs", "Fat"}
         assert goals["Protein"]["comparator"] == "gte" and goals["Protein"]["unit"] == "g"
-        assert goals["Calories"]["unit"] == "cal" and goals["Carbs"]["unit"] == "g"
+        assert goals["Calories"]["unit"] == "kcal" and goals["Carbs"]["unit"] == "g"
 
     def test_resaving_updates_in_place_not_duplicates(self, client, user_token):
         client.put("/targets/macros", headers=auth(user_token), json={
@@ -170,7 +170,7 @@ class TestProgressReadsTheEventLog:
 class TestNutrientAxisGoals:
     def test_shorthand_nutrient_goal_status(self, client, user_token):
         r = client.post("/goals", headers=auth(user_token), json={
-            "measure_field": "nutrient:Protein", "comparator": "gte", "target_amount": 100, "period": "daily",
+            "measure_field": "nutrient:Protein", "comparator": "gte", "target_amount": 700, "period": "weekly",
         })
         assert r.status_code == 201, r.text
         goal = r.json()
@@ -206,7 +206,7 @@ class TestNutrientAxisGoals:
     def test_measures_and_presets_endpoints(self, client, user_token):
         measures = client.get("/goals/measures").json()["measures"]
         assert measures[0]["label"] == "Calories" and any(m["field"] == "nutrient:Protein" for m in measures)
-        presets = client.get("/goals/presets").json()
+        presets = client.get("/goals/presets", headers=auth(user_token)).json()
         assert any(p.get("measure_field") for p in presets["basic"])
         assert any(p["measure_query"]["timeWindow"]["period"] == "monthly" for p in presets["advanced"])
 
