@@ -283,3 +283,110 @@ class TestPreExistingDuplicatesAreFlagged:
         goals = {g["id"]: g for g in _goals(client, token)}
         assert goals[dupe_id]["duplicate_of"] == floor["id"] and goals[floor["id"]]["duplicate_of"] is None
         assert client.delete(f"/goals/{dupe_id}", headers=auth(token)).status_code == 204
+
+
+class TestGoalsComparedAgainstAnotherMeasure:
+    """A goal's reference can be a computation on a DIFFERENT measure, times
+    a multiplier -- protein >= 0.0625 x calories is protein >= 25% of
+    calories. Evaluated against today (UTC), since a goal's window is
+    relative to now."""
+
+    @staticmethod
+    def _today():
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).date().isoformat()
+
+    def _log(self, client, token, calories, protein=None):
+        nutrients = {"Protein": {"value": protein, "unit": "G"}} if protein is not None else {}
+        r = client.post("/food/log", headers=auth(token), json={
+            "date": self._today(), "meal": "Lunch", "food_name": "Ratio Test", "source": "manual",
+            "calories": calories, "nutrients": nutrients,
+        })
+        assert r.status_code == 200, r.text
+
+    def _ratio_goal(self, client, token, scale=0.0625, **extra):
+        body = {
+            "comparator": "gte", "notify_on_crossing": True,
+            "measure_query": {"aggregation": "sum", "measureField": "nutrient:Protein", "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}},
+            "reference_query": {"aggregation": "sum", "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}, "scale": scale},
+            **extra,
+        }
+        return client.post("/goals", headers=auth(token), json=body)
+
+    def test_protein_as_a_share_of_calories(self, client):
+        token = _mint_token(_account_id(9), f"ratio_{_RUN_ID}@example.com")
+        r = self._ratio_goal(client, token)
+        assert r.status_code == 201, r.text
+        goal = r.json()
+        assert goal["reference_scale"] == 0.0625 and goal["reference_measure"]["label"] == "Calories"
+        assert goal["unit"] == "g"  # the goal is still asserted in the measure's own unit
+
+        self._log(client, token, calories=400, protein=30)  # needs 25 g, has 30
+        status = client.get(f"/goals/{goal['id']}/status", headers=auth(token)).json()
+        assert status["measure_value"] == 30 and status["reference_value"] == 25 and status["on_track"] is True
+
+        # More calories with no protein moves the REFERENCE side: 800 kcal now needs 50 g.
+        self._log(client, token, calories=400)
+        status = client.get(f"/goals/{goal['id']}/status", headers=auth(token)).json()
+        assert status["reference_value"] == 50 and status["on_track"] is False
+
+    def test_a_change_on_only_the_reference_side_logs_the_crossing(self, client):
+        token = _mint_token(_account_id(10), f"ratiocross_{_RUN_ID}@example.com")
+        goal = self._ratio_goal(client, token).json()
+        self._log(client, token, calories=400, protein=30)   # compliant: 30 >= 25
+        self._log(client, token, calories=400)               # calories-only event: 30 < 50
+        today = self._today()
+        events = client.get(f"/events?start={today}&end={today}&event_type=goal_exceeded", headers=auth(token)).json()["events"]
+        # This user has exactly one goal, so any goal_exceeded event is its crossing.
+        assert len(events) == 1 and goal["label"] is None
+
+    def test_reference_can_be_a_vital(self, client):
+        token = _mint_token(_account_id(11), f"ratiovital_{_RUN_ID}@example.com")
+        weight = {"aggregation": "last", "filters": [
+            {"field": "owner_type", "operator": "eq", "value": "vital"},
+            {"field": "category", "operator": "eq", "value": "weight"},
+        ], "timeWindow": {"kind": "all_time"}}
+        body = {
+            "comparator": "gte",
+            "measure_query": {"aggregation": "sum", "measureField": "nutrient:Protein", "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}},
+            "reference_query": {**weight, "scale": 0.5},
+        }
+        goal = client.post("/goals", headers=auth(token), json=body).json()
+        empty = client.get(f"/goals/{goal['id']}/status", headers=auth(token)).json()
+        assert empty["has_data"] is False and empty["on_track"] is False  # no weight logged yet
+        client.post("/vitals", headers=auth(token), json={"metric": "weight", "value": 160, "date": self._today()})
+        self._log(client, token, calories=500, protein=90)
+        status = client.get(f"/goals/{goal['id']}/status", headers=auth(token)).json()
+        assert status["reference_value"] == 80 and status["measure_value"] == 90 and status["on_track"] is True
+
+    def test_scale_is_validated_and_only_valid_on_the_reference(self, client):
+        token = _mint_token(_account_id(12), f"ratiobad_{_RUN_ID}@example.com")
+        for bad in (0, -1, "2"):
+            assert self._ratio_goal(client, token, scale=bad).status_code == 400
+        r = client.post("/goals", headers=auth(token), json={
+            "comparator": "lte", "reference_amount": 5,
+            "measure_query": {"aggregation": "sum", "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}, "scale": 2},
+        })
+        assert r.status_code == 400
+
+    def test_same_ratio_with_another_multiplier_is_a_duplicate_and_the_multiplier_is_editable(self, client):
+        token = _mint_token(_account_id(13), f"ratiodupe_{_RUN_ID}@example.com")
+        goal = self._ratio_goal(client, token).json()
+        assert self._ratio_goal(client, token, scale=0.05).status_code == 409
+        # A different reference measure is a different goal, not a duplicate.
+        other = client.post("/goals", headers=auth(token), json={
+            "comparator": "gte",
+            "measure_query": {"aggregation": "sum", "measureField": "nutrient:Protein", "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}},
+            "reference_query": {"aggregation": "sum", "measureField": "nutrient:Carbohydrate, by difference", "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}, "scale": 0.5},
+        })
+        assert other.status_code == 201, other.text
+        edited = client.patch(f"/goals/{goal['id']}", headers=auth(token), json={"reference_scale": 0.1})
+        assert edited.status_code == 200 and edited.json()["reference_scale"] == 0.1
+        assert client.patch(f"/goals/{goal['id']}", headers=auth(token), json={"reference_scale": 0}).status_code == 400
+
+    def test_ratio_presets_are_offered(self, client, user_token):
+        advanced = client.get("/goals/presets", headers=auth(user_token)).json()["advanced"]
+        names = [p["name"] for p in advanced]
+        assert "Protein ≥ 25% of calories" in names and "Sodium ≤ 1 mg per calorie" in names
+        preset = next(p for p in advanced if p["name"] == "Protein ≥ 25% of calories")
+        assert preset["reference_query"]["scale"] == 0.0625

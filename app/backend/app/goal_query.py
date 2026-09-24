@@ -22,6 +22,7 @@ is what carries the untrusted value.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field as dc_field
 from datetime import date, datetime, timedelta, timezone
@@ -113,6 +114,14 @@ class GoalQuery:
     # every existing goal (finance's, and this tracker's own pre-existing
     # calorie goals) simply never sets it and behaves exactly as before.
     measure_field: Optional[str] = None
+    # A multiplier applied to the evaluated value (None = 1). On a goal's
+    # reference_query it's what turns "compare against another measure"
+    # into a ratio: `protein >= scale x calories` is protein/calories >=
+    # scale, and the scale also carries the unit conversion (0.0625 g of
+    # protein per kcal = 25% of calories at 4 kcal/g). Additive and
+    # backward-compatible: absent everywhere it isn't used, and a scale of
+    # exactly 1 is normalized away so equal goals have equal shapes.
+    scale: Optional[float] = None
 
 
 def _validate_filter(f: dict, index: int) -> Optional[str]:
@@ -187,12 +196,20 @@ def parse_goal_query(value) -> Union[GoalQuery, str]:
     if not is_valid_measure_field(measure_field):
         return "measureField must be \"nutrient:<Name>\" or omitted"
 
+    scale = value.get("scale")
+    if scale is not None:
+        if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not math.isfinite(scale) or scale <= 0:
+            return "scale must be a positive number"
+        if scale == 1:
+            scale = None
+
     return GoalQuery(
         aggregation=aggregation,
         percentile=percentile if aggregation == "percentile" else None,
         filters=[FilterCondition(field=f["field"], operator=f["operator"], value=f["value"]) for f in filters],
         time_window=TimeWindow(**{k: v for k, v in raw_tw.items() if k in ("kind", "period", "count", "start", "end")}),
         measure_field=measure_field,
+        scale=scale,
     )
 
 
@@ -208,6 +225,8 @@ def goal_query_to_json(q: GoalQuery) -> dict:
         out["percentile"] = q.percentile
     if q.measure_field is not None:
         out["measureField"] = q.measure_field
+    if q.scale is not None:
+        out["scale"] = q.scale
     return out
 
 
@@ -485,7 +504,10 @@ async def evaluate_goal_query(conn, user_id: int, query: GoalQuery, now: Optiona
     present = [v for v in values if v is not None]
     if not present:
         return EvaluatedQuery(value=None, ranges=ranges)
-    return EvaluatedQuery(value=round(sum(present) / len(present), 2), ranges=ranges)
+    value = sum(present) / len(present)
+    if query.scale is not None:
+        value *= query.scale
+    return EvaluatedQuery(value=round(value, 2), ranges=ranges)
 
 
 def could_match_event(query: GoalQuery, category: Optional[str], event_type: str, owner_type: str, action: str) -> bool:

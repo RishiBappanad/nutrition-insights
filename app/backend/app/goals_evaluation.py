@@ -186,6 +186,12 @@ async def evaluate_goals_for_event(conn, user_id: int, event_id: int, category: 
     for row in rows:
         goal = dict(row)
         measure_query = _parse_stored_query(goal["measure_query"], "measure_query")
-        if not could_match_event(measure_query, category, event_type, owner_type, action):
+        matches = could_match_event(measure_query, category, event_type, owner_type, action)
+        if not matches and goal["reference_query"] is not None:
+            # A goal compared against ANOTHER measure (protein vs. calories)
+            # flips when either side moves, so an event that only touches the
+            # reference side still needs the transition check.
+            matches = could_match_event(_parse_stored_query(goal["reference_query"], "reference_query"), category, event_type, owner_type, action)
+        if not matches:
             continue
         await evaluate_goal_transition(conn, goal, event_id)

@@ -61,6 +61,17 @@ function termBadge(goal) {
   return window.period === 'daily' ? 'Daily' : window.period === 'weekly' ? 'Weekly' : window.period === 'monthly' ? 'Monthly' : 'Goal'
 }
 
+// "a computed baseline" for a same-measure trend; "0.0625 × Calories" when the
+// goal is compared against a computation on another measure (a ratio).
+function referenceText(goal) {
+  const ref = goal.reference_measure
+  const scale = goal.reference_scale ?? 1
+  if (ref && (ref.label !== goal.measure_label || scale !== 1)) {
+    return `${scale === 1 ? '' : `${scale} × `}${ref.label}${ref.unit ? ` (${ref.unit})` : ''}`
+  }
+  return 'a computed baseline'
+}
+
 function goalSubtitle(goal) {
   const mq = goal.measure_query
   if (goal.vital && !goal.reference_query) return 'latest reading'
@@ -79,7 +90,7 @@ function goalSubtitle(goal) {
 
 // ── Goal card ──────────────────────────────────────────────────────────
 
-function GoalCard({ goal, status, onSaveAmount, onReset, onDelete, onLogVital }) {
+function GoalCard({ goal, status, onSaveAmount, onSaveScale, onReset, onDelete, onLogVital }) {
   const isWarning = goal.severity === 'warning'
   const tone = status === undefined ? 'muted' : !status.has_data ? 'muted' : status.on_track ? 'ok' : isWarning ? 'warn' : 'bad'
   const iconBg = { muted: 'bg-secondary', ok: 'bg-emerald-500/10', warn: 'bg-amber-500/10', bad: 'bg-destructive/10' }[tone]
@@ -93,7 +104,9 @@ function GoalCard({ goal, status, onSaveAmount, onReset, onDelete, onLogVital })
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
 
-  const editable = goal.reference_query === null
+  // A fixed-amount goal edits its amount; a goal compared against a computed
+  // value edits the multiplier on it (the ratio).
+  const scaleMode = goal.reference_query !== null
   const title = goal.label || goal.measure_label
 
   async function run(action) {
@@ -110,8 +123,8 @@ function GoalCard({ goal, status, onSaveAmount, onReset, onDelete, onLogVital })
 
   const saveAmount = () => run(async () => {
     const value = Number(draft)
-    if (draft === '' || Number.isNaN(value) || value < 0) throw new Error('Enter a number')
-    await onSaveAmount(goal, value)
+    if (draft === '' || Number.isNaN(value) || value < 0 || (scaleMode && value === 0)) throw new Error(scaleMode ? 'Enter a number above 0' : 'Enter a number')
+    await (scaleMode ? onSaveScale(goal, value) : onSaveAmount(goal, value))
     setEditing(false)
   })
 
@@ -161,13 +174,13 @@ function GoalCard({ goal, status, onSaveAmount, onReset, onDelete, onLogVital })
       <div className="text-xs text-muted-foreground mt-3 flex items-center flex-wrap gap-x-1.5 gap-y-1">
         {editing ? (
           <>
-            <span>{comparatorLabel(goal.comparator, goal.tolerance_percent)}</span>
+            <span>{comparatorLabel(goal.comparator, goal.tolerance_percent)}{scaleMode ? ' ×' : ''}</span>
             <input
-              type="number" min="0" autoFocus value={draft} onChange={(e) => setDraft(e.target.value)}
+              type="number" min="0" step="any" autoFocus value={draft} onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') saveAmount(); if (e.key === 'Escape') setEditing(false) }}
               className={SMALL_INPUT}
             />
-            <span>{goal.unit}</span>
+            <span>{scaleMode ? (goal.reference_measure?.label ?? '') : goal.unit}</span>
             <button onClick={saveAmount} disabled={busy} className="text-primary font-medium hover:underline">Save</button>
             <button onClick={() => setEditing(false)} className="hover:underline">Cancel</button>
           </>
@@ -175,12 +188,12 @@ function GoalCard({ goal, status, onSaveAmount, onReset, onDelete, onLogVital })
           <>
             <span>
               {comparatorLabel(goal.comparator, goal.tolerance_percent)}{' '}
-              {goal.reference_query ? 'a computed baseline' : formatAmount(goal.reference_amount ?? 0, goal.unit)} — {goalSubtitle(goal)}
+              {goal.reference_query ? referenceText(goal) : formatAmount(goal.reference_amount ?? 0, goal.unit)} — {goalSubtitle(goal)}
             </span>
-            {editable && (
+            {(
               <button
-                onClick={() => { setDraft(String(goal.reference_amount ?? '')); setEditing(true); setError(null) }}
-                className="p-0.5 rounded hover:bg-secondary" aria-label="Edit amount"
+                onClick={() => { setDraft(String(scaleMode ? (goal.reference_scale ?? 1) : (goal.reference_amount ?? ''))); setEditing(true); setError(null) }}
+                className="p-0.5 rounded hover:bg-secondary" aria-label={scaleMode ? 'Edit multiplier' : 'Edit amount'}
               >
                 <Pencil className="h-3 w-3" />
               </button>
@@ -286,6 +299,11 @@ const DEFAULT_ADVANCED = {
   referenceAmount: 2000,
   refAggregation: 'mean',
   refPercentile: 95,
+  // Compare against a computation on ANOTHER measure: '' = the same measure as
+  // above (a trend against your own history); a measure key = a ratio between
+  // the two. `scale` multiplies the reference (and converts its unit).
+  refMeasure: '',
+  scale: 1,
   baselineKind: 'trailing',
   trailingCount: 7,
   yearsBackCount: 1,
@@ -307,6 +325,7 @@ function advancedDefaultsFor(measure) {
 function buildReferenceTimeWindow(form) {
   const period = form.period === 'all_time' ? 'weekly' : form.period
   switch (form.baselineKind) {
+    case 'current_period': return form.period === 'all_time' ? { kind: 'all_time' } : { kind: 'current_period', period }
     case 'trailing': return { kind: 'trailing', period, count: form.trailingCount }
     case 'same_period_last_year': return { kind: 'same_period_last_year', period, count: form.yearsBackCount }
     case 'all_time': return { kind: 'all_time' }
@@ -350,14 +369,23 @@ function buildAdvancedPayload(form) {
   const reference_query = {
     aggregation: form.refAggregation,
     ...(form.refAggregation === 'percentile' ? { percentile: form.refPercentile } : {}),
-    ...scope,
+    ...(form.refMeasure ? measureScope(form.refMeasure) : scope),
     timeWindow: buildReferenceTimeWindow(form),
+    ...(form.scale !== 1 ? { scale: form.scale } : {}),
   }
   return { ...base, reference_query }
 }
 
+// The picker key a stored query measures (inverse of measureScope).
+function queryMeasureKey(query) {
+  const vital = query?.filters?.find((f) => f.field === 'owner_type' && f.value === 'vital')
+  if (vital) return `vital:${query.filters.find((f) => f.field === 'category')?.value}`
+  return query?.measureField ?? 'calories'
+}
+
 function applyPresetToAdvancedForm(preset) {
   const form = { ...DEFAULT_ADVANCED }
+  if (preset.measure_query) form.measure = queryMeasureKey(preset.measure_query)
   form.comparator = preset.comparator
   if (preset.tolerance_percent !== undefined) form.tolerancePercent = preset.tolerance_percent
   if (preset.measure_query) {
@@ -367,6 +395,9 @@ function applyPresetToAdvancedForm(preset) {
   }
   if (preset.reference_query) {
     form.referenceMode = 'computed'
+    const refKey = queryMeasureKey(preset.reference_query)
+    form.refMeasure = refKey === form.measure ? '' : refKey
+    form.scale = preset.reference_query.scale ?? 1
     form.refAggregation = preset.reference_query.aggregation
     if (preset.reference_query.percentile !== undefined) form.refPercentile = preset.reference_query.percentile
     const tw = preset.reference_query.timeWindow
@@ -448,6 +479,9 @@ function NewGoalModal({ onClose, onCreated }) {
   const basicIsVital = basic.measure.startsWith('vital:')
   const advancedIsVital = advanced.measure.startsWith('vital:')
   const advancedUnit = unitOf(advanced.measure)
+  const refIsVital = (advanced.refMeasure || advanced.measure).startsWith('vital:')
+  const labelOf = (key) => measures.find((m) => measureKey(m) === key)?.label ?? key
+  const otherMeasureDefault = advanced.measure === 'calories' ? 'nutrient:Protein' : 'calories'
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
@@ -618,12 +652,32 @@ function NewGoalModal({ onClose, onCreated }) {
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <p className="text-xs text-muted-foreground">Baseline uses the same measure as above.</p>
+                  <label className="flex items-center justify-between text-sm">
+                    Compare against a different measure (a ratio)
+                    <input
+                      type="checkbox" checked={advanced.refMeasure !== ''} className="rounded border-border"
+                      onChange={(e) => updateAdvanced({ refMeasure: e.target.checked ? otherMeasureDefault : '', scale: 1, ...(e.target.checked ? { baselineKind: 'current_period', refAggregation: 'sum' } : {}) })}
+                    />
+                  </label>
+                  {advanced.refMeasure !== '' && (
+                    <>
+                      <MeasurePicker measures={measures} value={advanced.refMeasure} onChange={(v) => updateAdvanced({ refMeasure: v, ...(v.startsWith('vital:') ? { baselineKind: 'all_time', refAggregation: 'last' } : {}) })} />
+                      <div>
+                        <label className="text-xs text-muted-foreground">Multiplier</label>
+                        <input type="number" min="0" step="any" value={advanced.scale} onChange={(e) => updateAdvanced({ scale: Number(e.target.value) })} className={INPUT} />
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {labelOf(advanced.measure)} ({advancedUnit}) {comparatorLabel(advanced.comparator, advanced.tolerancePercent)} {advanced.scale} × {labelOf(advanced.refMeasure)} ({unitOf(advanced.refMeasure)}).
+                          The multiplier also converts units — e.g. 25% of calories as protein grams is 0.0625 (25% ÷ 4 kcal per gram).
+                        </p>
+                      </div>
+                    </>
+                  )}
+                  {advanced.refMeasure === '' && <p className="text-xs text-muted-foreground">Baseline uses the same measure as above.</p>}
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="text-xs text-muted-foreground">Aggregation</label>
                       <select value={advanced.refAggregation} onChange={(e) => updateAdvanced({ refAggregation: e.target.value })} className={INPUT}>
-                        {advancedIsVital && <option value="last">Latest reading</option>}
+                        {refIsVital && <option value="last">Latest reading</option>}
                         <option value="sum">Sum</option>
                         <option value="mean">Average</option>
                         <option value="median">Median</option>
@@ -635,6 +689,7 @@ function NewGoalModal({ onClose, onCreated }) {
                     <div>
                       <label className="text-xs text-muted-foreground">Baseline</label>
                       <select value={advanced.baselineKind} onChange={(e) => updateAdvanced({ baselineKind: e.target.value })} className={INPUT}>
+                        <option value="current_period">This same period</option>
                         <option value="trailing">Trailing periods</option>
                         <option value="same_period_last_year">Same period last year</option>
                         <option value="all_time">All-time</option>
@@ -747,6 +802,14 @@ export function GoalsSection({ reloadKey = 0, onChanged }) {
     onChanged?.()
   }
 
+  async function saveScale(goal, scale) {
+    const res = await api(`/goals/${goal.id}`, { method: 'PATCH', body: JSON.stringify({ reference_scale: scale }) })
+    if (!res.ok) throw new Error(await errorMessage(res, 'Could not save'))
+    replaceGoal(await res.json())
+    loadStatuses()
+    onChanged?.()
+  }
+
   async function resetGoal(goal) {
     const res = await api(`/goals/${goal.id}/reset`, { method: 'POST' })
     if (!res.ok) throw new Error(await errorMessage(res, 'Could not reset'))
@@ -835,7 +898,7 @@ export function GoalsSection({ reloadKey = 0, onChanged }) {
               {visible.map((g) => (
                 <GoalCard
                   key={g.id} goal={g} status={statuses[g.id]}
-                  onSaveAmount={saveAmount} onReset={resetGoal} onDelete={deleteGoal} onLogVital={logVital}
+                  onSaveAmount={saveAmount} onSaveScale={saveScale} onReset={resetGoal} onDelete={deleteGoal} onLogVital={logVital}
                 />
               ))}
             </div>

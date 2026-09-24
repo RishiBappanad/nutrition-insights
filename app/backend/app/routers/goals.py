@@ -97,6 +97,9 @@ class GoalUpdateInput(BaseModel):
     measure_query: Optional[dict] = None
     reference_amount: Optional[float] = None
     reference_query: Optional[dict] = None
+    # Edits just the multiplier on a computed reference (the ratio) without
+    # re-sending the whole query.
+    reference_scale: Optional[float] = None
 
 
 def _is_shorthand(body: GoalInput) -> bool:
@@ -189,6 +192,11 @@ def _serialize_goal(g: dict, defaults: Optional[dict] = None) -> dict:
         "measure_query": g["measure_query"],
         "reference_amount": g["reference_amount"],
         "reference_query": g["reference_query"],
+        # For a goal compared against a computed value: what that value
+        # measures (so "protein vs. calories" can say so) and the multiplier
+        # applied to it -- the ratio.
+        "reference_measure": describe_measure(g["reference_query"]) if g["reference_query"] else None,
+        "reference_scale": (g["reference_query"] or {}).get("scale", 1) if g["reference_query"] else None,
         "inflation_adjusted": g["inflation_adjusted"],
         "notify_on_crossing": g["notify_on_crossing"],
         "source": g.get("source"),
@@ -251,6 +259,8 @@ def _parse_goal_input(body: Union[GoalInput, GoalUpdateInput]) -> tuple[Optional
     measure_query = parse_goal_query(body.measure_query)
     if isinstance(measure_query, str):
         return None, None, None, f"measure_query: {measure_query}"
+    if measure_query.scale is not None:
+        return None, None, None, "scale belongs on reference_query (it's the multiplier on what you compare against)"
 
     has_amount = body.reference_amount is not None
     has_query = body.reference_query is not None
@@ -383,6 +393,13 @@ async def update_goal(goal_id: int, body: GoalUpdateInput, user_id: int = Depend
             updates["measure_query"] = measure_query
         updates["reference_amount"] = reference_amount
         updates["reference_query"] = reference_query
+    elif body.reference_scale is not None:
+        if current["reference_query"] is None:
+            raise HTTPException(status_code=400, detail="reference_scale only applies to a goal compared against a computed value")
+        parsed = parse_goal_query({**current["reference_query"], "scale": body.reference_scale})
+        if isinstance(parsed, str):
+            raise HTTPException(status_code=400, detail=f"reference_scale: {parsed}")
+        updates["reference_query"] = goal_query_to_json(parsed)
     elif body.reference_amount is not None:
         # Amount-only edit (the inline "change the number" path): leaves
         # the query alone. Only meaningful for a constant reference.
@@ -508,7 +525,29 @@ _BASIC_PRESETS = [
     {"name": "Body-fat ceiling", "comparator": "lte", "vital": "body_fat", "amount_hint": 20},
 ]
 
+def _ratio_preset(name: str, comparator: str, measure_field: str, ref_query: dict, scale: float) -> dict:
+    """A goal compared against a computation on ANOTHER measure: the day's
+    total of one nutrient vs. `scale` x the day's total (or latest reading)
+    of another -- i.e. a ratio between them. The scale also converts the
+    reference measure's unit into this one's."""
+    return {
+        "name": name,
+        "comparator": comparator,
+        "measure_query": {"aggregation": "sum", "measureField": measure_field, "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}},
+        "reference_query": {**ref_query, "scale": scale},
+    }
+
+
+_DAILY_CALORIES = {"aggregation": "sum", "filters": [], "timeWindow": {"kind": "current_period", "period": "daily"}}
+
 _ADVANCED_PRESETS = [
+    # Ratios between measures. Protein/carbs are 4 kcal/g and fat 9 kcal/g,
+    # so "25% of calories" as grams is 0.25/4 = 0.0625 g per kcal.
+    _ratio_preset("Protein ≥ 25% of calories", "gte", "nutrient:Protein", _DAILY_CALORIES, 0.0625),
+    _ratio_preset("Fat ≤ 35% of calories", "lte", "nutrient:Total lipid (fat)", _DAILY_CALORIES, round(0.35 / 9, 4)),
+    _ratio_preset("Sodium ≤ 1 mg per calorie", "lte", "nutrient:Sodium, Na", _DAILY_CALORIES, 1),
+    _ratio_preset("Fiber ≥ 14 g per 1,000 calories", "gte", "nutrient:Fiber, total dietary", _DAILY_CALORIES, 0.014),
+    _ratio_preset("Protein ≥ 0.8 g per lb of body weight", "gte", "nutrient:Protein", vital_measure_query("weight"), 0.8),
     {
         "name": "Rolling 7-day average, ±15%",
         "comparator": "within_tolerance_percent",

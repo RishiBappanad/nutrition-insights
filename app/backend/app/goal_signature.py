@@ -11,9 +11,9 @@ severity):
   - severity stays in, because a soft "warning" tier plus a hard "target"
     tier on the same measure is a supported, deliberate pairing.
   - a constant reference collapses to one tag (its amount is what a
-    duplicate would differ in); a computed baseline keeps its full query,
-    since "vs. trailing 7 days" and "vs. trailing 3 months" are different
-    goals.
+    duplicate would differ in); a computed baseline keeps its full query
+    (which measure, aggregation, window), since "vs. trailing 7 days" and
+    "vs. calories" are different goals -- but not its `scale` multiplier.
 """
 import json
 from typing import Optional
@@ -22,7 +22,12 @@ _DIRECTION = {"gte": "floor", "lte": "ceiling"}
 
 
 def _canonical_query(query: dict) -> str:
-    normalized = {**query, "filters": sorted(json.dumps(f, sort_keys=True) for f in query.get("filters", []))}
+    # `scale` is the ratio goal's "amount" (protein >= scale x calories): two
+    # goals that differ only in it disagree about a number, which is what a
+    # duplicate is, so it stays out of the signature just like a constant's
+    # amount does.
+    normalized = {k: v for k, v in query.items() if k != "scale"}
+    normalized["filters"] = sorted(json.dumps(f, sort_keys=True) for f in query.get("filters", []))
     return json.dumps(normalized, sort_keys=True)
 
 
