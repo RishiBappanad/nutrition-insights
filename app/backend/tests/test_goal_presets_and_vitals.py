@@ -109,10 +109,63 @@ class TestPresetsAreEditableAndResettable:
         for body in ({"comparator": "lte"}, {"severity": "warning"}, {"period": "weekly", "target_amount": 5}):
             assert client.patch(f"/goals/{preset['id']}", headers=auth(user_token), json=body).status_code == 400
 
-    def test_a_preset_cannot_be_deleted(self, client, user_token):
-        preset = _preset(client, user_token, "Zinc, Zn")
-        assert client.delete(f"/goals/{preset['id']}", headers=auth(user_token)).status_code == 409
-        assert any(g["id"] == preset["id"] for g in _goals(client, user_token))
+    def test_deleting_a_preset_removes_it_and_a_profile_change_does_not_bring_it_back(self, client, user_token):
+        preset = _preset(client, user_token, "Zinc, Zn", "lte")  # the UL ceiling
+        assert client.delete(f"/goals/{preset['id']}", headers=auth(user_token)).status_code == 204
+        active = client.get("/goals?active=true&include_system=true", headers=auth(user_token)).json()
+        assert all(g["id"] != preset["id"] for g in active)
+        # ... it's no longer a target on the dashboard's progress view either
+        zinc = next((t for t in client.get("/targets/nutrients", headers=auth(user_token)).json()["targets"] if t["nutrient_name"] == "Zinc, Zn"), None)
+        assert zinc is not None and zinc["max_threshold"] is None and zinc["daily_target"] is not None  # only the ceiling went
+        # A profile save re-seeds DRI defaults; a deleted preset must stay deleted.
+        assert client.put("/profile", headers=auth(user_token), json={"age": 29, "sex": "female"}).status_code == 200
+        active = client.get("/goals?active=true&include_system=true", headers=auth(user_token)).json()
+        assert not any(g["measure_query"].get("measureField") == "nutrient:Zinc, Zn" and g["comparator"] == "lte" for g in active)
+        assert len([g for g in client.get("/goals?include_system=true", headers=auth(user_token)).json()
+                    if g["measure_query"].get("measureField") == "nutrient:Zinc, Zn" and g["comparator"] == "lte"]) == 1  # not re-inserted alongside
+
+    def test_a_deleted_preset_can_be_reset_back_singly_or_all_at_once(self, client, user_token):
+        preset = _preset(client, user_token, "Selenium, Se", "lte")
+        client.delete(f"/goals/{preset['id']}", headers=auth(user_token))
+        r = client.post(f"/goals/{preset['id']}/reset", headers=auth(user_token))
+        assert r.status_code == 200 and r.json()["is_active"] is True and r.json()["source"] == "dri_default"
+
+        other = _preset(client, user_token, "Copper, Cu", "lte")
+        client.delete(f"/goals/{other['id']}", headers=auth(user_token))
+        assert client.post("/goals/presets/reset", headers=auth(user_token)).json()["reset"] >= 1
+        assert next(g for g in client.get("/goals?include_system=true", headers=auth(user_token)).json() if g["id"] == other["id"])["is_active"] is True
+
+    def test_a_deleted_preset_makes_room_for_your_own_and_is_not_restored_over_it(self, client, user_token):
+        preset = _preset(client, user_token, "Manganese, Mn", "lte")
+        client.delete(f"/goals/{preset['id']}", headers=auth(user_token))
+        own = client.post("/goals", headers=auth(user_token), json={"measure_field": "nutrient:Manganese, Mn", "comparator": "lte", "target_amount": 5, "period": "daily"})
+        assert own.status_code == 201, own.text
+        # Restoring the preset would now be a second identical goal.
+        assert client.post(f"/goals/{preset['id']}/reset", headers=auth(user_token)).status_code == 409
+        client.post("/goals/presets/reset", headers=auth(user_token))
+        still_off = next(g for g in client.get("/goals?include_system=true", headers=auth(user_token)).json() if g["id"] == preset["id"])
+        assert still_off["is_active"] is False
+
+    def test_customizing_a_deleted_nutrient_target_turns_it_back_on(self, client, user_token):
+        preset = _preset(client, user_token, "Phosphorus, P", "lte")
+        client.delete(f"/goals/{preset['id']}", headers=auth(user_token))
+        r = client.put("/targets/nutrients/Phosphorus, P", headers=auth(user_token), json={"nutrient_name": "Phosphorus, P", "daily_target": 700, "max_threshold": 3000, "is_custom": True})
+        assert r.status_code == 200
+        back = next(g for g in client.get("/goals?include_system=true", headers=auth(user_token)).json() if g["id"] == preset["id"])
+        assert back["is_active"] is True and back["reference_amount"] == 3000 and back["source"] == "user_target"
+
+    def test_deleting_a_macro_target_leaves_the_others(self, client):
+        token = _mint_token(_account_id(14), f"macrodelete_{_RUN_ID}@example.com")
+        assert client.put("/profile", headers=auth(token), json={"age": 30, "sex": "male"}).status_code == 200
+        client.put("/targets/macros", headers=auth(token), json={"mode": "fixed", "calorie_target": 2400, "protein_g": 170, "carbs_g": 250, "fat_g": 70})
+        carbs = next(g for g in _goals(client, token) if g["source"] == "macro_target" and g["label"] == "Carbs")
+        assert client.delete(f"/goals/{carbs['id']}", headers=auth(token)).status_code == 204
+        macros = client.get("/targets/macros", headers=auth(token)).json()
+        assert macros["carbs_g"] is None and macros["protein_g"] == 170 and macros["calorie_target"] == 2400
+        # Saving macro targets again brings it back.
+        client.put("/targets/macros", headers=auth(token), json={"mode": "fixed", "calorie_target": 2400, "protein_g": 170, "carbs_g": 250, "fat_g": 70})
+        assert client.get("/targets/macros", headers=auth(token)).json()["carbs_g"] == 250
+        assert len([g for g in _goals(client, token) if g["label"] == "Carbs"]) == 1  # revived, not duplicated
 
     def test_reset_all_restores_every_customized_preset(self, client, user_token):
         a = _preset(client, user_token, "Calcium, Ca")

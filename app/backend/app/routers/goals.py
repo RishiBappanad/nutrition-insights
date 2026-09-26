@@ -422,7 +422,11 @@ async def update_goal(goal_id: int, body: GoalUpdateInput, user_id: int = Depend
 async def delete_goal(goal_id: int, user_id: int = Depends(get_current_user)):
     current = await goals_query.get_owned_goal(goal_id, user_id)
     if current and current["source"] in PRESET_SOURCES:
-        raise HTTPException(status_code=409, detail="Preset goals can be edited or reset to their default, not deleted")
+        # A preset is removed by turning it off, not by deleting its row: seeding
+        # (a profile change) would otherwise put it straight back. Reset
+        # (POST /goals/:id/reset, POST /goals/presets/reset) brings it back.
+        await targets_query.deactivate_goal(goal_id, user_id)
+        return
     deleted = await goals_query.delete_goal(goal_id, user_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Goal not found")
@@ -633,11 +637,18 @@ async def _require_profile_defaults(user_id: int) -> tuple[dict, dict]:
 @router.post("/presets/reset")
 async def reset_all_presets(user_id: int = Depends(get_current_user)):
     """Restores every DRI preset to its default: customized amounts go
-    back, and any default missing for this profile is re-added."""
+    back, deleted ones return, and any default missing for this profile is
+    re-added."""
     profile, defaults = await _require_profile_defaults(user_id)
     restored = 0
-    for goal in await goals_query.list_goals(user_id, active_only=False, include_system=True):
+    all_goals = await goals_query.list_goals(user_id, active_only=False, include_system=True)
+    # A deleted preset is only brought back if the user hasn't since made their
+    # own goal covering the same thing (that would be two of the same goal).
+    covered = {signature_of_goal(g) for g in all_goals if g["is_active"]}
+    for goal in all_goals:
         if goal["source"] not in ("dri_default", "user_target"):
+            continue
+        if not goal["is_active"] and signature_of_goal(goal) in covered:
             continue
         default = _default_amount_for(goal, defaults)
         if default is not None and (goal["reference_amount"] != default or goal["source"] != "dri_default" or not goal["is_active"]):
@@ -659,6 +670,10 @@ async def reset_goal_to_default(goal_id: int, user_id: int = Depends(get_current
     default = _default_amount_for(goal, defaults)
     if default is None:
         raise HTTPException(status_code=400, detail="This goal has no default to reset to")
+    if not goal["is_active"]:
+        clash = next((g for g in await goals_query.list_active_goals_for_signatures(user_id) if signature_of_goal(g) == signature_of_goal(goal)), None)
+        if clash:
+            raise _duplicate_conflict(DuplicateGoalError(clash))
     await targets_query.restore_preset_goal(goal_id, user_id, default, "macro_target" if goal["source"] == "macro_target" else "dri_default")
     return await _serialize(await goals_query.get_owned_goal(goal_id, user_id), user_id)
 

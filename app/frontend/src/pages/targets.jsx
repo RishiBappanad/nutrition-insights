@@ -53,7 +53,7 @@ function MacroTargets({ onSaved, reloadKey = 0 }) {
         if (!d) return
         setMode(d.mode)
         if (d.mode === 'fixed') {
-          setFixed({ calorie_target: d.calorie_target, protein_g: d.protein_g, carbs_g: d.carbs_g, fat_g: d.fat_g })
+          setFixed({ calorie_target: d.calorie_target ?? '', protein_g: d.protein_g ?? '', carbs_g: d.carbs_g ?? '', fat_g: d.fat_g ?? '' })
         }
       })
       .finally(() => setLoading(false))

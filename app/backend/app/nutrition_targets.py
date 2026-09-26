@@ -97,7 +97,7 @@ async def seed_dri_targets(user_id: int, sex: str, age: int) -> int:
     Returns the number of nutrients seeded.
     """
     targets = get_targets_for(sex, age)
-    existing = {(r["nutrient_name"], r["comparator"]): r for r in await targets_query.list_nutrient_target_goals(user_id)}
+    existing = {(r["nutrient_name"], r["comparator"]): r for r in await targets_query.list_nutrient_target_goals(user_id, include_inactive=True)}
     # A goal the user wrote themselves that already asserts the same thing
     # (their own daily protein floor) means seeding the default beside it
     # would be a duplicate -- theirs wins, the preset is simply not added.
@@ -121,7 +121,7 @@ async def seed_dri_targets(user_id: int, sex: str, age: int) -> int:
                 label = name if comparator == "gte" else f"{name} (max)"
                 inserts.append((label, comparator, query, value, "dri_default"))
             elif current["source"] == "dri_default" and current["reference_amount"] != value:
-                updates.append((current["id"], value, "dri_default"))
+                updates.append((current["id"], value, "dri_default", False))
 
     await targets_query.apply_nutrient_goal_changes(user_id, inserts, updates, deletes)
     return len(targets)
@@ -150,7 +150,7 @@ async def set_nutrient_override(user_id: int, nutrient_name: str, daily_target: 
     (same contract as before: this isn't a general upsert for arbitrary
     nutrient names, since a target with no DRI counterpart has no unit or
     context to validate against)."""
-    existing = {r["comparator"]: r for r in await targets_query.list_nutrient_target_goals(user_id) if r["nutrient_name"] == nutrient_name}
+    existing = {r["comparator"]: r for r in await targets_query.list_nutrient_target_goals(user_id, include_inactive=True) if r["nutrient_name"] == nutrient_name}
     if not existing:
         return False
 
@@ -163,7 +163,7 @@ async def set_nutrient_override(user_id: int, nutrient_name: str, daily_target: 
         elif current is not None:
             # A macro target (Protein's floor) stays a macro target; only a
             # DRI preset flips to "customized".
-            updates.append((current["id"], value, "macro_target" if current["source"] == "macro_target" else "user_target"))
+            updates.append((current["id"], value, "macro_target" if current["source"] == "macro_target" else "user_target", True))
         else:
             label = nutrient_name if comparator == "gte" else f"{nutrient_name} (max)"
             inserts.append((label, comparator, daily_target_query(f"nutrient:{nutrient_name}"), value, "user_target"))
@@ -180,7 +180,7 @@ async def revert_nutrient_to_dri(user_id: int, nutrient_name: str) -> bool:
     profile = await profile_query.get_profile(user_id)
     if profile is None:
         return False
-    rows = await targets_query.list_nutrient_target_goals(user_id)
+    rows = await targets_query.list_nutrient_target_goals(user_id, include_inactive=True)
     deletes = [r["id"] for r in rows if r["nutrient_name"] == nutrient_name and r["source"] == "user_target"]
     await targets_query.apply_nutrient_goal_changes(user_id, [], [], deletes)
     await seed_dri_targets(user_id, profile["sex"], profile["age"])

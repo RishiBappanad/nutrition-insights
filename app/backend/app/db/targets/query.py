@@ -20,27 +20,36 @@ from ...goal_signature import goal_signature, signature_of_goal
 NUTRIENT_TARGET_SOURCES = ("dri_default", "user_target")
 
 
-async def list_nutrient_target_goals(user_id: int):
+async def list_nutrient_target_goals(user_id: int, include_inactive: bool = False):
     """One row per nutrient floor/ceiling goal (a nutrient with both
     yields two rows). Includes a macro_target goal when it's a plain
     floor/ceiling on a nutrient (Protein's is) -- there is only ever ONE
-    protein floor, and it's that goal, not a second DRI copy beside it."""
+    protein floor, and it's that goal, not a second DRI copy beside it.
+
+    A preset the user deleted is kept as an inactive row (see
+    deactivate_goal), so by default it's excluded here -- it's not a target
+    any more -- while seeding/customizing pass include_inactive=True to see
+    it: a row that exists but is off must not be re-inserted as "missing"."""
     pool = await get_pool()
     return await pool.fetch(
-        """SELECT id, comparator, reference_amount, source,
+        """SELECT id, comparator, reference_amount, source, is_active,
                   substr(measure_query::jsonb ->> 'measureField', 10) AS nutrient_name
            FROM goals
            WHERE user_id = $1
+             AND ($3 OR is_active)
              AND measure_query::jsonb ->> 'measureField' IS NOT NULL
              AND (source = ANY($2::text[]) OR (source = 'macro_target' AND comparator IN ('gte', 'lte')))""",
-        user_id, list(NUTRIENT_TARGET_SOURCES),
+        user_id, list(NUTRIENT_TARGET_SOURCES), include_inactive,
     )
 
 
 async def apply_nutrient_goal_changes(user_id: int, inserts: list, updates: list, deletes: list) -> None:
     """inserts: (label, comparator, measure_query_dict, amount, source);
-    updates: (goal_id, amount, source); deletes: goal ids. One transaction,
-    so a failed reseed can't leave a nutrient with half its targets."""
+    updates: (goal_id, amount, source, reactivate) -- `reactivate` turns a
+    deleted (inactive) preset back on, which a deliberate customization does
+    and a profile-driven reseed must not; deletes: goal ids. One
+    transaction, so a failed reseed can't leave a nutrient with half its
+    targets."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -48,8 +57,8 @@ async def apply_nutrient_goal_changes(user_id: int, inserts: list, updates: list
                 await conn.execute("DELETE FROM goals WHERE user_id = $1 AND id = ANY($2::int[])", user_id, deletes)
             if updates:
                 await conn.executemany(
-                    "UPDATE goals SET reference_amount = $2, source = $3, updated_at = now() WHERE id = $1 AND user_id = $4",
-                    [(gid, amount, source, user_id) for gid, amount, source in updates],
+                    "UPDATE goals SET reference_amount = $2, source = $3, is_active = (is_active OR $5), updated_at = now() WHERE id = $1 AND user_id = $4",
+                    [(gid, amount, source, user_id, reactivate) for gid, amount, source, reactivate in updates],
                 )
             if inserts:
                 await conn.executemany(
@@ -60,9 +69,10 @@ async def apply_nutrient_goal_changes(user_id: int, inserts: list, updates: list
 
 
 async def get_macro_goal_amounts(user_id: int) -> dict:
-    """{label: reference_amount} for this user's macro_target goals."""
+    """{label: reference_amount} for this user's ACTIVE macro_target goals
+    (a deleted macro preset is simply absent)."""
     pool = await get_pool()
-    rows = await pool.fetch("SELECT label, reference_amount FROM goals WHERE user_id = $1 AND source = 'macro_target'", user_id)
+    rows = await pool.fetch("SELECT label, reference_amount FROM goals WHERE user_id = $1 AND source = 'macro_target' AND is_active", user_id)
     return {r["label"]: r["reference_amount"] for r in rows}
 
 
@@ -75,11 +85,14 @@ async def set_macro_goals(user_id: int, definitions: list) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            rows = [_decode(r) for r in await conn.fetch("SELECT * FROM goals WHERE user_id = $1 AND is_active = TRUE", user_id)]
+            rows = [_decode(r) for r in await conn.fetch("SELECT * FROM goals WHERE user_id = $1", user_id)]
+            # An inactive (deleted) macro goal is found by label too and comes
+            # back to life below; only ACTIVE goals count as a twin to adopt.
             existing = {r["label"]: r["id"] for r in rows if r["source"] == "macro_target"}
             by_signature = {}
             for r in rows:
-                by_signature.setdefault(signature_of_goal(r), r)
+                if r["is_active"]:
+                    by_signature.setdefault(signature_of_goal(r), r)
             for label, comparator, tolerance, mq, amount in definitions:
                 if label in existing:
                     await conn.execute(
@@ -107,6 +120,16 @@ def _decode(row) -> dict:
     d["measure_query"] = json.loads(d["measure_query"])
     d["reference_query"] = json.loads(d["reference_query"]) if d["reference_query"] is not None else None
     return d
+
+
+async def deactivate_goal(goal_id: int, user_id: int) -> bool:
+    """"Deletes" a preset: it stays as an inactive row so seeding and
+    profile changes see it exists and don't put it back, and a reset (single
+    or all) can restore it. Every read that means "the user's current
+    goals" filters on is_active."""
+    pool = await get_pool()
+    result = await pool.execute("UPDATE goals SET is_active = FALSE, updated_at = now() WHERE id = $1 AND user_id = $2", goal_id, user_id)
+    return result == "UPDATE 1"
 
 
 async def restore_preset_goal(goal_id: int, user_id: int, amount: float, source: str) -> None:

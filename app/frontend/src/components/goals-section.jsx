@@ -163,11 +163,14 @@ function GoalCard({ goal, status, onSaveAmount, onSaveScale, onReset, onDelete, 
               <RotateCcw className="h-3.5 w-3.5 text-muted-foreground" />
             </button>
           )}
-          {!goal.is_preset && (
-            <button onClick={() => run(() => onDelete(goal))} className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-secondary" aria-label="Delete goal">
-              <Trash2 className="h-3.5 w-3.5 text-destructive" />
-            </button>
-          )}
+          <button
+            onClick={() => run(() => onDelete(goal))}
+            title={goal.is_preset ? 'Remove this preset (restore it any time with Reset presets)' : 'Delete goal'}
+            className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity p-1 rounded hover:bg-secondary"
+            aria-label={goal.is_preset ? 'Remove preset' : 'Delete goal'}
+          >
+            <Trash2 className="h-3.5 w-3.5 text-destructive" />
+          </button>
         </div>
       </div>
 
@@ -205,7 +208,7 @@ function GoalCard({ goal, status, onSaveAmount, onSaveScale, onReset, onDelete, 
       {goal.duplicate_of && (
         <p className="text-xs text-amber-600 mt-2 flex items-start gap-1">
           <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-px" />
-          Duplicate of another goal asserting the same thing{goal.is_preset ? '' : ' — delete this one'}.
+          Duplicate of another goal asserting the same thing{goal.is_preset ? ' — remove one of them' : ' — delete this one'}.
         </p>
       )}
       {error && <p className="text-xs text-destructive mt-2">{error}</p>}
@@ -770,6 +773,10 @@ function NewGoalModal({ onClose, onCreated }) {
 
 export function GoalsSection({ reloadKey = 0, onChanged }) {
   const [goals, setGoals] = useState([])
+  // Presets the user removed (kept server-side as inactive rows). Only the DRI
+  // ones count here: "Reset presets" restores those, whereas a removed macro
+  // target comes back by saving the macro editor again.
+  const [removedPresets, setRemovedPresets] = useState([])
   const [statuses, setStatuses] = useState({})
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
@@ -783,8 +790,10 @@ export function GoalsSection({ reloadKey = 0, onChanged }) {
   function load() {
     setLoading(true)
     setStatuses({})
-    api('/goals?active=true&include_system=true').then((r) => r.json()).then((rows) => {
+    api('/goals?include_system=true').then((r) => r.json()).then((all) => {
+      const rows = all.filter((g) => g.is_active)
       setGoals(rows)
+      setRemovedPresets(all.filter((g) => !g.is_active && (g.source === 'dri_default' || g.source === 'user_target')))
       setLoading(false)
       loadStatuses()
     }).catch(() => setLoading(false))
@@ -822,6 +831,7 @@ export function GoalsSection({ reloadKey = 0, onChanged }) {
     const res = await api(`/goals/${goal.id}`, { method: 'DELETE' })
     if (!res.ok) throw new Error(await errorMessage(res, 'Could not delete'))
     setGoals((prev) => prev.filter((g) => g.id !== goal.id))
+    if (goal.source === 'dri_default' || goal.source === 'user_target') setRemovedPresets((prev) => [...prev, goal])
     onChanged?.()
   }
 
@@ -852,6 +862,7 @@ export function GoalsSection({ reloadKey = 0, onChanged }) {
   const tabs = ['All', ...GROUPS.filter((g) => counts[g] > 0)]
   const visible = tab === 'All' ? goals : goals.filter((g) => g.group === tab)
   const anyModified = goals.some((g) => g.is_modified)
+  const canResetPresets = anyModified || removedPresets.length > 0
 
   return (
     <Card>
@@ -860,13 +871,17 @@ export function GoalsSection({ reloadKey = 0, onChanged }) {
           <div>
             <CardTitle>Goals</CardTitle>
             <CardDescription>
-              Your nutrient and vital goals, by category. Presets are filled in from your profile — edit any amount, or reset it to the default. Live progress is for the current period.
+              Your nutrient and vital goals, by category. Presets are filled in from your profile — edit any amount, reset it to the default, or remove the ones you don't want. Live progress is for the current period.
             </CardDescription>
           </div>
           <div className="shrink-0 flex items-center gap-2">
-            {anyModified && (
-              <button onClick={resetAll} className="flex items-center gap-1.5 border border-border rounded-md px-3 py-1.5 text-sm hover:bg-secondary" title="Put every customized preset back to its default">
-                <RotateCcw className="h-3.5 w-3.5" /> Reset presets
+            {canResetPresets && (
+              <button
+                onClick={resetAll}
+                className="flex items-center gap-1.5 border border-border rounded-md px-3 py-1.5 text-sm hover:bg-secondary"
+                title="Put every customized preset back to its default and bring back any you removed"
+              >
+                <RotateCcw className="h-3.5 w-3.5" /> Reset presets{removedPresets.length > 0 ? ` (${removedPresets.length} removed)` : ''}
               </button>
             )}
             <button onClick={() => setShowModal(true)} className="flex items-center gap-1.5 bg-primary text-primary-foreground rounded-md px-3 py-1.5 text-sm font-medium">
