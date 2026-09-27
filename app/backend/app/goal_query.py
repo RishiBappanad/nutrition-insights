@@ -43,6 +43,23 @@ DIRECT_FILTER_FIELDS = ("category", "event_type", "owner_type", "amount")
 TIME_WINDOW_KINDS = ("current_period", "trailing", "same_period_last_year", "fixed_range", "all_time")
 GOAL_QUERY_PERIODS = ("daily", "weekly", "monthly")
 
+# A goal's TERM -- Everyday vs. Long-Term -- is derived from its measure's own
+# time window, never stored: "current_period"/"trailing"/"same_period_last_year"
+# all recur on a schedule and reset every period (a dining budget, a daily
+# protein floor) -- something to MAINTAIN, never finished. "all_time"/
+# "fixed_range" don't recur -- a standing target checked against the whole
+# history (or a fixed span), the same shape a vital goal already has (protein
+# "last" reading vs. all-time) -- something ATTAINABLE, that stays true once
+# reached. Decided 2026-09-27; see workspace-notes/RECURRING_AND_GOALS_SPEC.md.
+TERM_EVERYDAY = "everyday"
+TERM_LONG_TERM = "long_term"
+_LONG_TERM_WINDOW_KINDS = ("all_time", "fixed_range")
+
+
+def term_of(measure_query: dict) -> str:
+    kind = (measure_query.get("timeWindow") or {}).get("kind")
+    return TERM_LONG_TERM if kind in _LONG_TERM_WINDOW_KINDS else TERM_EVERYDAY
+
 _METADATA_FIELD_RE = re.compile(r"^metadata\.[A-Za-z0-9_]+$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 

@@ -573,6 +573,26 @@ async def init_db():
             -- nutrition-specific, so another tracker could use it too.
             ALTER TABLE goals ADD COLUMN IF NOT EXISTS source TEXT;
 
+            -- Long-Term goals only (goal_query.py's term_of() == 'long_term' --
+            -- an all_time/fixed_range measure, e.g. a vital goal): an optional
+            -- deadline (target_date) and a one-time snapshot of the measure's
+            -- value at goal-creation time (start_value), used to draw a
+            -- start -> current -> target progress bar instead of the plain
+            -- current/target bar Everyday goals use. Both null for every
+            -- Everyday goal and for any Long-Term goal that predates this
+            -- column (no snapshot to backfill -- the bar just falls back to
+            -- the plain style until one exists). Immutable once set except by
+            -- an explicit user edit (PATCH), never recomputed by anything else.
+            -- TEXT, not a native DATE column -- this codebase's established
+            -- convention for every business date (food_log.date,
+            -- daily_nutrition.date, ...), specifically to avoid asyncpg's
+            -- strict native-date/timestamp typing (a bare Python str isn't
+            -- accepted for a real date column without an explicit parse,
+            -- the same friction domain_events.py's occurred_at already
+            -- works around).
+            ALTER TABLE goals ADD COLUMN IF NOT EXISTS target_date TEXT;
+            ALTER TABLE goals ADD COLUMN IF NOT EXISTS start_value DOUBLE PRECISION;
+
             -- logged_at was added a short time after domain_events itself
             -- (still pre-launch, no real rows anywhere yet) to separate
             -- "row insert time" from occurred_at once occurred_at started

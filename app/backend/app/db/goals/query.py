@@ -66,9 +66,13 @@ async def create_goal(
     reference_query: Optional[dict],
     inflation_adjusted: bool,
     notify_on_crossing: bool,
+    target_date: Optional[str] = None,
+    start_value: Optional[float] = None,
 ) -> dict:
     """Raises DuplicateGoalError instead of inserting a second goal that
-    asserts the same thing as an existing active one."""
+    asserts the same thing as an existing active one. `target_date`/
+    `start_value` are Long-Term-goal-only fields (see db/__init__.py's
+    migration comment); harmless, unused columns on an Everyday goal."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -82,12 +86,13 @@ async def create_goal(
             row = await conn.fetchrow(
                 """INSERT INTO goals
                        (user_id, label, severity, comparator, tolerance_percent, measure_query,
-                        reference_amount, reference_query, inflation_adjusted, notify_on_crossing)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        reference_amount, reference_query, inflation_adjusted, notify_on_crossing,
+                        target_date, start_value)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                    RETURNING *""",
                 user_id, label, severity, comparator, tolerance_percent, json.dumps(measure_query),
                 reference_amount, json.dumps(reference_query) if reference_query is not None else None,
-                inflation_adjusted, notify_on_crossing,
+                inflation_adjusted, notify_on_crossing, target_date, start_value,
             )
     return _row_to_goal(row)
 
@@ -171,3 +176,22 @@ async def delete_goal(goal_id: int, user_id: int) -> bool:
     pool = await get_pool()
     result = await pool.execute("DELETE FROM goals WHERE id = $1 AND user_id = $2", goal_id, user_id)
     return result == "DELETE 1"
+
+
+async def list_goal_crossings(user_id: int, goal_id: int, limit: int) -> list[dict]:
+    """A Long-Term goal's own history of goal_met/goal_exceeded transitions
+    (see goals_evaluation.py's evaluate_goal_transition, which writes these
+    as domain_events rows -- nothing new is stored here, this just reads
+    that existing log back for one goal, newest first). Scoped by user_id
+    even though goal_id alone would already be unique, matching every other
+    ownership-scoped query in this module."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """SELECT event_type, occurred_at, logged_at, metadata_json
+           FROM domain_events
+           WHERE user_id = $1 AND owner_type = 'goal' AND owner_id = $2
+             AND event_type IN ('goal_met', 'goal_exceeded')
+           ORDER BY logged_at DESC LIMIT $3""",
+        user_id, goal_id, limit,
+    )
+    return [dict(r) for r in rows]

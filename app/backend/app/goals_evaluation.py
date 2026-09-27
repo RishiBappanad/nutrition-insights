@@ -62,6 +62,25 @@ def percent_of_reference(measure: float, reference: float) -> float:
     return round((measure / reference) * 10000) / 100
 
 
+def journey_percent_of(comparator: str, start_value: Optional[float], measure: float, reference: float) -> Optional[float]:
+    """A Long-Term goal's start -> current -> target progress, as a 0-100
+    fraction of the distance from `start_value` already covered -- e.g. a
+    weight-loss floor at 210 -> 180 reads 0% at 210, 100% at or past 180,
+    not "measure / target" (which reads ~86% the moment you START, since
+    180/210 is already most of the way there on that math). None (falls
+    back to percent_of_reference's plain bar) when there's no start value
+    to measure from, when start == target (nothing to divide by), or for
+    a comparator this directional framing doesn't fit (eq/
+    within_tolerance_percent -- "on target" isn't a one-way journey)."""
+    if start_value is None or comparator not in ("lte", "gte") or start_value == reference:
+        return None
+    if comparator == "lte":
+        fraction = (start_value - measure) / (start_value - reference)
+    else:
+        fraction = (measure - start_value) / (reference - start_value)
+    return round(max(0.0, min(1.0, fraction)) * 10000) / 100
+
+
 @dataclass
 class EvaluatedGoal:
     measure_value: Optional[float]  # None = no readings yet (a "last" measure over an empty window)
@@ -71,6 +90,7 @@ class EvaluatedGoal:
     percent: float
     is_compliant: bool
     severity: str
+    journey_percent: Optional[float] = None  # Long-Term goals only -- see journey_percent_of
 
     @property
     def has_data(self) -> bool:
@@ -128,6 +148,7 @@ async def compute_goal_status(conn, goal: dict, exclude_event_id: Optional[int] 
         percent=percent_of_reference(measure.value, reference_value),
         is_compliant=is_compliant(comparator, measure.value, reference_value, goal["tolerance_percent"]),
         severity=goal["severity"],
+        journey_percent=journey_percent_of(comparator, goal.get("start_value"), measure.value, reference_value),
     )
 
 

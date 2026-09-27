@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Target, Plus, Trash2, CheckCircle2, AlertTriangle, X, Pencil, RotateCcw, Scale } from 'lucide-react'
+import { Target, Plus, Trash2, CheckCircle2, AlertTriangle, X, Pencil, RotateCcw, Scale, Calendar as CalendarIcon, Trophy } from 'lucide-react'
 import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 
@@ -48,6 +48,13 @@ function periodLabel(period) {
   }
 }
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+function shortDate(iso) {
+  const [, m, d] = iso.split('-').map(Number)
+  return `${MONTHS[m - 1]} ${d}`
+}
+
 function formatAmount(n, unit) {
   if (n === null || n === undefined) return '—'
   const value = Math.abs(n) >= 100 ? Math.round(n) : Math.round(n * 10) / 10
@@ -88,9 +95,31 @@ function goalSubtitle(goal) {
   return `${mq.aggregation} per ${periodLabel(period)}`
 }
 
+function GoalCrossingHistory({ goalId }) {
+  const [rows, setRows] = useState(null)
+  useEffect(() => {
+    api(`/goals/${goalId}/history`).then((r) => r.json()).then((d) => setRows(d.crossings ?? [])).catch(() => setRows([]))
+  }, [goalId])
+  if (!rows) return <p className="text-xs text-muted-foreground mt-2">Loading…</p>
+  if (rows.length === 0) return <p className="text-xs text-muted-foreground mt-2">No crossings yet.</p>
+  return (
+    <div className="mt-2 space-y-1">
+      {rows.map((r, i) => (
+        <div key={i} className="flex items-center justify-between text-xs">
+          <span className="flex items-center gap-1">
+            {r.event === 'met' ? <Trophy className="h-3 w-3 text-emerald-600" /> : <AlertTriangle className="h-3 w-3 text-amber-600" />}
+            {r.event === 'met' ? 'Reached' : 'Fell out of range'}
+          </span>
+          <span className="text-muted-foreground">{shortDate(r.occurred_at.slice(0, 10))}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // ── Goal card ──────────────────────────────────────────────────────────
 
-function GoalCard({ goal, status, onSaveAmount, onSaveScale, onReset, onDelete, onLogVital }) {
+function GoalCard({ goal, status, onSaveAmount, onSaveScale, onSaveTargetDate, onReset, onDelete, onLogVital }) {
   const isWarning = goal.severity === 'warning'
   const tone = status === undefined ? 'muted' : !status.has_data ? 'muted' : status.on_track ? 'ok' : isWarning ? 'warn' : 'bad'
   const iconBg = { muted: 'bg-secondary', ok: 'bg-emerald-500/10', warn: 'bg-amber-500/10', bad: 'bg-destructive/10' }[tone]
@@ -103,6 +132,11 @@ function GoalCard({ goal, status, onSaveAmount, onSaveScale, onReset, onDelete, 
   const [reading, setReading] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+  const [editingDate, setEditingDate] = useState(false)
+  const [dateDraft, setDateDraft] = useState('')
+  const [showHistory, setShowHistory] = useState(false)
+
+  const isLongTerm = goal.term === 'long_term'
 
   // A fixed-amount goal edits its amount; a goal compared against a computed
   // value edits the multiplier on it (the ratio).
@@ -135,6 +169,11 @@ function GoalCard({ goal, status, onSaveAmount, onSaveScale, onReset, onDelete, 
     setReading('')
   })
 
+  const saveDate = () => run(async () => {
+    await onSaveTargetDate(goal, dateDraft || null)
+    setEditingDate(false)
+  })
+
   return (
     <div className="bg-card border border-border rounded-lg p-4 relative group">
       <div className="flex items-start justify-between gap-3">
@@ -148,9 +187,31 @@ function GoalCard({ goal, status, onSaveAmount, onSaveScale, onReset, onDelete, 
               {goal.group}
               {goal.is_preset && (goal.is_modified ? ' · Customized preset' : ' · Preset')}
             </p>
+            {isLongTerm && (
+              editingDate ? (
+                <div className="flex items-center gap-1.5 mt-1">
+                  <input type="date" value={dateDraft} onChange={(e) => setDateDraft(e.target.value)} className="text-xs border border-border rounded px-1.5 py-0.5 bg-background" />
+                  <button onClick={saveDate} disabled={busy} className="text-xs text-primary font-medium hover:underline">Save</button>
+                  <button onClick={() => setEditingDate(false)} className="text-xs hover:underline">Cancel</button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => { setDateDraft(goal.target_date ?? ''); setEditingDate(true); setError(null) }}
+                  className="flex items-center gap-1 mt-1 text-[11px] text-muted-foreground hover:text-foreground"
+                >
+                  <CalendarIcon className="h-3 w-3" />
+                  {goal.target_date
+                    ? `Target ${shortDate(goal.target_date)} · ${goal.days_until_target >= 0 ? `${goal.days_until_target}d left` : `${-goal.days_until_target}d overdue`}`
+                    : '+ Add a target date'}
+                </button>
+              )
+            )}
           </div>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          {isLongTerm && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary font-medium">Long-Term</span>
+          )}
           <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-border text-muted-foreground">{termBadge(goal)}</span>
           {goal.is_modified && (
             <button
@@ -218,6 +279,27 @@ function GoalCard({ goal, status, onSaveAmount, onSaveScale, onReset, onDelete, 
           <div className="h-2 w-full bg-secondary rounded-full animate-pulse" />
         ) : !status.has_data ? (
           <p className="text-sm text-muted-foreground">No readings yet — log your first below.</p>
+        ) : status.journey_percent !== null && status.journey_percent !== undefined ? (
+          // Long-Term, with a start value: a start -> current -> target journey, not a
+          // plain "how close to the number" bar -- see goals_evaluation.py's journey_percent_of.
+          <>
+            <div className="h-2 w-full bg-secondary rounded-full overflow-hidden">
+              <div className={'h-full rounded-full ' + barFg} style={{ width: `${status.journey_percent}%` }} />
+            </div>
+            <div className="flex items-center justify-between mt-1 text-[10px] text-muted-foreground">
+              <span>Start {formatAmount(goal.start_value, goal.unit)}</span>
+              <span>{Math.round(status.journey_percent)}% there</span>
+              <span>Target {formatAmount(status.reference_value, goal.unit)}</span>
+            </div>
+            <div className="flex items-center justify-between mt-2">
+              <span className="text-sm font-mono">
+                {formatAmount(status.measure_value, goal.unit)} <span className="text-muted-foreground">now</span>
+              </span>
+              <span className={'text-xs font-medium flex items-center gap-1 ' + iconFg}>
+                {status.on_track ? (<><Trophy className="h-3.5 w-3.5" /> Reached</>) : (<><AlertTriangle className="h-3.5 w-3.5" /> {isWarning ? 'Off track' : 'Not yet'}</>)}
+              </span>
+            </div>
+          </>
         ) : (
           <>
             <div className="h-2 w-full bg-secondary rounded-full overflow-hidden">
@@ -246,6 +328,15 @@ function GoalCard({ goal, status, onSaveAmount, onSaveScale, onReset, onDelete, 
           <span className="text-xs text-muted-foreground">{goal.unit}</span>
           <button onClick={logReading} disabled={busy} className="text-xs font-medium border border-border rounded-md px-2 py-1 hover:bg-secondary">Log</button>
         </div>
+      )}
+
+      {isLongTerm && (
+        <>
+          <button type="button" className="mt-2 text-[11px] text-muted-foreground hover:text-foreground underline" onClick={() => setShowHistory(!showHistory)}>
+            {showHistory ? 'Hide history' : 'History'}
+          </button>
+          {showHistory && <GoalCrossingHistory goalId={goal.id} />}
+        </>
       )}
     </div>
   )
@@ -289,7 +380,7 @@ function MeasurePicker({ measures, value, onChange }) {
 
 // ── New goal modal ─────────────────────────────────────────────────────
 
-const DEFAULT_BASIC = { measure: 'calories', comparator: 'lte', amount: 2000, period: 'daily', severity: 'target' }
+const DEFAULT_BASIC = { measure: 'calories', comparator: 'lte', amount: 2000, period: 'daily', severity: 'target', targetDate: '', startValue: '' }
 
 const DEFAULT_ADVANCED = {
   measure: 'calories',
@@ -315,6 +406,10 @@ const DEFAULT_ADVANCED = {
   severity: 'target',
   notifyOnCrossing: true,
   label: '',
+  // Long-Term only (vitals today): an optional deadline, and a starting value
+  // (blank = auto-snapshot the current reading when the goal is created).
+  targetDate: '',
+  startValue: '',
 }
 
 // A vital is read as "the latest reading" by default, so its advanced form
@@ -367,7 +462,12 @@ function buildAdvancedPayload(form) {
     ...(form.comparator === 'within_tolerance_percent' ? { tolerance_percent: form.tolerancePercent } : {}),
   }
 
-  if (form.referenceMode === 'fixed') return { ...base, reference_amount: form.referenceAmount }
+  const longTermFields = {
+    ...(form.measure.startsWith('vital:') && form.targetDate ? { target_date: form.targetDate } : {}),
+    ...(form.measure.startsWith('vital:') && form.startValue !== '' ? { start_value: Number(form.startValue) } : {}),
+  }
+
+  if (form.referenceMode === 'fixed') return { ...base, reference_amount: form.referenceAmount, ...longTermFields }
 
   const reference_query = {
     aggregation: form.refAggregation,
@@ -376,7 +476,7 @@ function buildAdvancedPayload(form) {
     timeWindow: buildReferenceTimeWindow(form),
     ...(form.scale !== 1 ? { scale: form.scale } : {}),
   }
-  return { ...base, reference_query }
+  return { ...base, reference_query, ...longTermFields }
 }
 
 // The picker key a stored query measures (inverse of measureScope).
@@ -451,7 +551,13 @@ function NewGoalModal({ onClose, onCreated }) {
 
   const submitBasic = () => {
     const shared = { comparator: basic.comparator, target_amount: basic.amount, severity: basic.severity }
-    if (basic.measure.startsWith('vital:')) return post({ ...shared, vital: basic.measure.slice('vital:'.length) })
+    if (basic.measure.startsWith('vital:')) {
+      return post({
+        ...shared, vital: basic.measure.slice('vital:'.length),
+        ...(basic.targetDate ? { target_date: basic.targetDate } : {}),
+        ...(basic.startValue !== '' ? { start_value: Number(basic.startValue) } : {}),
+      })
+    }
     return post({
       ...shared,
       ...(basic.measure !== 'calories' ? { measure_field: basic.measure } : {}),
@@ -545,6 +651,18 @@ function NewGoalModal({ onClose, onCreated }) {
                 </select>
               </div>
             </div>
+            {basicIsVital && (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-muted-foreground">Target date (optional)</label>
+                  <input type="date" value={basic.targetDate} onChange={(e) => updateBasic({ targetDate: e.target.value })} className={INPUT} />
+                </div>
+                <div>
+                  <label className="text-xs text-muted-foreground">Starting {unitOf(basic.measure)} (optional)</label>
+                  <input type="number" step="any" placeholder="today's reading" value={basic.startValue} onChange={(e) => updateBasic({ startValue: e.target.value })} className={INPUT} />
+                </div>
+              </div>
+            )}
             <button onClick={submitBasic} disabled={submitting} className="w-full bg-primary text-primary-foreground rounded-md py-2 text-sm font-medium mt-2 disabled:opacity-60">
               {submitting ? 'Creating…' : 'Create Goal'}
             </button>
@@ -636,6 +754,18 @@ function NewGoalModal({ onClose, onCreated }) {
                 <div className="mt-3">
                   <label className="text-xs text-muted-foreground">Percentile</label>
                   <input type="number" min="0" max="100" value={advanced.measurePercentile} onChange={(e) => updateAdvanced({ measurePercentile: Number(e.target.value) })} className={INPUT} />
+                </div>
+              )}
+              {advancedIsVital && (
+                <div className="grid grid-cols-2 gap-3 mt-3">
+                  <div>
+                    <label className="text-xs text-muted-foreground">Target date (optional)</label>
+                    <input type="date" value={advanced.targetDate} onChange={(e) => updateAdvanced({ targetDate: e.target.value })} className={INPUT} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-muted-foreground">Starting {advancedUnit} (optional)</label>
+                    <input type="number" step="any" placeholder="today's reading" value={advanced.startValue} onChange={(e) => updateAdvanced({ startValue: e.target.value })} className={INPUT} />
+                  </div>
                 </div>
               )}
             </div>
@@ -819,6 +949,13 @@ export function GoalsSection({ reloadKey = 0, onChanged }) {
     onChanged?.()
   }
 
+  async function saveTargetDate(goal, targetDate) {
+    const res = await api(`/goals/${goal.id}`, { method: 'PATCH', body: JSON.stringify({ target_date: targetDate }) })
+    if (!res.ok) throw new Error(await errorMessage(res, 'Could not save'))
+    replaceGoal(await res.json())
+    onChanged?.()
+  }
+
   async function resetGoal(goal) {
     const res = await api(`/goals/${goal.id}/reset`, { method: 'POST' })
     if (!res.ok) throw new Error(await errorMessage(res, 'Could not reset'))
@@ -913,7 +1050,7 @@ export function GoalsSection({ reloadKey = 0, onChanged }) {
               {visible.map((g) => (
                 <GoalCard
                   key={g.id} goal={g} status={statuses[g.id]}
-                  onSaveAmount={saveAmount} onSaveScale={saveScale} onReset={resetGoal} onDelete={deleteGoal} onLogVital={logVital}
+                  onSaveAmount={saveAmount} onSaveScale={saveScale} onSaveTargetDate={saveTargetDate} onReset={resetGoal} onDelete={deleteGoal} onLogVital={logVital}
                 />
               ))}
             </div>

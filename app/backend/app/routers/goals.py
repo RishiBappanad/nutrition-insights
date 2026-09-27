@@ -21,7 +21,9 @@ adjusts anything with it here (see that module's own note) -- CPI
 inflation is a money concept finance-tracker's Goals uses, not a
 nutrition one.
 """
-from datetime import datetime, timezone
+import json
+import re
+from datetime import date, datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Union
@@ -34,10 +36,10 @@ from ..db.targets import query as targets_query
 from ..db import get_pool
 from ..goal_query import (
     parse_goal_query, is_valid_period, is_valid_measure_field, GOAL_QUERY_PERIODS, goal_query_to_json,
-    compute_nutrient_totals_for_date,
+    compute_nutrient_totals_for_date, evaluate_goal_query, term_of, TERM_LONG_TERM,
 )
 from ..goals_evaluation import (
-    is_valid_comparator, is_valid_severity, compute_goal_status, is_compliant, percent_of_reference,
+    is_valid_comparator, is_valid_severity, compute_goal_status, is_compliant, percent_of_reference, journey_percent_of,
 )
 from ..goal_measures import list_measures, describe_measure, GROUP_ORDER
 from ..goal_signature import goal_signature, signature_of_goal
@@ -79,6 +81,13 @@ class GoalInput(BaseModel):
     label: Optional[str] = None
     inflation_adjusted: bool = False
     notify_on_crossing: bool = True
+    # Long-Term goals only (see goal_query.py's term_of) -- rejected on an
+    # Everyday goal. target_date is an optional deadline; start_value is a
+    # one-time snapshot, auto-captured from the current measure at creation
+    # if omitted (a real earlier value -- your actual starting weight -- can
+    # be given directly instead).
+    target_date: Optional[str] = None
+    start_value: Optional[float] = None
 
 
 class GoalUpdateInput(BaseModel):
@@ -100,6 +109,21 @@ class GoalUpdateInput(BaseModel):
     # Edits just the multiplier on a computed reference (the ratio) without
     # re-sending the whole query.
     reference_scale: Optional[float] = None
+    target_date: Optional[str] = None
+    start_value: Optional[float] = None
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _is_valid_date_string(value: str) -> bool:
+    if not _DATE_RE.match(value):
+        return False
+    try:
+        date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
 
 
 def _is_shorthand(body: GoalInput) -> bool:
@@ -179,11 +203,26 @@ def _default_amount_for(goal: dict, defaults: dict) -> Optional[float]:
     return defaults.get((field[len("nutrient:"):], goal["comparator"]))
 
 
+def _days_until(target_date: Optional[str]) -> Optional[int]:
+    if not target_date:
+        return None
+    today = datetime.now(timezone.utc).date()
+    return (date.fromisoformat(target_date) - today).days
+
+
 def _serialize_goal(g: dict, defaults: Optional[dict] = None) -> dict:
     measure = describe_measure(g["measure_query"])
     default_amount = _default_amount_for(g, defaults or {})
+    term = term_of(g["measure_query"])
     return {
         "id": g["id"],
+        # Everyday (a maintained, resets-on-schedule check) vs. Long-Term (a
+        # standing target you work toward and can hold) -- derived from the
+        # measure's own time window, not stored; see goal_query.py's term_of.
+        "term": term,
+        "target_date": g.get("target_date"),
+        "days_until_target": _days_until(g.get("target_date")),
+        "start_value": g.get("start_value"),
         "label": g["label"],
         "severity": g["severity"],
         "is_active": g["is_active"],
@@ -226,6 +265,22 @@ def _duplicate_conflict(e: DuplicateGoalError) -> HTTPException:
         "message": f'You already have this goal ("{name}") -- edit it instead of adding a second one.',
         "existing_goal_id": existing["id"],
     })
+
+
+async def _snapshot_current_value(user_id: int, measure_query: dict) -> Optional[float]:
+    """A one-time read of a Long-Term goal's measure, right now, for
+    `start_value` when the caller doesn't supply one directly (a real
+    earlier value -- your actual starting weight -- can be given instead).
+    None if there's no data yet (no vital reading logged): the goal is
+    still created, just without a start snapshot -- the journey bar falls
+    back to the plain style until one exists via a later PATCH."""
+    parsed = parse_goal_query(measure_query)
+    if isinstance(parsed, str):
+        return None  # already validated upstream; defensive only
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await evaluate_goal_query(conn, user_id, parsed)
+    return result.value
 
 
 def _parse_goal_input(body: Union[GoalInput, GoalUpdateInput]) -> tuple[Optional[dict], Optional[float], Optional[dict], Optional[str]]:
@@ -325,6 +380,16 @@ async def create_goal(body: GoalInput, user_id: int = Depends(get_current_user))
     if measure_query is None:
         raise HTTPException(status_code=400, detail="measure_query (or category/target_amount/period shorthand) is required")
 
+    term = term_of(measure_query)
+    if term != TERM_LONG_TERM and (body.target_date is not None or body.start_value is not None):
+        raise HTTPException(status_code=400, detail="target_date/start_value only apply to a Long-Term goal (one whose measure covers all_time, like a vital goal)")
+    if body.target_date is not None and not _is_valid_date_string(body.target_date):
+        raise HTTPException(status_code=400, detail="target_date must be a real YYYY-MM-DD date")
+
+    start_value = body.start_value
+    if term == TERM_LONG_TERM and start_value is None:
+        start_value = await _snapshot_current_value(user_id, measure_query)
+
     try:
         goal = await goals_query.create_goal(
             user_id=user_id,
@@ -337,6 +402,8 @@ async def create_goal(body: GoalInput, user_id: int = Depends(get_current_user))
             reference_query=reference_query,
             inflation_adjusted=body.inflation_adjusted,
             notify_on_crossing=body.notify_on_crossing,
+            target_date=body.target_date,
+            start_value=start_value,
         )
     except DuplicateGoalError as e:
         raise _duplicate_conflict(e)
@@ -409,6 +476,17 @@ async def update_goal(goal_id: int, body: GoalUpdateInput, user_id: int = Depend
         if current["source"] == "dri_default":
             updates["source"] = "user_target"  # customized: a profile change must no longer overwrite it
 
+    if body.target_date is not None or body.start_value is not None:
+        effective_measure_query = updates.get("measure_query", current["measure_query"])
+        if term_of(effective_measure_query) != TERM_LONG_TERM:
+            raise HTTPException(status_code=400, detail="target_date/start_value only apply to a Long-Term goal (one whose measure covers all_time, like a vital goal)")
+        if body.target_date is not None:
+            if not _is_valid_date_string(body.target_date):
+                raise HTTPException(status_code=400, detail="target_date must be a real YYYY-MM-DD date")
+            updates["target_date"] = body.target_date
+        if body.start_value is not None:
+            updates["start_value"] = body.start_value
+
     try:
         goal = await goals_query.update_goal(goal_id, user_id, updates)
     except DuplicateGoalError as e:
@@ -442,6 +520,7 @@ def _status_body(evaluated) -> dict:
         "on_track": evaluated.is_compliant,
         "severity": evaluated.severity,
         "has_data": evaluated.has_data,
+        "journey_percent": evaluated.journey_percent,
     }
 
 
@@ -498,6 +577,7 @@ async def get_goal_statuses(user_id: int = Depends(get_current_user)):
                     "measure_value": measure, "reference_value": round(reference, 2), "comparator": goal["comparator"],
                     "tolerance_percent": goal["tolerance_percent"], "percent": percent_of_reference(measure, reference),
                     "on_track": compliant, "severity": goal["severity"], "has_data": True,
+                    "journey_percent": None,  # this shortcut only ever covers Everyday (daily preset) goals
                 }
             else:
                 statuses[goal["id"]] = _status_body(await compute_goal_status(conn, goal))
@@ -684,3 +764,28 @@ async def get_goal_status(goal_id: int, user_id: int = Depends(get_current_user)
     if not goal:
         raise HTTPException(status_code=404, detail="Goal not found")
     return await _read_goal_status(goal)
+
+
+@router.get("/{goal_id}/history")
+async def get_goal_history(goal_id: int, limit: int = 20, user_id: int = Depends(get_current_user)):
+    """A Long-Term goal's own record of reaching (or falling back out of)
+    its target -- read from the goal_met/goal_exceeded domain_events
+    evaluate_goal_transition already writes on every crossing. Deliberately
+    NOT pushed anywhere else (no calendar entry, no notification target
+    today): per explicit product decision, a goal crossing is a fact this
+    goal itself remembers, not something that populates a shared view --
+    the calendar stays restricted to what's actionable that day."""
+    goal = await goals_query.get_owned_goal(goal_id, user_id)
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    rows = await goals_query.list_goal_crossings(user_id, goal_id, max(1, min(limit, 100)))
+    return {
+        "crossings": [
+            {
+                "event": "met" if r["event_type"] == "goal_met" else "exceeded",
+                "occurred_at": r["occurred_at"].isoformat(),
+                **{k: v for k, v in json.loads(r["metadata_json"]).items() if k in ("measure_value", "reference_value")},
+            }
+            for r in rows
+        ],
+    }
