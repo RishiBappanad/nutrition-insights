@@ -1,0 +1,74 @@
+{
+  "$comment": "Shared behavioral contract for every trackstack-calendar-client implementation (this repo's Node /calendar-client subpath, and the trackstack-calendar-client PyPI package). Each implementation's own test suite loads this file and asserts identical request-building behavior against it, so the two can't silently drift the way the auth PAT-fallback logic once did before either had a shared contract fixture. Keep this file byte-identical across both repos -- if it ever needs to change, update it in both places in the same commit/session.",
+  "calendarBaseUrl": "http://trackstack-gateway.invalid",
+  "tracker": "finance",
+  "authHeader": "Bearer fixture-token",
+
+  "pushInput": {
+    "owner_type": "transaction",
+    "owner_id": "123",
+    "event_type": "transaction_created",
+    "action": "created",
+    "category": "dining",
+    "amount": 42.5,
+    "label": "Dinner at Cafe Roma",
+    "occurred_at": "2026-09-16T00:00:00.000Z",
+    "metadata": { "merchant": "Cafe Roma" }
+  },
+  "expectedRequestBody": {
+    "tracker": "finance",
+    "owner_type": "transaction",
+    "owner_id": "123",
+    "event_type": "transaction_created",
+    "action": "created",
+    "occurred_at": "2026-09-16T00:00:00.000Z",
+    "category": "dining",
+    "amount": 42.5,
+    "label": "Dinner at Cafe Roma",
+    "color": null,
+    "link": null,
+    "metadata": { "merchant": "Cafe Roma" }
+  },
+
+  "pushInputWithKind": {
+    "owner_type": "recurring_item",
+    "owner_id": "7",
+    "event_type": "recurring_item_expected",
+    "action": "updated",
+    "occurred_at": "2026-10-01",
+    "kind": "forecast",
+    "category": null,
+    "amount": null,
+    "label": null,
+    "metadata": {}
+  },
+  "expectedRequestBodyWithKind": {
+    "tracker": "finance",
+    "owner_type": "recurring_item",
+    "owner_id": "7",
+    "event_type": "recurring_item_expected",
+    "action": "updated",
+    "occurred_at": "2026-10-01",
+    "kind": "forecast",
+    "category": null,
+    "amount": null,
+    "label": null,
+    "color": null,
+    "link": null,
+    "metadata": {}
+  },
+
+  "expectedUrl": "http://trackstack-gateway.invalid/api/calendar/entries",
+  "expectedAuthorizationHeader": "Bearer fixture-token",
+  "successResponseStatus": 200,
+  "notFoundResponseStatus": 401,
+
+  "$behavior": [
+    "Given pushInput (no kind) with tracker='finance': POST expectedUrl with body == expectedRequestBody (tracker injected server-side-of-the-client, kind omitted from the body entirely since pushInput has no kind field), Authorization header == expectedAuthorizationHeader. A response with successResponseStatus resolves true.",
+    "Given pushInputWithKind (kind: 'forecast'): the sent body must equal expectedRequestBodyWithKind -- kind is passed through verbatim, everything else unchanged.",
+    "color is always present in the sent body (unlike kind, which is omitted entirely when absent) -- null when pushInput/pushInputWithKind doesn't set one, passed through verbatim otherwise.",
+    "link behaves exactly like color: always present, null when unset, passed through verbatim otherwise.",
+    "A non-2xx response (e.g. notFoundResponseStatus) resolves false, never throws or rejects.",
+    "A network/connection failure resolves false, never throws or rejects -- the caller's own request must never fail because a calendar push failed."
+  ]
+}
