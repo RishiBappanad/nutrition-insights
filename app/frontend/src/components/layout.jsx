@@ -15,9 +15,10 @@ import {
   Refrigerator,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { AppSwitcher, MobileAppSwitcher } from 'trackstack-ui'
+import { AppSwitcher, MobileAppSwitcher, ICON_COMPONENTS, usePinnedTrackers, useAppRegistry } from 'trackstack-ui'
 
 const TRACKSTACK_AUTH_URL = import.meta.env.VITE_TRACKSTACK_AUTH_URL ?? ''
+const CUSTOM_API_BASE = import.meta.env.VITE_CUSTOM_API_BASE ?? ''
 const CURRENT_APP_ID = 'nutrition'
 
 // Log Food, Recipes, and Meals are intentionally NOT persistent sidebar
@@ -37,15 +38,32 @@ const navItems = [
   { href: '/settings', label: 'Settings', icon: Settings },
 ]
 
-export function Layout({ children, onLogout }) {
+export function Layout({ children, onLogout, token }) {
   const [location] = useLocation()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+
+  // A pinned custom tracker is meant to be reachable from every
+  // TrackStack app's own AppSwitcher, not just Home's -- see
+  // APP_INTERFACE_SPEC.md §3 and trackstack-ui's usePinnedTrackers. A
+  // pinned tracker's own page only exists on Home, so its href is
+  // Home's own registered base URL (from the SAME registry AppSwitcher
+  // itself reads) plus the tracker's path -- never this app's own origin.
+  const pinnedTrackers = usePinnedTrackers(CUSTOM_API_BASE, token)
+  const apps = useAppRegistry(TRACKSTACK_AUTH_URL)
+  const homeHref = apps.find((a) => a.id === 'home')?.href ?? ''
+  const extraItems = pinnedTrackers.map((t) => ({
+    id: `custom_${t.slug}`,
+    label: t.name,
+    href: `${homeHref}/trackers/${t.slug}`,
+    icon: t.icon,
+    active: false,
+  }))
 
   return (
     <div className="flex min-h-screen w-full bg-background">
       {/* Desktop: App Switcher + Sidebar */}
       <div className="hidden md:flex">
-        <AppSwitcher authBaseUrl={TRACKSTACK_AUTH_URL} currentAppId={CURRENT_APP_ID} />
+        <AppSwitcher authBaseUrl={TRACKSTACK_AUTH_URL} currentAppId={CURRENT_APP_ID} iconMap={ICON_COMPONENTS} extraItems={extraItems} />
         <aside className="w-56 flex-shrink-0 bg-sidebar border-r border-sidebar-border flex flex-col">
           <div className="h-14 flex items-center px-5 border-b border-sidebar-border">
             <div className="flex items-center gap-2 text-sidebar-foreground">
@@ -97,7 +115,7 @@ export function Layout({ children, onLogout }) {
       {/* Main content wrapper */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Mobile: App switcher bar + header */}
-        <MobileAppSwitcher authBaseUrl={TRACKSTACK_AUTH_URL} currentAppId={CURRENT_APP_ID} />
+        <MobileAppSwitcher authBaseUrl={TRACKSTACK_AUTH_URL} currentAppId={CURRENT_APP_ID} iconMap={ICON_COMPONENTS} extraItems={extraItems} />
         <header className="h-12 md:hidden flex items-center justify-between px-4 border-b border-border bg-card">
           <div className="flex items-center gap-2">
             <Apple className="h-4 w-4 text-primary" />

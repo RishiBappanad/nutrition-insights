@@ -2,6 +2,20 @@
 
 @import "tailwindcss";
 
+/* Tailwind v4's automatic content detection scans from this file's own
+   directory outward and does not look inside node_modules -- so a class
+   used ONLY inside trackstack-ui (AppSwitcher's `w-10`, `bg-switcher`,
+   etc.) never gets generated here, even though trackstack-ui itself is a
+   real dependency being imported and rendered. Found 2026-10-02: every
+   AppSwitcher icon was rendering unstyled/shrunk to its own SVG size (20px
+   instead of the intended 40px button), on every size of this app -- not
+   a new regression, just never caught before. Same fix trackstack-ui's
+   own Home app already needed for the identical reason (see its
+   app/src/index.css's own comment on this), pointed at node_modules here
+   instead of a source alias since this app consumes the published/linked
+   package, not trackstack-ui's raw source. */
+@source "../node_modules/trackstack-ui";
+
 @theme inline {
   --color-background: hsl(var(--background));
   --color-foreground: hsl(var(--foreground));

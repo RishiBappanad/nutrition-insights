@@ -33,10 +33,10 @@ import Settings from '@/pages/settings'
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
 const AUTH_BASE_URL = import.meta.env.VITE_TRACKSTACK_AUTH_URL ?? ''
 
-function AppRoutes({ onLogout }) {
+function AppRoutes({ onLogout, token }) {
   return (
     <PendingActionProvider>
-      <Layout onLogout={onLogout}>
+      <Layout onLogout={onLogout} token={token}>
         <Switch>
           <Route path="/" component={Dashboard} />
           <Route path="/food-log" component={FoodLog} />
@@ -119,7 +119,7 @@ export default function App() {
 
   return (
     <Router base={BASE}>
-      <AppRoutes onLogout={logout} />
+      <AppRoutes onLogout={logout} token={auth.token} />
     </Router>
   )
 }
