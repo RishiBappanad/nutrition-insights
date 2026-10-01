@@ -50,7 +50,7 @@ GOAL_QUERY_PERIODS = ("daily", "weekly", "monthly")
 # "fixed_range" don't recur -- a standing target checked against the whole
 # history (or a fixed span), the same shape a vital goal already has (protein
 # "last" reading vs. all-time) -- something ATTAINABLE, that stays true once
-# reached. Decided 2026-09-27; see workspace-notes/RECURRING_AND_GOALS_SPEC.md.
+# reached. See workspace-notes/RECURRING_AND_GOALS_SPEC.md for the full model.
 TERM_EVERYDAY = "everyday"
 TERM_LONG_TERM = "long_term"
 _LONG_TERM_WINDOW_KINDS = ("all_time", "fixed_range")
@@ -125,11 +125,9 @@ class GoalQuery:
     # for that nutrient name, joined to domain_events by (owner_type,
     # owner_id) -- the extension that makes macro/micronutrient targets
     # (protein grams, sodium mg, etc.) expressible, since those live in
-    # nutrient_facts, not on the domain_events row itself (see
-    # RECURRING_AND_GOALS_SPEC.md's 2026-09-23 "known limitation" note,
-    # closed 2026-09-24 by this field). Additive and backward-compatible:
-    # every existing goal (finance's, and this tracker's own pre-existing
-    # calorie goals) simply never sets it and behaves exactly as before.
+    # nutrient_facts, not on the domain_events row itself. Additive and
+    # backward-compatible: every existing goal (finance's, and this
+    # tracker's own calorie goals) simply never sets it.
     measure_field: Optional[str] = None
     # A multiplier applied to the evaluated value (None = 1). On a goal's
     # reference_query it's what turns "compare against another measure"
@@ -181,10 +179,8 @@ def parse_goal_query(value) -> Union[GoalQuery, str]:
     string naming the first problem -- never raises, matching this
     project's request-validation convention elsewhere. Accepts either
     `timeWindow` (camelCase, the real wire format every tracker's own
-    goals already use -- see finance-tracker's RECURRING_AND_GOALS_SPEC.md
-    correction, 2026-09-20) or `time_window` (snake_case) on input, same
-    lenient-input/canonical-output shape goal-query.ts's own
-    parseGoalQuery already established."""
+    goals use) or `time_window` (snake_case) on input, same lenient-input/
+    canonical-output shape goal-query.ts's own parseGoalQuery establishes."""
     if not isinstance(value, dict):
         return "must be an object"
 
@@ -380,11 +376,11 @@ def resolve_time_window(tw: TimeWindow, now: Optional[datetime] = None) -> list[
 
 def _current_state_cte(user_id_param: int, exclude_event_id_param: Optional[int]) -> str:
     """domain_events is an append-only CRUD log -- a row per create/update/
-    delete, not one row per owner. Summing `amount` directly over it
-    double-counts every owner that's ever been edited more than once (the
-    exact bug finance-tracker found live, 2026-09-19, in its own copy of
-    this same design). The fix, ported verbatim: a CTE that collapses
-    each CRUD-tracked owner (event_type ending in _created/_updated/
+    delete, not one row per owner. Summing `amount` directly over it would
+    double-count every owner that's ever been edited more than once (the
+    same failure mode finance-tracker's own copy of this design must also
+    guard against). The fix: a CTE that collapses each CRUD-tracked owner
+    (event_type ending in _created/_updated/
     _deleted) down to its single latest row, dropping owners whose latest
     row is a deletion. "Occurrence" events (event_type not matching that
     suffix, e.g. goal_met/goal_exceeded) are independent, repeatable
@@ -495,8 +491,8 @@ async def compute_measure_for_date(conn, user_id: int, query: GoalQuery, date_st
     """Evaluates a GoalQuery's measure over exactly one calendar date,
     ignoring the query's OWN configured time window entirely -- the
     dashboard's per-date progress view (routers/targets.py's GET
-    /progress, rewired 2026-09-24 to read from goals) needs "how much of
-    X happened on THIS specific date" for a date the user is actively
+    /progress, which reads from goals) needs "how much of X happened on
+    THIS specific date" for a date the user is actively
     navigating to (today, yesterday, any day), which is a different
     question from a goal's own "current period relative to now" framing
     that evaluate_goal_query answers. Reuses compute_aggregate_for_range

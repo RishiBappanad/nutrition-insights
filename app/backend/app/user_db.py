@@ -59,12 +59,8 @@ async def _upsert_vital(conn, user_id: int, date: str, metric: str, value: float
 
 
 def compute_orm(weight: float, reps: int) -> float:
-    """Estimate 1RM using Brzycki (reps<=10) or Epley (reps>10). Moved
-    here from routers/data.py 2026-09-05 when Hevy sync was removed
-    (see archive/hevy_fitness_tracker/) -- this formula is generic 1RM
-    math, not Hevy-specific, so it's shared by the manual POST
-    /lifts/log stand-in instead of living only inside the removed sync
-    code."""
+    """Estimate 1RM using Brzycki (reps<=10) or Epley (reps>10). Generic
+    1RM math, shared by the manual POST /lifts/log path."""
     if reps <= 0 or weight <= 0:
         return 0
     if reps == 1:

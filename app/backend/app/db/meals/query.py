@@ -189,9 +189,9 @@ async def get_combined_meal_log_entry(food_log_id: int, user_id: int, meal_id: i
 
 
 async def replace_combined_entry_with_items(food_log_id: int, user_id: int, date: str, meal_label: str, items) -> list:
-    # NOTE: the DELETE below intentionally has no user_id check, matching
-    # the original -- ownership is already confirmed by the caller's
-    # earlier get_combined_meal_log_entry() lookup before this runs.
+    # NOTE: the DELETE below intentionally has no user_id check --
+    # ownership is already confirmed by the caller's earlier
+    # get_combined_meal_log_entry() lookup before this runs.
     """Deletes the one combined food_log entry (+ its nutrient_facts) and
     inserts one food_log entry per meal item, all in one transaction."""
     pool = await get_pool()

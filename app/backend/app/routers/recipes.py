@@ -44,8 +44,8 @@ class RecipeRequest(BaseModel):
     name: str
     servings_per_batch: float = 1.0
     # Leave unset to auto-compute as whichever category contributes the
-    # most total calories across `items` (explicit user decision,
-    # 2026-09-08); set explicitly to override that default. On update,
+    # most total calories across `items`; set explicitly to override
+    # that default. On update,
     # omitting this preserves whatever the recipe already has (an
     # earlier override stays an override; an earlier auto-computed value
     # gets recomputed from the new items) -- see update_recipe.

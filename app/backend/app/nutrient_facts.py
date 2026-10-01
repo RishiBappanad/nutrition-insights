@@ -6,16 +6,10 @@ whatever's added later) references the ONE nutrient_facts table (see
 db.py) by (owner_type, owner_id) instead of getting its own hand-rolled
 X_nutrients table plus its own duplicate read/write SQL.
 
-This directly replaces food_log_nutrients, pantry_item_nutrients,
-custom_food_nutrients, recipe_item_nutrients, and meal_item_nutrients
-(migrated into nutrient_facts in db.py's init_db, 2026-08-27) — 5
-byte-for-byte identical tables that had 6 independent hand-rolled read
-implementations and 2 independent (one a hand-duplicate) write
-implementations scattered across 5 router files. That duplication was the
-root cause of a single nutrient-related change needing to touch 5+ files:
-adding a 6th "loggable item with named sub-attributes" concept used to
-mean a new table plus new read/write SQL; now it means one new
-OWNER_TYPES entry.
+This is the one place nutrient read/write/delete SQL lives for every
+owner type -- adding a 6th "loggable item with named sub-attributes"
+concept means one new OWNER_TYPES entry, never a new table or new
+read/write SQL (see CLAUDE.md's "Named Sub-Attributes" pattern).
 
 owner_type is a plain string discriminator, not a foreign key — Postgres
 has no polymorphic FK across 5 different parent tables in one column.
@@ -43,11 +37,10 @@ OWNER_TYPES = {
 
 def _nutrients_to_rows(owner_type: str, owner_id: int, nutrients: dict) -> list[tuple]:
     """Normalize a {name: {value, unit}} dict into nutrient_facts rows,
-    silently dropping any entry missing a numeric value — this is the ONE
-    normalization implementation now (previously duplicated verbatim
-    between food_entry_contract.py and routers/custom_foods.py, and
-    reimplemented slightly differently again in routers/meals.py and
-    routers/recipes.py)."""
+    silently dropping any entry missing a numeric value — the ONE
+    normalization implementation; callers (food_entry_contract.py,
+    routers/custom_foods.py, routers/meals.py, routers/recipes.py) use
+    this rather than reimplementing it."""
     rows = []
     for name, info in (nutrients or {}).items():
         if not isinstance(info, dict):

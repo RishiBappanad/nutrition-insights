@@ -1,16 +1,15 @@
 """Manual strength-training log -- a deliberately minimal stand-in for
-the Hevy-fed lift_orm data this app used to sync automatically (removed
-2026-09-05, see archive/hevy_fitness_tracker/ for the removed
-integration and why: nutrition and fitness are separate trackers per
+automatic lift-tracking sync (see archive/hevy_fitness_tracker/ for a
+removed integration): nutrition and fitness are separate trackers per
 CLAUDE.md's tenets, and TrackStack itself should merge them, not one
-tracker's app owning another domain's sync integration).
+tracker's app owning another domain's sync integration.
 
-This is intentionally not a full lift-tracking experience ("just a
-dummy" per the decision to defer real set-by-set strength tracking to a
-future, separate fitness tracker) -- one logged weight x reps set in,
-one estimated 1RM out, written straight into the same lift_orm table
-Hevy sync used to populate, so Charts' Exercise tab and Lift Insights
-keep working unchanged, just fed manually instead of by sync."""
+This is intentionally not a full lift-tracking experience -- real
+set-by-set strength tracking is deferred to a future, separate fitness
+tracker. One logged weight x reps set in, one estimated 1RM out,
+written straight into the lift_orm table, so Charts' Exercise tab and
+Lift Insights work from manually-entered data the same as they would
+from a synced source."""
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 

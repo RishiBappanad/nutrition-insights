@@ -6,11 +6,8 @@ three separate item types.
 
 Nutrition is stored PER serving_size/serving_unit (the same "reference
 amount, scale by count" convention custom_foods uses) so that consuming
-or removing an item can reflect real nutrition in the diary without the
-caller re-entering it every time — this was a real gap fixed per user
-request (previously a pantry item stored zero nutrition and /consume
-silently logged 0 macros unless a caller happened to resupply them,
-which the frontend never did)."""
+or removing an item reflects real nutrition in the diary without the
+caller re-entering it every time."""
 from datetime import date as date_cls, timedelta
 from typing import Optional
 

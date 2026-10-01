@@ -4,13 +4,11 @@ reference amount, compute the proportionally-scaled nutrients for a
 different amount (e.g. 100g reference -> 250g requested = 2.5x every
 nutrient).
 
-This did not exist anywhere in the codebase before this module — verified
-by search: `serving_size` was stored as a plain field on food_log/
-pantry_items but nothing ever multiplied nutrient values by it. Every
-caller (food logging, pantry consume, recipes, meals) was implicitly
-relying on the frontend (which doesn't exist yet) to have already done
-this math before submitting a request. This module is the single,
-shared implementation so no caller reimplements the scaling formula.
+`serving_size` is stored as a plain field on food_log/pantry_items, but
+nothing multiplies nutrient values by it elsewhere -- every caller (food
+logging, pantry consume, recipes, meals) relies on this module as the
+single, shared implementation so none of them reimplement the scaling
+formula themselves.
 
 Two scaling modes, matching how food reference data actually varies:
 - Gram-based: the food's serving is a real gram weight (USDA/CNF usually

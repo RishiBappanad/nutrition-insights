@@ -1,7 +1,5 @@
 """Storage for nutrient/macro targets, which live in the `goals` table
-since the 2026-09-24 Targets/Goals unification (previously separate
-nutrition_targets/macro_target_settings tables -- see db/__init__.py's
-migration and app/nutrition_targets.py for the conventions):
+(see app/nutrition_targets.py for the conventions):
 
   source = 'dri_default'  auto-seeded DRI nutrient target (floor = a gte
                           goal, ceiling = an lte goal, both daily)

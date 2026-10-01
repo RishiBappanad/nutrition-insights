@@ -19,10 +19,9 @@ future mobile app, a Shortcut) can use to build the same grouped UI
 without re-deriving the grouping itself — matches the project's
 "every capability is a real backend endpoint" requirement.
 
-Separately (2026-08-27): a logged entry's nutrients dict was being handed
-back to every caller in whatever order Postgres happened to return
-food_log_nutrients rows in (effectively arbitrary, no ORDER BY) — order_
-nutrients() below fixes that by sorting into Cronometer's own report
+Separately: a logged entry's nutrients dict has no inherent order coming
+back from Postgres (no ORDER BY on the underlying rows) — order_
+nutrients() below imposes one, sorting into Cronometer's own report
 layout: Protein, then Carbohydrate (with its sub-nutrients immediately
 after — Fiber/Sugars/Starch), then Fat (with its sub-nutrients —
 saturated/mono/poly/trans fat, cholesterol), then Alcohol, then a small

@@ -176,10 +176,10 @@ async def consume_pantry_item(item_id: int, user_id: int, servings: float, date:
                 source=item["source"], source_id=item["source_id"],
                 metadata={"meal": meal, "consumed_from_pantry_item": item_id},
                 # The entry's own date, not "now": Goals/Targets bucket
-                # consumption by occurred_at, so omitting this filed a
-                # backdated (or future-dated) pantry consume under the day it
-                # was clicked -- found 2026-09-24 when the dashboard's
-                # progress moved onto the event log.
+                # consumption by occurred_at, so using the current
+                # timestamp here would file a backdated (or future-dated)
+                # pantry consume under the day it was clicked instead of
+                # the day it's for.
                 occurred_at=date,
             )
 

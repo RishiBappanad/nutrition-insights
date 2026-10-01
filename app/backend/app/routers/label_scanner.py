@@ -11,10 +11,9 @@ separately POSTs to /custom-foods (already built) to actually persist it
 — scanning and saving are two explicit steps, matching finance-tracker's
 receipt /scan + separate confirm flow, not one auto-committing action.
 
-No Gemini/genai dependency existed anywhere in this backend before this
-module — confirmed via search. GEMINI_API_KEY must be set in env to
-enable it; without it, every call returns manual_required immediately
-rather than failing, same contract finance-tracker already established.
+GEMINI_API_KEY must be set in env to enable this; without it, every
+call returns manual_required immediately rather than failing, same
+contract finance-tracker already establishes.
 """
 import base64
 import json

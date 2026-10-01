@@ -12,11 +12,11 @@ converter function that produces one of these models, not touching the
 storage layer or duplicating the INSERT logic that routers/food.py and
 routers/recipes.py already have.
 
-Concretely, this replaces what used to be routers/sync.py's own direct
-SQL inserts into food_log/food_log_nutrients (a real, now-fixed coupling
-issue — the sync path used to bypass POST /food/log's logic entirely,
-meaning any future change to how a food log entry is validated/scaled/
-stored would silently NOT apply to Cronometer-synced entries).
+This keeps routers/sync.py from inserting directly into food_log/
+food_log_nutrients on its own: without this contract, a sync path could
+bypass POST /food/log's validation/scaling logic entirely, so a future
+change to how a food log entry is processed could silently fail to
+apply to Cronometer-synced entries.
 """
 import json
 from datetime import date, datetime, time, timezone
@@ -52,7 +52,7 @@ class FoodLogEntryContract(BaseModel):
     serving_size: float = 1.0
     serving_unit: str = "serving"
     # `calories` is the sole top-level numeric field — TrackStack's
-    # "amount" for this tracker (Event Contract decision, 2026-08-26).
+    # "amount" for this tracker (see the Universal Event Contract).
     # Protein/carbs/fat/fiber are NOT top-level fields here; they're
     # expected under nutrients["Protein"]/["Carbohydrate, by difference"]/
     # ["Total lipid (fat)"]/["Fiber, total dietary"] like every other
@@ -84,8 +84,8 @@ class RecipeImportContract(BaseModel):
 
     `category`, left unset: import_recipe() computes the recipe's own
     category as whichever category contributes the most total calories
-    across `items` (explicit user decision, 2026-09-08) and stores that
-    as the auto-computed default. Set `category` explicitly to override
+    across `items` and stores that as the auto-computed default. Set
+    `category` explicitly to override
     that default instead — this is also how a human user overriding a
     recipe's category at creation time flows through (see
     routers/recipes.py's create_recipe, which delegates to

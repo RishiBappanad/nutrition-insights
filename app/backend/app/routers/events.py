@@ -8,15 +8,14 @@ domain-specific endpoints (POST /food/log, POST /exercise, POST
 /pantry, etc.), which stay exactly as they are and remain the primary
 way this app's own frontend talks to its own backend.
 
-As of 2026-09-14, GET /events and GET /aggregations read from
-`domain_events` (see db/__init__.py's table comment and
-app/domain_events.py) instead of deriving events live from food_log/
-exercise_log's CURRENT rows -- the earlier approach could only ever
-answer "this exists right now," never "this was updated" or "this was
-deleted after the fact," which is exactly the gap a user reported: a
-pantry item being consumed down to zero and removed is real,
-contract-worthy information, not something that should just vanish
-from the record. event_type follows the "<entity>_<action>" convention
+GET /events and GET /aggregations read from `domain_events` (see
+db/__init__.py's table comment and app/domain_events.py) rather than
+deriving events live from food_log/exercise_log's CURRENT rows --
+deriving live can only ever answer "this exists right now," never
+"this was updated" or "this was deleted after the fact." A pantry item
+being consumed down to zero and removed is real, contract-worthy
+information that would otherwise just vanish from the record.
+event_type follows the "<entity>_<action>" convention
 todo-tracker's todo_events already established (e.g.
 "food_log_created", "pantry_item_deleted"), generalized here across
 every entity that logs domain_events -- currently food_log,
@@ -256,9 +255,9 @@ async def get_aggregations(
 ):
     """Sums `amount` grouped by the requested dimension, across every
     domain_events row in range regardless of event_type (created,
-    updated, deleted all count) -- unlike the pre-2026-09-14 version,
-    this can now double-count the "same" real-world food/activity if,
-    say, a pantry item's creation and its later consumption-triggered
+    updated, deleted all count) -- this can double-count the "same"
+    real-world food/activity if, say, a pantry item's creation and its
+    later consumption-triggered
     deletion both fall in the requested range and both carry a
     calorie-shaped amount. That's an intentional tradeoff of moving to a
     real CRUD log rather than a live-table snapshot: revisit if a real

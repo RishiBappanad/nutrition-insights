@@ -11,12 +11,10 @@ router = APIRouter()
 
 
 VALID_SEARCH_SOURCES = {"USDA", "CNF", "recipe", "meal", "pantry"}
-# "recipe" and "meal" default on to preserve this endpoint's original
-# behavior (own recipes/meals always included) for any caller not passing
-# `sources` explicitly. "pantry" defaults off -- it was never part of the
-# result set before this became a selectable source (added 2026-09-10 per
-# user request), so an unfiltered caller shouldn't suddenly see pantry
-# items mixed into results they weren't there before.
+# "recipe" and "meal" default on (own recipes/meals always included) for
+# any caller not passing `sources` explicitly. "pantry" defaults off, so
+# an unfiltered caller doesn't unexpectedly see pantry items mixed into
+# search results.
 DEFAULT_SEARCH_SOURCES = "USDA,CNF,recipe,meal"
 
 
@@ -106,14 +104,10 @@ async def _search_user_recipes(user_id: int, query: str) -> list[dict]:
                 "id": str(recipe["id"]),
                 "name": recipe["name"],
                 "brand": "",
-                # This used to be the hardcoded string "Recipe" -- a
-                # UI-facing "what kind of result is this" label that
-                # collided with the real food-type category field added
-                # 2026-09-08 (app/food_category.py). The `recipe`/`meal`/
-                # `recipeOrMeal` booleans below already cover "what kind of
-                # result," and confirmed nothing in the frontend reads
-                # `.category`'s string value, so this now carries the
-                # recipe's actual resolved category instead.
+                # Carries the recipe's actual resolved food-type category
+                # (app/food_category.py), not a "what kind of result is
+                # this" label -- the `recipe`/`meal`/`recipeOrMeal`
+                # booleans below already cover that distinction.
                 "category": recipe["category"],
                 "nutrients": {
                     # per_serving_nutrients already carries "Protein",
@@ -283,9 +277,8 @@ async def log_food(
     the requested amount before storing — the caller sends the food's
     reference (unscaled) values plus the target amount, not pre-scaled
     numbers, so the actual multiplication happens in one place
-    (portion_scaling.py) instead of being reimplemented by every caller
-    (or, before this existed, not implemented at all). If `scale_to` is
-    omitted, the request body's top-level fields are stored exactly as
+    (portion_scaling.py) instead of being reimplemented by every caller.
+    If `scale_to` is omitted, the request body's top-level fields are stored exactly as
     given — unchanged behavior for existing callers.
       - mode="grams": {"from_grams": 118, "to_grams": 250} — for foods
         with a real gram-based reference (USDA/CNF's serving_size, when

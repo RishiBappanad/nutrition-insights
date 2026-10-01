@@ -107,9 +107,9 @@ def dominant_category_by_calories(items: list[dict]) -> Optional[FoodCategory]:
     """Given a recipe/meal's items as [{"category": FoodCategory|str|None, "calories": float}, ...],
     return the category of whichever items together contribute the most
     total calories -- the default for a composite item's own category,
-    per explicit user decision (2026-09-08): calories, not ingredient
-    count or weight, since that's the dimension that matters for this
-    use case. Items with no category are excluded from the calorie
+    chosen by calories rather than ingredient count or weight, since
+    that's the dimension that matters for this use case. Items with no
+    category are excluded from the calorie
     totals (an uncategorized ingredient doesn't get to silently win by
     default). Returns None if no item has both a category and positive
     calories -- caller decides the fallback (e.g. DEFAULT_CATEGORY) in
@@ -138,15 +138,13 @@ def resolve_category(
     or meal) get, and is that a user override or an auto-computed
     default" is decided -- every router that owns a composite-item table
     (recipes.py, meals.py, food_entry_contract.py's import_recipe) calls
-    this instead of each re-implementing the same branching, which is
-    exactly what happened once already before this function existed
-    (see workspace-notes/ACTION_ITEMS.md's 2026-09-08 entry).
+    this instead of each re-implementing the same branching.
 
     Rule, in order:
       1. `explicit` (a value the caller's request itself set) always wins.
       2. Otherwise, `existing` (the row's current {"category",
-         "category_is_custom"} before this save, or None for a brand new
-         item) is checked: if it was already a user override, that
+         "category_is_custom"} prior to this save, or None for a brand
+         new item) is checked: if it was already a user override, that
          override is preserved rather than silently recomputed out from
          under them.
       3. Otherwise, recompute via dominant_category_by_calories(items),

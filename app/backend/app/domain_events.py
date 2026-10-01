@@ -51,10 +51,9 @@ async def log_domain_event(
     asyncpg's timestamptz codec requires an actual date/datetime
     instance, not a string, once the column resolves to timestamptz."""
     # UTC midnight, explicitly: passing a bare `date` lets asyncpg localize
-    # it in the *client process's* timezone (found 2026-09-24 -- a dev
-    # machine in US Eastern wrote 04:00 UTC), which would make per-day
+    # it in the client process's own timezone, which would make per-day
     # bucketing (Goals/Targets read this column in UTC days) depend on
-    # wherever the write happened to run.
+    # wherever the write happens to run.
     occurred_at_value = (
         datetime.combine(date.fromisoformat(occurred_at), time.min, tzinfo=timezone.utc) if occurred_at else None
     )

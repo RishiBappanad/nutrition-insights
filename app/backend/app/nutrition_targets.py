@@ -1,10 +1,8 @@
 """
 Nutrition targets service: DRI seeding, macro target resolution, and
-per-nutrient progress computation -- all backed by the `goals` table since
-the 2026-09-24 Targets/Goals unification (see db/targets/query.py for the
-source-column conventions, and db/__init__.py for the one-time migration
-that moved the old nutrition_targets/macro_target_settings tables here).
-A "target" is just a daily goal: a nutrient's RDA floor is a gte goal, its
+per-nutrient progress computation -- all backed by the `goals` table
+(see db/targets/query.py for the source-column conventions). A "target"
+is just a daily goal: a nutrient's RDA floor is a gte goal, its
 UL ceiling an lte goal, both measuring `nutrient:<Name>` over food_log
 consumption.
 
@@ -91,8 +89,7 @@ async def seed_dri_targets(user_id: int, sex: str, age: int) -> int:
     profile edit (e.g. a birthday passing into a new age bracket) refresh
     the *defaults* without silently overwriting a value the user
     deliberately chose. A default whose UL no longer exists for the new
-    bracket is removed, matching the old behavior of overwriting
-    max_threshold with NULL.
+    bracket is removed rather than left stale.
 
     Returns the number of nutrients seeded.
     """

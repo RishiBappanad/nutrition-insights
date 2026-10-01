@@ -20,17 +20,11 @@ router = APIRouter()
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 VALID_NUTRIENT_NAMES = set(VITAMIN_GROUP) | set(MINERAL_GROUP)
 
-# Every color-coded element across the app that a user can currently see,
-# with a documented default matching what was hardcoded before this
-# feature existed:
-#   - macro_*: dashboard's MacroCard pie/legend segments (was: fixed CSS
-#     theme chart-1..4 vars)
-#   - nutrient_*: dashboard's MicronutrientCard status bars (was: fixed
-#     Tailwind color classes)
-#   - chart_line_1/2/3: pages/charts.jsx's up-to-3-selected-metric line
-#     palette (was: a hardcoded 3-item hsl() array, colors[idx % 3])
+# Every color-coded element across the app that a user can currently see:
+#   - macro_*: dashboard's MacroCard pie/legend segments
+#   - nutrient_*: dashboard's MicronutrientCard status bars
+#   - chart_line_1/2/3: pages/charts.jsx's up-to-3-selected-metric line palette
 #   - lift_scatter: pages/lift-insights.jsx's ORM scatter plot dot color
-#     (was: a hardcoded hsl() literal)
 # One source of truth here (not hardcoded separately per-page in the
 # frontend) — the frontend fetches this via GET and only falls back to
 # these same literal values if the request fails entirely (e.g. offline).

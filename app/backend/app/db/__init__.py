@@ -201,14 +201,10 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_food_log_date ON food_log(user_id, date);
             CREATE INDEX IF NOT EXISTS idx_water_log_date ON water_log(user_id, date);
 
-            -- TDEE/BMR tracking data. Was previously a local CSV file
-            -- (app_data/user_{id}/tdee_tracking_log.csv) baked into the
-            -- container image with no persistent volume mount -- writes
-            -- during a request lived only as long as that container
-            -- instance, so BMR was computed against partial/reset
-            -- history depending on which instance handled the request.
-            -- This table is the fix: same one-row-per-(user,date) shape
-            -- as the CSV, but durable, matching every other table here.
+            -- TDEE/BMR tracking data, one row per (user, date) -- lives
+            -- in Postgres rather than a local file since Cloud Run
+            -- container disk is ephemeral and not shared across
+            -- instances.
             CREATE TABLE IF NOT EXISTS tdee_log (
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
                 date TEXT NOT NULL,
@@ -232,15 +228,10 @@ async def init_db():
             -- its own nutrition data (calories + nutrient_facts,
             -- owner_type='pantry_item', which carries protein/carbs/
             -- fat/fiber and every other non-macro nutrient), PER
-            -- serving_size/serving_unit,
-            -- the same "reference amount + scale by count" convention
-            -- custom_foods uses. This was NOT true originally (a pantry
-            -- item stored zero nutrition, relying on the caller to
-            -- resupply it at /consume time, which the frontend never did
-            -- -- consuming anything silently logged 0 macros to the
-            -- diary). Fixed per explicit user request: removing/eating a
-            -- pantry item must reflect real nutrition in the diary
-            -- without the caller re-entering it.
+            -- serving_size/serving_unit, the same "reference amount +
+            -- scale by count" convention custom_foods uses -- so that
+            -- consuming or removing a pantry item reflects real
+            -- nutrition in the diary without the caller re-entering it.
             CREATE TABLE IF NOT EXISTS pantry_items (
                 id SERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
@@ -327,9 +318,8 @@ async def init_db():
             -- Resolved food-type category for the recipe as a whole.
             -- Defaults to whichever category contributes the most total
             -- calories across the recipe's items (see
-            -- food_category.dominant_category_by_calories) -- explicit
-            -- user decision, 2026-09-08, over weight- or count-based
-            -- alternatives. category_is_custom mirrors
+            -- food_category.dominant_category_by_calories), chosen over
+            -- weight- or count-based alternatives. category_is_custom mirrors
             -- nutrition_targets.is_custom's pattern: distinguishes "user
             -- explicitly picked this" from "still the auto-computed
             -- default," so editing the recipe's ingredients later only
@@ -438,15 +428,13 @@ async def init_db():
             ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS important_nutrients_json TEXT;
 
             -- Two independent sync pointers, per user, for the two-way
-            -- Cronometer sync: last_pulled_at tracks how far the
-            -- Cronometer -> TrackStack diary import has progressed (used
-            -- to only import entries newer than the last successful
-            -- sync, instead of re-parsing the full export range every
-            -- time -- fixes the duplicate-import issue flagged when the
-            -- read path was first built). last_pushed_at tracks how far
-            -- the TrackStack -> Cronometer push has progressed (used to
-            -- find food_log entries logged since the last push that
-            -- still need to go to Cronometer). Deliberately two separate
+            -- Cronometer sync: last_pulled_at lets the Cronometer ->
+            -- TrackStack diary import only pull entries newer than the
+            -- last successful sync, instead of re-parsing the full
+            -- export range (and duplicate-importing) every time.
+            -- last_pushed_at lets the TrackStack -> Cronometer push find
+            -- food_log entries logged since the last push that still
+            -- need to go out. Deliberately two separate
             -- timestamps, not one shared pointer -- the two directions
             -- run independently and can succeed/fail on different
             -- schedules (e.g. a pull succeeds but a push fails, or vice
@@ -488,13 +476,12 @@ async def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_exercise_log_user_date ON exercise_log(user_id, date);
 
-            -- Universal Event Contract's actual backing store (2026-09-14),
-            -- generalizing todo-tracker's todo_events pattern (one
-            -- append-only event log per tracker) across every domain
-            -- entity this tracker owns, rather than the previous approach
-            -- of GET /events deriving events live from food_log/
-            -- exercise_log's current rows -- which could only ever show
-            -- "this exists," never "this was updated" or "this was
+            -- Universal Event Contract's actual backing store, generalizing
+            -- todo-tracker's todo_events pattern (one append-only event
+            -- log per tracker) across every domain entity this tracker
+            -- owns. Deriving GET /events live from food_log/exercise_log's
+            -- current rows instead could only ever show "this exists,"
+            -- never "this was updated" or "this was
             -- deleted after the fact." One polymorphic table (owner_type,
             -- owner_id) + one shared helper (app/domain_events.py) that
             -- every mutating route calls into, same reasoning
@@ -601,7 +588,7 @@ async def init_db():
             -- exists, same convention as every other migration below.
             ALTER TABLE domain_events ADD COLUMN IF NOT EXISTS logged_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
-            -- One-time migration (2026-08-27): fiber and protein/carbs/fat
+            -- One-time migration: fiber and protein/carbs/fat
             -- used to be denormalized macro columns on food_log/
             -- pantry_items/custom_foods/recipe_items/meal_items, backfilled
             -- into their respective X_nutrients child table and dropped in
@@ -661,7 +648,7 @@ async def init_db():
                 END IF;
             END $$;
 
-            -- One-time migration (2026-09-24): Targets and Goals unified onto
+            -- One-time migration: Targets and Goals unified onto
             -- the `goals` table. nutrition_targets (per-nutrient DRI/custom
             -- daily_target + max_threshold) and macro_target_settings
             -- (calorie/macro targets, fixed or ratio) become goals rows in
@@ -768,7 +755,7 @@ async def init_db():
                 END IF;
             END $$;
 
-            -- Vitals for Goals (2026-09-24). Weight already lives in
+            -- Vitals for Goals. Weight already lives in
             -- daily_nutrition ("Weight (lbs)": Charts, Cronometer sync,
             -- POST /data/weight); to make a reading a goal-able domain_event
             -- (owner_type 'vital') each row needs an integer identity, which
@@ -796,7 +783,7 @@ async def init_db():
                   AND NOT EXISTS (SELECT 1 FROM domain_events e WHERE e.owner_type = 'vital' AND e.owner_id = dn.id);
             END $$;
 
-            -- One protein floor, not two (2026-09-24). A user who set macro
+            -- One protein floor, not two. A user who set macro
             -- targets also had the auto-seeded DRI protein floor: two goals
             -- asserting the same thing. The macro target is the one the user
             -- chose, so any DRI-sourced goal that duplicates a macro_target

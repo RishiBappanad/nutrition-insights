@@ -81,11 +81,9 @@ def _parse_tdee_rows(cronometer_files: dict) -> dict:
 
 async def _update_tdee_log(cronometer_files: dict, user_id: int) -> int:
     """Merge Cronometer exports into the tdee_log Postgres table (one
-    upsert per date with new data) — previously merged into a local CSV
-    file with no persistent volume behind it, so BMR was computed
-    against whatever partial/reset history happened to survive on the
-    specific Cloud Run instance handling the request. Returns the number
-    of dates updated."""
+    upsert per date with new data) -- Postgres rather than a local file
+    since Cloud Run container disk is ephemeral and not shared across
+    instances. Returns the number of dates updated."""
     from ..user_db import upsert_tdee_log
 
     parsed = _parse_tdee_rows(cronometer_files)
@@ -190,12 +188,10 @@ def _servings_row_to_food_log_entry(row: dict) -> "FoodLogEntryContract":
     meal = _MEAL_GROUP_MAP.get((row.get("Group") or "").strip().lower(), row.get("Group") or "Uncategorized")
     serving_size, serving_unit = _parse_amount(row.get("Amount", ""))
     food_name = row.get("Food Name", "").strip() or "Unknown"
-    # Cronometer's own "Category" column -- previously in
-    # _SERVINGS_NON_NUTRIENT_COLUMNS above and discarded entirely (a
-    # known, tracked gap since EVENT_CONTRACT_SPEC.md was drafted).
-    # Reuses the same USDA-taxonomy mapping search results use, since
-    # Cronometer's category values are that same taxonomy (confirmed
-    # real value "Fast Foods" against an actual export).
+    # Cronometer's own "Category" column. Reuses the same USDA-taxonomy
+    # mapping search results use, since Cronometer's category values are
+    # that same taxonomy (confirmed real value "Fast Foods" against an
+    # actual export).
     category = map_raw_category(row.get("Category"), food_name)
 
     return FoodLogEntryContract(
@@ -454,11 +450,11 @@ async def sync_cronometer(user_id: int = Depends(get_current_user)):
                 raise HTTPException(status_code=status_code, detail=f"Cronometer export unavailable (RPC: {rpc_error}; Web: {web_error})")
 
         # Processing below must run regardless of which path above produced
-        # `results` (RPC success, or web-scraper fallback success) -- this
-        # used to be nested inside `except Exception as rpc_error:` above,
-        # which meant it only ran on the fallback path. On the normal path
-        # (RPC succeeds, the common case), the endpoint returned 200 with no
-        # body and silently synced nothing at all. Fixed 2026-09-03.
+        # `results` (RPC success, or web-scraper fallback success) -- it
+        # must NOT be nested inside the `except Exception as rpc_error:`
+        # block above, since that would make it only run on the fallback
+        # path, silently skipping all syncing on the normal RPC-succeeds
+        # path.
         if results.get("biometrics"):
             _filter_biometrics(results["biometrics"])
         tdee_days_updated = await _update_tdee_log(results, user_id)
@@ -569,12 +565,11 @@ async def sync_bmr(user_id: int = Depends(get_current_user), push_to_cronometer:
 
 @router.post("/all")
 async def sync_all(user_id: int = Depends(get_current_user)):
-    """Run full sync pipeline. Hevy used to run here too -- removed
-    2026-09-05 along with POST /sync/hevy (see
-    archive/hevy_fitness_tracker/ for the removed code and why: fitness
-    and nutrition are separate trackers per CLAUDE.md's tenets, and
-    strength-training data now comes from the manual POST /lifts/log
-    stand-in instead of a synced integration owned by this app)."""
+    """Run full sync pipeline. Deliberately Cronometer-only: fitness and
+    nutrition are separate trackers per CLAUDE.md's tenets, so
+    strength-training data comes from the manual POST /lifts/log
+    stand-in (see archive/hevy_fitness_tracker/) rather than a synced
+    integration owned by this app."""
     results = {}
     try:
         crono = await sync_cronometer(user_id)

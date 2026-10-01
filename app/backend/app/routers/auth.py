@@ -67,10 +67,10 @@ async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(securit
 @router.post("/credentials")
 async def save_credentials(req: CredentialsRequest, user_id: int = Depends(get_current_user)):
     """hevy_username/hevy_password columns still exist on `credentials`
-    but are no longer written here -- Hevy sync was removed 2026-09-05
-    (see archive/hevy_fitness_tracker/ in the backend). Any value a user
-    saved previously is left untouched, not wiped, in case it's useful
-    when porting to a future fitness tracker."""
+    but are intentionally not written here (Hevy sync is inactive --
+    see archive/hevy_fitness_tracker/). Any value already stored there
+    is left untouched, not wiped, in case it's useful when integrating
+    a future fitness tracker."""
     await auth_query.save_credentials(
         user_id,
         encrypt(req.cronometer_username) if req.cronometer_username else None,

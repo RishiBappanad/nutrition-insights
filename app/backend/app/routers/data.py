@@ -23,9 +23,9 @@ def user_data_dir(user_id: int) -> Path:
 @router.get("/bmr")
 async def get_bmr(user_id: int = Depends(get_current_user)):
     """Get current calculated BMR, sourced from Postgres (tdee_log table)
-    — previously read a local CSV file with no persistent storage behind
-    it, so BMR was computed against whatever partial/reset history
-    happened to survive on the container instance handling the request."""
+    — Cloud Run container-local disk is ephemeral and not shared across
+    instances, so this data must live in Postgres rather than a local
+    file to stay consistent across requests."""
     from ..user_db import get_tdee_log as _get_tdee_log_rows
 
     records = await _get_tdee_log_rows(user_id)
