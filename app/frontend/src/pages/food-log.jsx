@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 import { todayIso } from '@/lib/dates'
 import { Search, Plus, CheckCircle, Info, ScanLine } from 'lucide-react'
 import { useFoodSearch } from '@/hooks/useFoodSearch'
-import { FoodPreviewCard } from '@/components/ui/food-preview-card'
+import { FoodPreviewModal } from '@/components/ui/food-preview-modal'
 import { LabelPhotoCaptureButton } from '@/components/label-photo-capture-button'
 import { BarcodeScannerModal } from '@/components/barcode-scanner-modal'
 
@@ -339,15 +339,6 @@ export default function FoodLog() {
             </div>
           )}
 
-          {previewing && (
-            <div className="space-y-2">
-              <button onClick={() => setPreviewing(null)} className="text-xs text-muted-foreground hover:text-foreground">
-                Close preview
-              </button>
-              <FoodPreviewCard result={previewing} />
-            </div>
-          )}
-
           {!searching && query.trim().length >= 2 && results.length === 0 && !searchError && (
             <p className="text-sm text-muted-foreground">No results. Try a different search term.</p>
           )}
@@ -452,6 +443,8 @@ export default function FoodLog() {
           onClose={() => setShowBarcodeScanner(false)}
         />
       )}
+
+      <FoodPreviewModal result={previewing} onClose={() => setPreviewing(null)} />
     </div>
   )
 }

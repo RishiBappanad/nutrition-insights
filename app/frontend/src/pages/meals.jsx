@@ -4,7 +4,7 @@ import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Plus, Save, CheckCircle, ArrowLeft, Layers, X, Info } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
 import { useFoodSearch } from '@/hooks/useFoodSearch'
-import { FoodPreviewCard } from '@/components/ui/food-preview-card'
+import { FoodPreviewModal } from '@/components/ui/food-preview-modal'
 
 // Protein/carbs/fat/fiber are deliberately NOT here — none of them are
 // macro fields on a meal item; they're sent/read entirely via the
@@ -319,7 +319,7 @@ function MealEditor({ mealId, onDone, onCancel }) {
                       onClick={() => addItem(r)}
                       className="flex-1 text-left px-3 py-2 text-sm hover:bg-muted transition-colors flex items-center justify-between gap-2 min-w-0"
                     >
-                      <span className="truncate">{r.name}</span>
+                      <span className="truncate">{r.name}{r.brand ? ` · ${r.brand}` : ''}</span>
                       <Plus className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
                     </button>
                     <button
@@ -335,14 +335,7 @@ function MealEditor({ mealId, onDone, onCancel }) {
             )}
           </div>
 
-          {previewing && (
-            <div className="space-y-2">
-              <button onClick={() => setPreviewing(null)} className="text-xs text-muted-foreground hover:text-foreground">
-                Close preview
-              </button>
-              <FoodPreviewCard result={previewing} />
-            </div>
-          )}
+          <FoodPreviewModal result={previewing} onClose={() => setPreviewing(null)} />
 
           {items.length === 0 ? (
             <p className="text-sm text-muted-foreground">No items added yet.</p>

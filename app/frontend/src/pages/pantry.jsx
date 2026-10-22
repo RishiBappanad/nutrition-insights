@@ -7,7 +7,7 @@ import { cn } from '@/lib/utils'
 import { Plus, Trash2, CheckCheck, AlertTriangle, X, Refrigerator, Share2, ChefHat, ChevronDown, ChevronRight, Info } from 'lucide-react'
 import { todayIso } from '@/lib/dates'
 import { useFoodSearch } from '@/hooks/useFoodSearch'
-import { FoodPreviewCard } from '@/components/ui/food-preview-card'
+import { FoodPreviewModal } from '@/components/ui/food-preview-modal'
 
 // Protein/carbs/fat/fiber are deliberately NOT here — none of them are
 // macro fields on a pantry item; they're sent/read entirely via the
@@ -606,7 +606,7 @@ function AddItemForm({ onDone, onCancel }) {
                     onClick={() => selectResult(r)}
                     className="flex-1 text-left px-3 py-2 text-sm hover:bg-muted transition-colors min-w-0 truncate"
                   >
-                    {r.name}
+                    {r.name}{r.brand ? ` · ${r.brand}` : ''}
                   </button>
                   <button
                     onClick={() => setPreviewing(previewing === r ? null : r)}
@@ -621,14 +621,7 @@ function AddItemForm({ onDone, onCancel }) {
           )}
         </div>
 
-        {previewing && (
-          <div className="space-y-2">
-            <button onClick={() => setPreviewing(null)} className="text-xs text-muted-foreground hover:text-foreground">
-              Close preview
-            </button>
-            <FoodPreviewCard result={previewing} />
-          </div>
-        )}
+        <FoodPreviewModal result={previewing} onClose={() => setPreviewing(null)} />
 
         <div className="space-y-1.5">
           <label className="text-xs font-medium text-muted-foreground">Tracking Mode</label>
