@@ -3,9 +3,11 @@ import { api } from '@/lib/api'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import { todayIso } from '@/lib/dates'
-import { Search, Plus, CheckCircle, Info } from 'lucide-react'
+import { Search, Plus, CheckCircle, Info, ScanLine } from 'lucide-react'
 import { useFoodSearch } from '@/hooks/useFoodSearch'
 import { FoodPreviewCard } from '@/components/ui/food-preview-card'
+import { LabelPhotoCaptureButton } from '@/components/label-photo-capture-button'
+import { BarcodeScannerModal } from '@/components/barcode-scanner-modal'
 
 const MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack']
 
@@ -49,6 +51,10 @@ export default function FoodLog() {
   const [previewing, setPreviewing] = useState(null)
   const [logging, setLogging] = useState(false)
   const [status, setStatus] = useState('')
+  const [scanResult, setScanResult] = useState(null)
+  const [scanError, setScanError] = useState('')
+  const [savingScan, setSavingScan] = useState(false)
+  const [showBarcodeScanner, setShowBarcodeScanner] = useState(false)
 
   function selectResult(result) {
     // Recipes are returned as search results per-serving (serving_size:
@@ -77,6 +83,67 @@ export default function FoodLog() {
       date: todayIso(),
     })
     setStatus('')
+  }
+
+  // Shared by both the label-photo scanner and the barcode scanner --
+  // they return slightly different fields (LabelScanResult has
+  // reference_amount/reference_unit, BarcodeScanResult doesn't) but both
+  // carry food_name/brand/reference_grams/calories/nutrients/
+  // suggested_matches/status, which is all this page needs.
+  function handleScanResult(result) {
+    setShowBarcodeScanner(false)
+    if (result.status === 'manual_required' || result.status === 'failed' || result.status === 'not_found') {
+      setScanError(result.error || 'Could not read that scan.')
+      setScanResult(null)
+      return
+    }
+    setScanError('')
+    setScanResult(result)
+  }
+
+  // A suggested match is a normal search result (same source/id/nutrients
+  // shape food_search.py already produces) -- selecting one reuses the
+  // exact same logging flow as typing a search query, no separate
+  // "linked item" concept needed.
+  function selectSuggestedMatch(match) {
+    selectResult(match)
+    setScanResult(null)
+  }
+
+  async function saveScanAsNewFood() {
+    if (!scanResult) return
+    setSavingScan(true)
+    try {
+      const res = await api('/custom-foods', {
+        method: 'POST',
+        body: JSON.stringify({
+          food_name: scanResult.food_name,
+          brand: scanResult.brand || null,
+          reference_amount: 1,
+          reference_unit: scanResult.reference_grams ? 'g' : (scanResult.reference_unit || 'serving'),
+          reference_grams: scanResult.reference_grams ?? null,
+          calories: scanResult.calories || 0,
+          nutrients: scanResult.nutrients || {},
+        }),
+      })
+      if (!res.ok) {
+        setScanError('Could not save this food.')
+        return
+      }
+      const created = await res.json()
+      selectResult({
+        source: 'custom',
+        id: created.id,
+        name: scanResult.food_name,
+        brand: scanResult.brand,
+        nutrients: scanResult.nutrients,
+        serving_size: scanResult.reference_grams || 100,
+        serving_unit: scanResult.reference_grams ? 'g' : 'serving',
+      })
+      setScanResult(null)
+    } finally {
+      setSavingScan(false)
+    }
   }
 
   async function handleLog() {
@@ -167,6 +234,73 @@ export default function FoodLog() {
               {searching ? 'Searching...' : ''}
             </div>
           </div>
+
+          <div className="flex items-center gap-2">
+            <LabelPhotoCaptureButton onResult={handleScanResult} onError={setScanError} />
+            <button
+              type="button"
+              onClick={() => { setScanError(''); setShowBarcodeScanner(true) }}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-md border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors"
+            >
+              <ScanLine className="h-4 w-4" />
+              Scan Barcode
+            </button>
+          </div>
+
+          {scanError && (
+            <p className="text-sm text-destructive">{scanError}</p>
+          )}
+
+          {scanResult && (
+            <div className="space-y-3 border border-border rounded-md p-3">
+              <div>
+                <p className="text-sm font-medium text-foreground">{scanResult.food_name}</p>
+                <p className="text-xs text-muted-foreground">
+                  {scanResult.brand && `${scanResult.brand} · `}
+                  {Math.round(scanResult.calories || 0)} kcal
+                  {scanResult.reference_grams ? ` per ${scanResult.reference_grams}g` : ''}
+                </p>
+              </div>
+
+              {scanResult.suggested_matches?.length > 0 && (
+                <div className="space-y-1.5">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    Matches an existing food in our database — use this instead of creating a duplicate:
+                  </p>
+                  {scanResult.suggested_matches.map((m) => (
+                    <button
+                      key={`${m.source}-${m.id}`}
+                      onClick={() => selectSuggestedMatch(m)}
+                      className="w-full text-left px-3 py-2 rounded-md border border-border hover:bg-muted transition-colors flex items-center justify-between gap-3"
+                    >
+                      <div className="min-w-0">
+                        <p className="text-sm text-foreground truncate">{m.name}</p>
+                        <p className="text-xs text-muted-foreground">{m.source}{m.brand ? ` · ${m.brand}` : ''}</p>
+                      </div>
+                      <Plus className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={saveScanAsNewFood}
+                  disabled={savingScan}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                >
+                  <Plus className="h-4 w-4" />
+                  {savingScan ? 'Saving...' : 'Save as new food'}
+                </button>
+                <button
+                  onClick={() => setScanResult(null)}
+                  className="px-4 py-2 rounded-md border border-border text-sm font-medium text-muted-foreground hover:bg-muted transition-colors"
+                >
+                  Discard
+                </button>
+              </div>
+            </div>
+          )}
 
           {sourceChips}
 
@@ -309,6 +443,14 @@ export default function FoodLog() {
       )}
       {status && status !== 'logged' && (
         <p className="text-sm text-destructive">{status}</p>
+      )}
+
+      {showBarcodeScanner && (
+        <BarcodeScannerModal
+          onResult={handleScanResult}
+          onError={(msg) => { setScanError(msg); setShowBarcodeScanner(false) }}
+          onClose={() => setShowBarcodeScanner(false)}
+        />
       )}
     </div>
   )

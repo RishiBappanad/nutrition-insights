@@ -8,10 +8,15 @@ const AUTH_BASE_URL = import.meta.env.VITE_TRACKSTACK_AUTH_URL ?? ''
 
 export async function api(path, opts = {}) {
   const token = localStorage.getItem('token')
+  // A FormData body (label-scanner's image upload) must NOT get an
+  // explicit Content-Type -- the browser sets its own multipart boundary
+  // parameter, which this helper can't replicate, so forcing
+  // 'application/json' here would silently break every multipart upload.
+  const isFormData = typeof FormData !== 'undefined' && opts.body instanceof FormData
   const res = await fetch(`${API}${path}`, {
     ...opts,
     headers: {
-      'Content-Type': 'application/json',
+      ...(!isFormData && { 'Content-Type': 'application/json' }),
       ...(token && { Authorization: `Bearer ${token}` }),
       ...opts.headers,
     },

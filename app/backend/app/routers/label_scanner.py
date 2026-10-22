@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from ..routers.auth import get_current_user
+from ..food_matching import find_existing_food_matches
 
 router = APIRouter()
 
@@ -82,6 +83,12 @@ class LabelScanResult(BaseModel):
     calories: Optional[float] = None
     nutrients: dict = {}
     error: Optional[str] = None
+    # Existing USDA/CNF foods this scan plausibly matches (see
+    # ../food_matching.py), best match first. The caller should offer
+    # linking to one of these instead of always creating a new
+    # custom_foods entry -- empty when nothing scored above the match
+    # threshold, not when matching wasn't attempted.
+    suggested_matches: list = []
 
 
 def _manual_required(error: str) -> LabelScanResult:
@@ -211,4 +218,7 @@ async def scan_label(file: UploadFile = File(...), user_id: int = Depends(get_cu
     if len(contents) == 0:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    return extract_label_with_gemini(contents, file.content_type)
+    result = extract_label_with_gemini(contents, file.content_type)
+    if result.food_name:
+        result.suggested_matches = find_existing_food_matches(result.food_name, result.brand)
+    return result
