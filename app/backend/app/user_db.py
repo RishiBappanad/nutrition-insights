@@ -112,11 +112,15 @@ async def _food_log_series(conn, user_id: int, metric: str) -> dict:
             user_id,
         )
     else:
+        # nutrient_facts is one row per owner (nutrients = JSON-encoded
+        # {name: {value, unit}} TEXT -- see nutrient_facts.py's module
+        # docstring), so this pulls the one metric's value out of the
+        # blob by key instead of filtering a per-nutrient row.
         rows = await conn.fetch(
-            """SELECT fl.date, SUM(nf.value) AS total
+            """SELECT fl.date, SUM((nf.nutrients::jsonb -> $2::text ->> 'value')::double precision) AS total
                FROM nutrient_facts nf
                JOIN food_log fl ON fl.id = nf.owner_id AND nf.owner_type = 'food_log'
-               WHERE fl.user_id = $1 AND nf.nutrient_name = $2
+               WHERE fl.user_id = $1 AND (nf.nutrients::jsonb -> $2::text) IS NOT NULL
                GROUP BY fl.date""",
             user_id, metric,
         )
@@ -252,10 +256,15 @@ async def get_nutrition_metrics(user_id: int) -> list:
             "SELECT DISTINCT metric FROM daily_nutrition WHERE user_id = $1",
             user_id,
         )
+        # nutrient_facts is one row per owner (nutrients = JSON-encoded
+        # {name: {value, unit}} TEXT -- see nutrient_facts.py's module
+        # docstring), so this reads the blob's own keys instead of a
+        # distinct per-nutrient-row scan.
         logged_rows = await conn.fetch(
-            """SELECT DISTINCT nf.nutrient_name AS metric
+            """SELECT DISTINCT key AS metric
                FROM nutrient_facts nf
                JOIN food_log fl ON fl.id = nf.owner_id AND nf.owner_type = 'food_log'
+               CROSS JOIN LATERAL jsonb_object_keys(nf.nutrients::jsonb) AS key
                WHERE fl.user_id = $1""",
             user_id,
         )

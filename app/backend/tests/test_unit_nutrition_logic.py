@@ -121,62 +121,51 @@ class TestDeriveMacroGrams:
             derive_macro_grams(mode="auto_from_burn", calorie_target=2000)
 
 
-# ── food.py: nutrients_to_rows ───────────────────────────────────────────────
+# ── nutrient_facts.py: _normalize_nutrients ──────────────────────────────────
 
-class TestNutrientsToRows:
-    """nutrient_facts._nutrients_to_rows is now the single normalization
-    implementation for every X_nutrients-shaped write path (previously
+class TestNormalizeNutrients:
+    """nutrient_facts._normalize_nutrients is the single normalization
+    implementation for every nutrients-dict write path (previously
     duplicated between routers/food.py and routers/custom_foods.py, and
     reimplemented slightly differently again in meals.py/recipes.py) --
-    see app/nutrient_facts.py. Row shape is now (owner_type, owner_id,
-    nutrient_name, value, unit), not (entity_id, name, value, unit)."""
+    see app/nutrient_facts.py. Pure dict in, dict out, as of the
+    2026-11-12 one-row-per-owner migration -- owner_type/owner_id are no
+    longer part of normalization at all (they're the SQL layer's
+    PRIMARY KEY now, not baked into each normalized entry)."""
 
     def test_normalizes_valid_nutrients(self):
-        from app.nutrient_facts import _nutrients_to_rows
+        from app.nutrient_facts import _normalize_nutrients
         nutrients = {"Sodium, Na": {"value": 5.0, "unit": "mg"}, "Iron, Fe": {"value": "1.2", "unit": "mg"}}
-        rows = _nutrients_to_rows("food_log", 42, nutrients)
-        assert ("food_log", 42, "Sodium, Na", 5.0, "mg") in rows
-        assert ("food_log", 42, "Iron, Fe", 1.2, "mg") in rows
+        normalized = _normalize_nutrients(nutrients)
+        assert normalized["Sodium, Na"] == {"value": 5.0, "unit": "mg"}
+        assert normalized["Iron, Fe"] == {"value": 1.2, "unit": "mg"}
 
     def test_skips_entries_with_missing_value(self):
-        from app.nutrient_facts import _nutrients_to_rows
+        from app.nutrient_facts import _normalize_nutrients
         nutrients = {"Sodium, Na": {"unit": "mg"}}  # no "value" key
-        rows = _nutrients_to_rows("food_log", 1, nutrients)
-        assert rows == []
+        assert _normalize_nutrients(nutrients) == {}
 
     def test_skips_non_numeric_value(self):
-        from app.nutrient_facts import _nutrients_to_rows
+        from app.nutrient_facts import _normalize_nutrients
         nutrients = {"Sodium, Na": {"value": "not-a-number", "unit": "mg"}}
-        rows = _nutrients_to_rows("food_log", 1, nutrients)
-        assert rows == []
+        assert _normalize_nutrients(nutrients) == {}
 
     def test_skips_malformed_entries_gracefully(self):
         """A food source with a gap in nutrient coverage (a bare string
         instead of a {value, unit} dict) shouldn't crash the whole log
         request — one bad nutrient entry is skipped, not fatal."""
-        from app.nutrient_facts import _nutrients_to_rows
+        from app.nutrient_facts import _normalize_nutrients
         nutrients = {"Weird Field": "unexpected string", "Sodium, Na": {"value": 5, "unit": "mg"}}
-        rows = _nutrients_to_rows("food_log", 1, nutrients)
-        assert rows == [("food_log", 1, "Sodium, Na", 5.0, "mg")]
+        assert _normalize_nutrients(nutrients) == {"Sodium, Na": {"value": 5.0, "unit": "mg"}}
 
-    def test_empty_nutrients_returns_empty_list(self):
-        from app.nutrient_facts import _nutrients_to_rows
-        assert _nutrients_to_rows("food_log", 1, {}) == []
+    def test_empty_nutrients_returns_empty_dict(self):
+        from app.nutrient_facts import _normalize_nutrients
+        assert _normalize_nutrients({}) == {}
 
     def test_missing_unit_defaults_to_empty_string(self):
-        from app.nutrient_facts import _nutrients_to_rows
-        rows = _nutrients_to_rows("food_log", 1, {"Vitamin C": {"value": 10}})
-        assert rows == [("food_log", 1, "Vitamin C", 10.0, "")]
-
-    def test_different_owner_types_are_independent(self):
-        """The whole point of the owner_type discriminator: the same
-        owner_id under two different owner_types must not collide."""
-        from app.nutrient_facts import _nutrients_to_rows
-        nutrients = {"Protein": {"value": 10, "unit": "G"}}
-        food_rows = _nutrients_to_rows("food_log", 1, nutrients)
-        pantry_rows = _nutrients_to_rows("pantry_item", 1, nutrients)
-        assert food_rows == [("food_log", 1, "Protein", 10.0, "G")]
-        assert pantry_rows == [("pantry_item", 1, "Protein", 10.0, "G")]
+        from app.nutrient_facts import _normalize_nutrients
+        normalized = _normalize_nutrients({"Vitamin C": {"value": 10}})
+        assert normalized == {"Vitamin C": {"value": 10.0, "unit": ""}}
 
 
 # ── water.py: default_water_target_ml ───────────────────────────────────────
@@ -844,10 +833,10 @@ class TestFoodEntryContractModels:
         assert len(recipe.items) == 1
         assert recipe.items[0].food_name == "Rice"
 
-    def test_nutrients_to_rows_skips_malformed_entries(self):
-        """food_entry_contract.py no longer has its own _nutrients_to_rows
-        -- it uses the single shared implementation in app/nutrient_facts.py
-        (see TestNutrientsToRows above for its full coverage)."""
-        from app.nutrient_facts import _nutrients_to_rows
-        rows = _nutrients_to_rows("food_log", 1, {"Bad": "not-a-dict", "Good": {"value": 5, "unit": "g"}, "NoValue": {"unit": "g"}})
-        assert rows == [("food_log", 1, "Good", 5.0, "g")]
+    def test_normalize_nutrients_skips_malformed_entries(self):
+        """food_entry_contract.py has no normalization of its own -- it
+        uses the single shared implementation in app/nutrient_facts.py
+        (see TestNormalizeNutrients above for its full coverage)."""
+        from app.nutrient_facts import _normalize_nutrients
+        normalized = _normalize_nutrients({"Bad": "not-a-dict", "Good": {"value": 5, "unit": "g"}, "NoValue": {"unit": "g"}})
+        assert normalized == {"Good": {"value": 5.0, "unit": "g"}}

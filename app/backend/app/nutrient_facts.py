@@ -11,6 +11,20 @@ owner type -- adding a 6th "loggable item with named sub-attributes"
 concept means one new OWNER_TYPES entry, never a new table or new
 read/write SQL (see CLAUDE.md's "Named Sub-Attributes" pattern).
 
+**Storage shape, changed 2026-11-12**: one row per owner (not one row per
+nutrient). The original design gave every nutrient its own row --
+food_log entries alone averaged 43.6 nutrient rows each, which had grown
+to 4.6M total rows / 827MB (85% of this database) by the time it forced a
+real decision: Neon's free-tier project storage cap. Collapsing to one
+`nutrients` TEXT column (JSON-encoded `{name: {value, unit}}`, this
+codebase's established convention for JSON-shaped columns -- see
+db/__init__.py's own comment on domain_events.metadata_json, not a native
+JSONB column) cut it to ~225MB, measured against the real production data
+before migrating, not guessed. Every function below keeps its exact prior
+signature and return shape, so no caller (food_entry_contract.py,
+routers/custom_foods.py, routers/meals.py, routers/pantry.py,
+routers/recipes.py) needed to change -- only this module's internals.
+
 owner_type is a plain string discriminator, not a foreign key — Postgres
 has no polymorphic FK across 5 different parent tables in one column.
 Referential integrity for this table is therefore enforced in application
@@ -21,6 +35,7 @@ nutrient_facts rows become permanently orphaned (harmless to correctness
 — nothing reads a row for an owner_id that no longer exists anywhere —
 but a real, avoidable storage leak).
 """
+import json
 from typing import Iterable
 
 # owner_type -> the table it references. Documentation only (no FK is
@@ -35,13 +50,13 @@ OWNER_TYPES = {
 }
 
 
-def _nutrients_to_rows(owner_type: str, owner_id: int, nutrients: dict) -> list[tuple]:
-    """Normalize a {name: {value, unit}} dict into nutrient_facts rows,
-    silently dropping any entry missing a numeric value — the ONE
-    normalization implementation; callers (food_entry_contract.py,
-    routers/custom_foods.py, routers/meals.py, routers/recipes.py) use
-    this rather than reimplementing it."""
-    rows = []
+def _normalize_nutrients(nutrients: dict) -> dict:
+    """Normalize a {name: {value, unit}} dict, silently dropping any entry
+    missing a numeric value — the ONE normalization implementation;
+    callers (food_entry_contract.py, routers/custom_foods.py,
+    routers/meals.py, routers/recipes.py) use this rather than
+    reimplementing it."""
+    normalized = {}
     for name, info in (nutrients or {}).items():
         if not isinstance(info, dict):
             continue
@@ -52,8 +67,20 @@ def _nutrients_to_rows(owner_type: str, owner_id: int, nutrients: dict) -> list[
             value = float(value)
         except (TypeError, ValueError):
             continue
-        rows.append((owner_type, owner_id, name, value, info.get("unit", "")))
-    return rows
+        normalized[name] = {"value": value, "unit": info.get("unit", "")}
+    return normalized
+
+
+# Shallow-merges the new nutrients blob into whatever's already stored for
+# this owner (nutrient_facts.nutrients::jsonb || EXCLUDED...), matching the
+# old per-row upsert semantics exactly: a nutrient name present in both
+# keeps the new value, every other existing nutrient for this owner is
+# left untouched. Cast back to ::text since this codebase stores
+# JSON-shaped columns as TEXT, not native JSONB (see module docstring).
+_UPSERT_SQL = """INSERT INTO nutrient_facts (owner_type, owner_id, nutrients)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (owner_type, owner_id)
+       DO UPDATE SET nutrients = (nutrient_facts.nutrients::jsonb || EXCLUDED.nutrients::jsonb)::text"""
 
 
 async def write_nutrients(conn, owner_type: str, owner_id: int, nutrients: dict) -> None:
@@ -61,37 +88,27 @@ async def write_nutrients(conn, owner_type: str, owner_id: int, nutrients: dict)
     breakdown. Does NOT clear existing rows first — a caller REPLACING an
     item's nutrients (an edit) should call delete_nutrient_facts() first;
     a caller creating a brand-new item never needs to."""
-    rows = _nutrients_to_rows(owner_type, owner_id, nutrients)
-    if not rows:
+    normalized = _normalize_nutrients(nutrients)
+    if not normalized:
         return
-    await conn.executemany(
-        """INSERT INTO nutrient_facts (owner_type, owner_id, nutrient_name, value, unit)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (owner_type, owner_id, nutrient_name)
-           DO UPDATE SET value = EXCLUDED.value, unit = EXCLUDED.unit""",
-        rows,
-    )
+    await conn.execute(_UPSERT_SQL, owner_type, owner_id, json.dumps(normalized))
 
 
 async def write_nutrients_bulk(conn, owner_type: str, owner_nutrients: list[tuple[int, dict]]) -> None:
     """Bulk equivalent of write_nutrients() for a caller writing many
     owners' worth of nutrients in one go (e.g. an importer processing
-    hundreds of entries) -- one executemany for every owner's nutrient
-    rows combined, instead of one executemany per owner. Same
-    insert-or-update semantics as write_nutrients(); just batched.
-    `owner_nutrients` is a list of (owner_id, nutrients_dict) pairs."""
+    hundreds of entries) -- one executemany for every owner's row at
+    once, instead of one execute per owner. Same insert-or-update
+    semantics as write_nutrients(); just batched. `owner_nutrients` is a
+    list of (owner_id, nutrients_dict) pairs."""
     rows = []
     for owner_id, nutrients in owner_nutrients:
-        rows.extend(_nutrients_to_rows(owner_type, owner_id, nutrients))
+        normalized = _normalize_nutrients(nutrients)
+        if normalized:
+            rows.append((owner_type, owner_id, json.dumps(normalized)))
     if not rows:
         return
-    await conn.executemany(
-        """INSERT INTO nutrient_facts (owner_type, owner_id, nutrient_name, value, unit)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (owner_type, owner_id, nutrient_name)
-           DO UPDATE SET value = EXCLUDED.value, unit = EXCLUDED.unit""",
-        rows,
-    )
+    await conn.executemany(_UPSERT_SQL, rows)
 
 
 async def read_nutrients_bulk(conn, owner_type: str, owner_ids: Iterable[int]) -> dict[int, dict]:
@@ -106,15 +123,13 @@ async def read_nutrients_bulk(conn, owner_type: str, owner_ids: Iterable[int]) -
     if not owner_ids:
         return {}
     rows = await conn.fetch(
-        "SELECT owner_id, nutrient_name, value, unit FROM nutrient_facts "
+        "SELECT owner_id, nutrients FROM nutrient_facts "
         "WHERE owner_type = $1 AND owner_id = ANY($2::int[])",
         owner_type, owner_ids,
     )
-    by_owner: dict[int, dict] = {}
-    for r in rows:
-        by_owner.setdefault(r["owner_id"], {})[r["nutrient_name"]] = {
-            "value": r["value"], "unit": r["unit"],
-        }
+    by_owner: dict[int, dict] = {
+        r["owner_id"]: (json.loads(r["nutrients"]) if r["nutrients"] else {}) for r in rows
+    }
     return {owner_id: order_nutrients(nutrients) for owner_id, nutrients in by_owner.items()}
 
 

@@ -121,9 +121,10 @@ class GoalQuery:
     percentile: Optional[float] = None
     # None (the default) aggregates over domain_events.amount, same as
     # every finance-tracker goal and this tracker's own calorie-based
-    # goals. "nutrient:<Name>" instead aggregates over nutrient_facts.value
-    # for that nutrient name, joined to domain_events by (owner_type,
-    # owner_id) -- the extension that makes macro/micronutrient targets
+    # goals. "nutrient:<Name>" instead pulls that one key out of
+    # nutrient_facts.nutrients (one JSON blob per owner), joined to
+    # domain_events by (owner_type, owner_id) -- the extension that makes
+    # macro/micronutrient targets
     # (protein grams, sodium mg, etc.) expressible, since those live in
     # nutrient_facts, not on the domain_events row itself. Additive and
     # backward-compatible: every existing goal (finance's, and this
@@ -447,21 +448,26 @@ async def compute_aggregate_for_range(
 
     # measure_field selects WHAT gets aggregated: domain_events.amount by
     # default (every finance goal, this tracker's own calorie goals), or
-    # a nutrient_facts.value join for "nutrient:<Name>" (macro/micronutrient
-    # targets -- see GoalQuery.measure_field's own doc). The CTE-deduped
-    # `domain_events` relation is aliased `de` either way so both branches
-    # share one FROM clause shape; nutrient_facts is joined on the SAME
+    # one key out of nutrient_facts.nutrients for "nutrient:<Name>"
+    # (macro/micronutrient targets -- see GoalQuery.measure_field's own
+    # doc). nutrient_facts is one row per owner now (its `nutrients`
+    # column is a JSON-encoded {name: {value, unit}} TEXT blob, see
+    # nutrient_facts.py's module docstring for why), so the join no longer
+    # filters to a matching per-nutrient row -- it joins on the SAME
     # (owner_type, owner_id) pair the dedup CTE already resolved to each
-    # owner's single latest surviving row, so an edited entry's nutrient
-    # values can't double-count any more than its calories can.
+    # owner's single latest surviving row (so an edited entry's nutrient
+    # values can't double-count any more than its calories can), and the
+    # WHERE clause below is what excludes an owner that never logged this
+    # particular nutrient at all (an inner JOIN previously did that job).
     from_sql = "FROM domain_events de"
     value_expr = "de.amount"
     if query.measure_field and query.measure_field.startswith("nutrient:"):
         nutrient_name = query.measure_field[len("nutrient:"):]
         params.append(nutrient_name)
         nutrient_idx = len(params)
-        from_sql += f" JOIN nutrient_facts nf ON nf.owner_type = de.owner_type AND nf.owner_id = de.owner_id AND nf.nutrient_name = ${nutrient_idx}"
-        value_expr = "nf.value"
+        from_sql += f" JOIN nutrient_facts nf ON nf.owner_type = de.owner_type AND nf.owner_id = de.owner_id"
+        value_expr = f"(nf.nutrients::jsonb -> ${nutrient_idx}::text ->> 'value')::double precision"
+        where_sql += f" AND (nf.nutrients::jsonb -> ${nutrient_idx}::text) IS NOT NULL"
 
     if query.aggregation == "count":
         select_expr = "count(*)"
@@ -556,15 +562,21 @@ async def compute_nutrient_totals_for_date(conn, user_id: int, date_str: str) ->
     owner_type = 'food_log' (which is what every DRI/user-target goal's
     measure_query filters on -- pantry stock, recipes, and custom foods
     also carry nutrient_facts rows but aren't consumption), just grouped
-    by nutrient instead of filtered to one."""
+    by nutrient instead of filtered to one. nutrient_facts is one row per
+    owner (its `nutrients` column is a JSON-encoded {name: {value, unit}}
+    TEXT blob -- see nutrient_facts.py's module docstring), so this
+    expands each owner's blob into one row per nutrient via jsonb_each
+    before summing, rather than grouping rows that already existed
+    per-nutrient."""
     start = datetime.fromisoformat(f"{date_str}T00:00:00+00:00")
     end = start + timedelta(days=1)
     cte = _current_state_cte(1, None)
     sql = f"""WITH {cte}
-        SELECT nf.nutrient_name, coalesce(sum(nf.value), 0) AS total
+        SELECT kv.key AS nutrient_name, coalesce(sum((kv.value ->> 'value')::double precision), 0) AS total
         FROM domain_events de
         JOIN nutrient_facts nf ON nf.owner_type = de.owner_type AND nf.owner_id = de.owner_id
+        CROSS JOIN LATERAL jsonb_each(nf.nutrients::jsonb) AS kv(key, value)
         WHERE de.user_id = $1 AND de.owner_type = 'food_log' AND de.occurred_at >= $2 AND de.occurred_at < $3
-        GROUP BY nf.nutrient_name"""
+        GROUP BY kv.key"""
     rows = await conn.fetch(sql, user_id, start, end)
     return {r["nutrient_name"]: float(r["total"]) for r in rows}

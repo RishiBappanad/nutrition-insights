@@ -141,16 +141,28 @@ async def init_db():
             -- replace of its items, must also call
             -- nutrient_facts.delete_*() for it. See OWNER_TYPES in
             -- app/nutrient_facts.py for the full list of valid values.
+            --
+            -- **One row per owner, not one row per nutrient (changed
+            -- 2026-11-12).** The original one-row-per-nutrient design put
+            -- 4.6M rows / 827MB here (food_log entries alone averaged 43.6
+            -- nutrient rows each) -- 85% of this whole database, and the
+            -- thing that pushed the project over Neon's free-tier storage
+            -- cap. `nutrients` is a JSON-encoded TEXT blob
+            -- (`{name: {value, unit}}`, this codebase's established
+            -- convention for JSON-shaped columns -- see
+            -- domain_events.metadata_json), not a native JSONB column.
+            -- Measured against real production data before migrating:
+            -- ~225MB this way, not guessed. See nutrient_facts.py's
+            -- module docstring for the full writeup and the production
+            -- cutover (manual table swap -- CREATE TABLE IF NOT EXISTS
+            -- here only matters for a fresh database, e.g. local dev or a
+            -- disposable branch).
             CREATE TABLE IF NOT EXISTS nutrient_facts (
                 owner_type TEXT NOT NULL,
                 owner_id INTEGER NOT NULL,
-                nutrient_name TEXT NOT NULL,
-                value DOUBLE PRECISION NOT NULL,
-                unit TEXT NOT NULL,
-                PRIMARY KEY (owner_type, owner_id, nutrient_name)
+                nutrients TEXT NOT NULL,
+                PRIMARY KEY (owner_type, owner_id)
             );
-
-            CREATE INDEX IF NOT EXISTS idx_nutrient_facts_owner ON nutrient_facts(owner_type, owner_id);
 
             -- nutrition_targets and macro_target_settings no longer exist here:
             -- unified into `goals` (see the one-time migration at the end of
