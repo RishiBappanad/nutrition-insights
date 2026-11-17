@@ -35,6 +35,7 @@ from ..db.sql_builder import select_clause, where_clause, order_by_clause
 from ..food_category import FoodCategory
 from ..food_entry_contract import (
     FoodLogEntryContract, ExerciseLogContract, log_food_entry, log_exercise_entry,
+    log_food_entries_bulk, log_exercise_entries_bulk, find_existing_by_source,
 )
 
 # Two router objects, mounted at two different prefixes in app/__init__.py
@@ -109,39 +110,59 @@ class AggregationsResponse(BaseModel):
     data: list[dict[str, Union[str, float]]]
 
 
+def _to_food_entry(req: EventLogRequest) -> FoodLogEntryContract:
+    """Pure parse, no I/O -- shared by the single and batch routes below.
+    Raises ValueError (not HTTPException) so the batch route can prefix
+    its own events[i] index onto the message; the single route below
+    wraps this back into a 400 itself."""
+    food_name = req.metadata.get("food_name")
+    if not food_name:
+        raise ValueError("metadata.food_name is required for event_type=food_log_created")
+    return FoodLogEntryContract(
+        date=req.occurred_at,
+        meal=req.metadata.get("meal", "Snack"),
+        food_name=food_name,
+        source=req.source,
+        source_id=req.source_id,
+        category=req.category,
+        serving_size=req.metadata.get("serving_size", 1.0),
+        serving_unit=req.metadata.get("serving_unit", "serving"),
+        calories=req.amount,
+        nutrients=req.metadata.get("nutrients", {}),
+    )
+
+
+def _to_exercise_entry(req: EventLogRequest) -> ExerciseLogContract:
+    """Pure parse, no I/O -- see _to_food_entry's own comment."""
+    activity_name = req.metadata.get("activity_name")
+    if not activity_name:
+        raise ValueError("metadata.activity_name is required for event_type=exercise_log_created")
+    return ExerciseLogContract(
+        date=req.occurred_at,
+        activity_name=activity_name,
+        duration_minutes=req.metadata.get("duration_minutes"),
+        calories_burned=req.amount,
+        source=req.source or "manual",
+        source_id=req.source_id,
+        notes=req.metadata.get("notes"),
+    )
+
+
 async def _dispatch_log(user_id: int, req: EventLogRequest) -> dict:
     if req.event_type == "food_log_created":
-        food_name = req.metadata.get("food_name")
-        if not food_name:
-            raise HTTPException(status_code=400, detail="metadata.food_name is required for event_type=food_log_created")
-        entry = FoodLogEntryContract(
-            date=req.occurred_at,
-            meal=req.metadata.get("meal", "Snack"),
-            food_name=food_name,
-            source=req.source,
-            source_id=req.source_id,
-            category=req.category,
-            serving_size=req.metadata.get("serving_size", 1.0),
-            serving_unit=req.metadata.get("serving_unit", "serving"),
-            calories=req.amount,
-            nutrients=req.metadata.get("nutrients", {}),
-        )
+        try:
+            entry = _to_food_entry(req)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         food_log_id = await log_food_entry(user_id, entry)
         return {"id": food_log_id}
 
     if req.event_type == "exercise_log_created":
-        activity_name = req.metadata.get("activity_name")
-        if not activity_name:
-            raise HTTPException(status_code=400, detail="metadata.activity_name is required for event_type=exercise_log_created")
-        entry_id, _ = await log_exercise_entry(user_id, ExerciseLogContract(
-            date=req.occurred_at,
-            activity_name=activity_name,
-            duration_minutes=req.metadata.get("duration_minutes"),
-            calories_burned=req.amount,
-            source=req.source or "manual",
-            source_id=req.source_id,
-            notes=req.metadata.get("notes"),
-        ))
+        try:
+            entry = _to_exercise_entry(req)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        entry_id, _ = await log_exercise_entry(user_id, entry)
         return {"id": entry_id}
 
     raise HTTPException(
@@ -162,6 +183,126 @@ async def log_event(req: EventLogRequest, user_id: int = Depends(get_current_use
     GET /events."""
     result = await _dispatch_log(user_id, req)
     return {"status": "logged", **result}
+
+
+# BATCH_EVENTS_SPEC.md's suggested default -- a plain constant, not
+# configurable: large enough for a real bulk-log use case, small enough
+# that a single request can't become a multi-minute transaction or an
+# unbounded memory hold. (log_food_entries_bulk's OWN unbounded use from
+# Cronometer sync is a separate, internal-only code path -- not reachable
+# through this public endpoint, so it keeps no cap of its own.)
+MAX_BATCH_SIZE = 200
+
+
+class EventLogBatchRequest(BaseModel):
+    events: list[EventLogRequest]
+
+
+class BatchResultItem(BaseModel):
+    status: str
+    id: int
+
+
+class EventLogBatchResponse(BaseModel):
+    results: list[BatchResultItem]
+
+
+@router.post("/log/batch", response_model=EventLogBatchResponse, status_code=201)
+async def log_event_batch(req: EventLogBatchRequest, user_id: int = Depends(get_current_user)):
+    """BATCH_EVENTS_SPEC.md: an arbitrary number of events in one all-or-
+    nothing request. Every item is validated BEFORE the transaction opens
+    -- one bad item 400s the whole batch, touching the database not at
+    all. Dispatches to log_food_entries_bulk/log_exercise_entries_bulk
+    (food_entry_contract.py) grouped by event_type, both sharing the ONE
+    connection/transaction this route opens, so a food item and an
+    exercise item in the same batch commit or roll back together even
+    though they land in different tables. A duplicate (source,
+    source_id) -- including one that duplicates an EARLIER item in this
+    same batch -- is a per-item "duplicate" result, not a batch failure;
+    see the in-batch dedup pass below for how that's caught even though
+    the actual insert is one multi-row statement, not a per-item loop."""
+    if not req.events:
+        raise HTTPException(status_code=400, detail="events must contain at least 1 item")
+    if len(req.events) > MAX_BATCH_SIZE:
+        raise HTTPException(status_code=400, detail=f"events must contain at most {MAX_BATCH_SIZE} items")
+
+    # Validate + parse every item before touching the database at all.
+    parsed: list[tuple[int, str, object]] = []  # (original_index, event_type, FoodLogEntryContract|ExerciseLogContract)
+    for i, item in enumerate(req.events):
+        if item.event_type not in CREATABLE_EVENT_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"events[{i}]: unknown event_type {item.event_type!r} — must be one of {sorted(CREATABLE_EVENT_TYPES)}",
+            )
+        try:
+            entry = _to_food_entry(item) if item.event_type == "food_log_created" else _to_exercise_entry(item)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"events[{i}]: {e}")
+        parsed.append((i, item.event_type, entry))
+
+    results: list[Optional[BatchResultItem]] = [None] * len(req.events)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for event_type, table, bulk_fn in (
+                ("food_log_created", "food_log", log_food_entries_bulk),
+                ("exercise_log_created", "exercise_log", log_exercise_entries_bulk),
+            ):
+                group = [(i, entry) for i, et, entry in parsed if et == event_type]
+                if not group:
+                    continue
+
+                # In-batch dedup FIRST: two items in the SAME batch sharing a
+                # (source, source_id) must resolve to the SAME id, but the
+                # bulk insert below is one multi-row statement with no
+                # per-row existence check of its own -- so a later
+                # duplicate is pulled out here and backfilled once the
+                # first occurrence's real id is known (either freshly
+                # inserted, or itself a duplicate of an already-persisted
+                # row -- the chained case `in_batch_dup_of` resolves below).
+                seen_at: dict[tuple[str, str], int] = {}
+                in_batch_dup_of: dict[int, int] = {}
+                deduped = []
+                for i, entry in group:
+                    if entry.source_id:
+                        key = (entry.source, entry.source_id)
+                        if key in seen_at:
+                            in_batch_dup_of[i] = seen_at[key]
+                            continue
+                        seen_at[key] = i
+                    deduped.append((i, entry))
+
+                # THEN cross-request dedup, grouped by source (a batch's
+                # items need not all share one) -- against rows already
+                # committed before this request, via this transaction's
+                # own `conn`.
+                by_source: dict[str, list[tuple[int, object]]] = {}
+                for i, entry in deduped:
+                    if entry.source_id:
+                        by_source.setdefault(entry.source, []).append((i, entry))
+                existing: dict[int, int] = {}
+                for source, items in by_source.items():
+                    matches = await find_existing_by_source(conn, user_id, table, source, [entry.source_id for _, entry in items])
+                    for i, entry in items:
+                        if entry.source_id in matches:
+                            existing[i] = matches[entry.source_id]
+
+                to_insert = [(i, entry) for i, entry in deduped if i not in existing]
+                for i, existing_id in existing.items():
+                    results[i] = BatchResultItem(status="duplicate", id=existing_id)
+
+                inserted_id_by_index: dict[int, int] = {}
+                if to_insert:
+                    new_ids = await bulk_fn(user_id, [entry for _, entry in to_insert], conn)
+                    for (i, _), new_id in zip(to_insert, new_ids):
+                        results[i] = BatchResultItem(status="logged", id=new_id)
+                        inserted_id_by_index[i] = new_id
+
+                for dup_i, original_i in in_batch_dup_of.items():
+                    real_id = inserted_id_by_index.get(original_i, existing.get(original_i))
+                    results[dup_i] = BatchResultItem(status="duplicate", id=real_id)
+
+    return {"results": results}
 
 
 def _row_to_event(r) -> dict:

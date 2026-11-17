@@ -122,6 +122,70 @@ class TestPostEventsLog:
         assert r.status_code == 400
 
 
+class TestPostEventsLogBatch:
+    """BATCH_EVENTS_SPEC.md: an arbitrary number of events in one
+    all-or-nothing request."""
+
+    def test_creates_every_item_atomically_across_both_tables(self, client, user_token):
+        r = client.post("/events/log/batch", headers=auth(user_token), json={"events": [
+            {"event_type": "food_log_created", "occurred_at": TEST_DATE, "amount": 10, "metadata": {"food_name": "Batch Oats"}},
+            {"event_type": "exercise_log_created", "occurred_at": TEST_DATE, "amount": 50, "metadata": {"activity_name": "Batch Walk"}},
+            {"event_type": "food_log_created", "occurred_at": TEST_DATE, "amount": 20, "metadata": {"food_name": "Batch Toast"}},
+        ]})
+        assert r.status_code == 201
+        results = r.json()["results"]
+        assert len(results) == 3
+        assert all(item["status"] == "logged" for item in results)
+
+        food = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token)).json()["entries"]
+        assert any(e["food_name"] == "Batch Oats" for e in food)
+        assert any(e["food_name"] == "Batch Toast" for e in food)
+        exercise = client.get(f"/exercise?date={TEST_DATE}", headers=auth(user_token)).json()["entries"]
+        assert any(e["activity_name"] == "Batch Walk" for e in exercise)
+
+    def test_validates_every_item_before_writing_any(self, client, user_token):
+        before = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token)).json()["entries"]
+        r = client.post("/events/log/batch", headers=auth(user_token), json={"events": [
+            {"event_type": "food_log_created", "occurred_at": TEST_DATE, "amount": 10, "metadata": {"food_name": "Should Not Persist"}},
+            {"event_type": "food_log_created", "occurred_at": TEST_DATE, "amount": 10, "metadata": {}},  # missing food_name
+        ]})
+        assert r.status_code == 400
+        assert "events[1]" in r.json()["detail"]
+
+        after = client.get(f"/food/log?date={TEST_DATE}", headers=auth(user_token)).json()["entries"]
+        assert len(after) == len(before)
+
+    def test_rejects_empty_array_and_a_batch_over_the_size_cap(self, client, user_token):
+        r = client.post("/events/log/batch", headers=auth(user_token), json={"events": []})
+        assert r.status_code == 400
+        too_many = [{"event_type": "food_log_created", "occurred_at": TEST_DATE, "amount": 1, "metadata": {"food_name": "X"}}] * 201
+        r2 = client.post("/events/log/batch", headers=auth(user_token), json={"events": too_many})
+        assert r2.status_code == 400
+
+    def test_duplicate_source_id_is_a_per_item_result_including_an_in_batch_duplicate(self, client, user_token):
+        r = client.post("/events/log/batch", headers=auth(user_token), json={"events": [
+            {"event_type": "food_log_created", "occurred_at": TEST_DATE, "amount": 5, "source": "cronometer", "source_id": "dup-1", "metadata": {"food_name": "Dup Food"}},
+            {"event_type": "food_log_created", "occurred_at": TEST_DATE, "amount": 9, "metadata": {"food_name": "Unrelated Food"}},
+            {"event_type": "food_log_created", "occurred_at": TEST_DATE, "amount": 5, "source": "cronometer", "source_id": "dup-1", "metadata": {"food_name": "Dup Food Again"}},
+        ]})
+        assert r.status_code == 201
+        results = r.json()["results"]
+        assert results[0]["status"] == "logged"
+        assert results[1]["status"] == "logged"
+        assert results[2] == {"status": "duplicate", "id": results[0]["id"]}
+
+    def test_sees_a_duplicate_source_id_from_an_earlier_request_too(self, client, user_token):
+        first = client.post("/events/log", headers=auth(user_token), json={
+            "event_type": "exercise_log_created", "occurred_at": TEST_DATE, "amount": 5,
+            "source": "cronometer", "source_id": "dup-cross-1", "metadata": {"activity_name": "Dup Exercise"},
+        })
+        assert first.status_code == 200
+        r = client.post("/events/log/batch", headers=auth(user_token), json={"events": [
+            {"event_type": "exercise_log_created", "occurred_at": TEST_DATE, "amount": 5, "source": "cronometer", "source_id": "dup-cross-1", "metadata": {"activity_name": "Dup Exercise Again"}},
+        ]})
+        assert r.json()["results"] == [{"status": "duplicate", "id": first.json()["id"]}]
+
+
 class TestGetEvents:
     def test_returns_both_event_types_in_range(self, client, user_token):
         r = client.get(f"/events?start={TEST_DATE}&end={TEST_DATE}", headers=auth(user_token))

@@ -154,9 +154,67 @@ async def log_food_entry(user_id: int, entry: FoodLogEntryContract) -> int:
     return food_log_id
 
 
-async def log_food_entries_bulk(user_id: int, entries: list[FoodLogEntryContract]) -> list[int]:
+async def _insert_food_entries_bulk(conn, user_id: int, entries: list[FoodLogEntryContract]) -> list[int]:
+    """The actual multi-row insert, against whichever `conn` the caller
+    is already using -- no acquire/transaction of its own, so it composes
+    inside a bigger transaction (BATCH_EVENTS_SPEC.md's batch route) the
+    same way it runs standalone (log_food_entries_bulk below)."""
+    rows = await conn.fetch(
+        """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
+               category, serving_size, serving_unit, calories, nutrients_json)
+           SELECT * FROM unnest(
+               $1::int[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+               $7::text[], $8::float8[], $9::text[], $10::float8[], $11::text[]
+           )
+           RETURNING id""",
+        [user_id] * len(entries),
+        [e.date for e in entries],
+        [e.meal for e in entries],
+        [e.food_name for e in entries],
+        [e.source for e in entries],
+        [e.source_id for e in entries],
+        [e.category.value if e.category else None for e in entries],
+        [e.serving_size for e in entries],
+        [e.serving_unit for e in entries],
+        [e.calories for e in entries],
+        [json.dumps(e.nutrients) for e in entries],
+    )
+    food_log_ids = [r["id"] for r in rows]
+
+    await write_nutrients_bulk(
+        conn, "food_log",
+        [(food_log_id, entry.nutrients) for food_log_id, entry in zip(food_log_ids, entries)],
+    )
+
+    # Bulk event insert, matching this function's whole reason for
+    # existing (log_food_entry's real per-row cost is exactly the
+    # N+1 pattern that made a ~3000-row Cronometer sync blow past
+    # Cloud Run's request timeout) -- N individual log_domain_event
+    # calls here would reintroduce that same cost for the event
+    # rows alone.
+    if food_log_ids:
+        await conn.executemany(
+            """INSERT INTO domain_events
+                   (user_id, owner_type, owner_id, event_type, category, amount, label, source, source_id, metadata_json, occurred_at)
+               VALUES ($1, 'food_log', $2, 'food_log_created', $3, $4, $5, $6, $7, $8, $9)""",
+            [
+                (
+                    user_id, food_log_id,
+                    entry.category.value if entry.category else None, entry.calories, entry.food_name,
+                    entry.source, entry.source_id, json.dumps({"meal": entry.meal}),
+                    datetime.combine(date.fromisoformat(entry.date), time.min, tzinfo=timezone.utc),
+                )
+                for food_log_id, entry in zip(food_log_ids, entries)
+            ],
+        )
+
+    return food_log_ids
+
+
+async def log_food_entries_bulk(user_id: int, entries: list[FoodLogEntryContract], conn=None) -> list[int]:
     """Bulk equivalent of log_food_entry() for an importer writing many
-    entries at once (Cronometer sync, currently the only caller). One
+    entries at once (Cronometer sync, currently the only caller, and
+    BATCH_EVENTS_SPEC.md's POST /events/log/batch, the second). One
     multi-row INSERT for all food_log rows plus one executemany for all
     their nutrient_facts rows, instead of N separate
     acquire+transaction+insert+commit cycles.
@@ -173,63 +231,24 @@ async def log_food_entries_bulk(user_id: int, entries: list[FoodLogEntryContract
     a plain (non-parallel, no ORDER BY) INSERT's RETURNING clause.
     Verified directly against a real disposable-branch Postgres before
     relying on it, not assumed.
+
+    `conn`: pass an already-open connection/transaction (BATCH_EVENTS_
+    SPEC.md's batch route, which needs N calls across food AND exercise
+    to share ONE transaction) to use it directly with no transaction of
+    this function's own; omit it (every other caller) to acquire one and
+    wrap the insert in its own transaction, exactly as before this
+    parameter existed.
     """
     if not entries:
         return []
 
+    if conn is not None:
+        return await _insert_food_entries_bulk(conn, user_id, entries)
+
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            rows = await conn.fetch(
-                """INSERT INTO food_log (user_id, date, meal, food_name, source, source_id,
-                       category, serving_size, serving_unit, calories, nutrients_json)
-                   SELECT * FROM unnest(
-                       $1::int[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-                       $7::text[], $8::float8[], $9::text[], $10::float8[], $11::text[]
-                   )
-                   RETURNING id""",
-                [user_id] * len(entries),
-                [e.date for e in entries],
-                [e.meal for e in entries],
-                [e.food_name for e in entries],
-                [e.source for e in entries],
-                [e.source_id for e in entries],
-                [e.category.value if e.category else None for e in entries],
-                [e.serving_size for e in entries],
-                [e.serving_unit for e in entries],
-                [e.calories for e in entries],
-                [json.dumps(e.nutrients) for e in entries],
-            )
-            food_log_ids = [r["id"] for r in rows]
-
-            await write_nutrients_bulk(
-                conn, "food_log",
-                [(food_log_id, entry.nutrients) for food_log_id, entry in zip(food_log_ids, entries)],
-            )
-
-            # Bulk event insert, matching this function's whole reason for
-            # existing (log_food_entry's real per-row cost is exactly the
-            # N+1 pattern that made a ~3000-row Cronometer sync blow past
-            # Cloud Run's request timeout) -- N individual log_domain_event
-            # calls here would reintroduce that same cost for the event
-            # rows alone.
-            if food_log_ids:
-                await conn.executemany(
-                    """INSERT INTO domain_events
-                           (user_id, owner_type, owner_id, event_type, category, amount, label, source, source_id, metadata_json, occurred_at)
-                       VALUES ($1, 'food_log', $2, 'food_log_created', $3, $4, $5, $6, $7, $8, $9)""",
-                    [
-                        (
-                            user_id, food_log_id,
-                            entry.category.value if entry.category else None, entry.calories, entry.food_name,
-                            entry.source, entry.source_id, json.dumps({"meal": entry.meal}),
-                            datetime.combine(date.fromisoformat(entry.date), time.min, tzinfo=timezone.utc),
-                        )
-                        for food_log_id, entry in zip(food_log_ids, entries)
-                    ],
-                )
-
-    return food_log_ids
+    async with pool.acquire() as owned_conn:
+        async with owned_conn.transaction():
+            return await _insert_food_entries_bulk(owned_conn, user_id, entries)
 
 
 async def import_recipe(user_id: int, recipe: RecipeImportContract) -> int:
@@ -353,3 +372,88 @@ async def log_exercise_entry(user_id: int, entry: ExerciseLogContract) -> tuple[
                 metadata={"duration_minutes": entry.duration_minutes, "notes": entry.notes}, occurred_at=entry.date,
             )
     return entry_id, True
+
+
+async def _insert_exercise_entries_bulk(conn, user_id: int, entries: list[ExerciseLogContract]) -> list[int]:
+    """The multi-row insert, against whichever `conn` the caller is
+    already using -- same no-transaction-of-its-own shape as
+    _insert_food_entries_bulk, for the same reason (BATCH_EVENTS_SPEC.md's
+    batch route needs this to compose inside a bigger transaction)."""
+    rows = await conn.fetch(
+        """INSERT INTO exercise_log (user_id, date, activity_name, duration_minutes, calories_burned, source, source_id, notes)
+           SELECT * FROM unnest(
+               $1::int[], $2::text[], $3::text[], $4::float8[], $5::float8[], $6::text[], $7::text[], $8::text[]
+           )
+           RETURNING id""",
+        [user_id] * len(entries),
+        [e.date for e in entries],
+        [e.activity_name for e in entries],
+        [e.duration_minutes for e in entries],
+        [e.calories_burned for e in entries],
+        [e.source for e in entries],
+        [e.source_id for e in entries],
+        [e.notes for e in entries],
+    )
+    exercise_log_ids = [r["id"] for r in rows]
+
+    if exercise_log_ids:
+        await conn.executemany(
+            """INSERT INTO domain_events
+                   (user_id, owner_type, owner_id, event_type, amount, label, source, source_id, metadata_json, occurred_at)
+               VALUES ($1, 'exercise_log', $2, 'exercise_log_created', $3, $4, $5, $6, $7, $8)""",
+            [
+                (
+                    user_id, exercise_log_id, entry.calories_burned, entry.activity_name,
+                    entry.source, entry.source_id, json.dumps({"duration_minutes": entry.duration_minutes, "notes": entry.notes}),
+                    datetime.combine(date.fromisoformat(entry.date), time.min, tzinfo=timezone.utc),
+                )
+                for exercise_log_id, entry in zip(exercise_log_ids, entries)
+            ],
+        )
+
+    return exercise_log_ids
+
+
+async def log_exercise_entries_bulk(user_id: int, entries: list[ExerciseLogContract], conn=None) -> list[int]:
+    """Bulk equivalent of log_exercise_entry() -- same shape and reasoning
+    as log_food_entries_bulk (see its own docstring), written for
+    BATCH_EVENTS_SPEC.md's POST /events/log/batch (its first caller; no
+    exercise importer exists yet the way Cronometer sync motivated the
+    food version). Unlike log_exercise_entry, this does NOT dedupe by
+    (source, source_id) itself -- the batch route checks that upfront,
+    across both food and exercise items in one pass, before calling
+    either bulk function at all (BATCH_EVENTS_SPEC.md's "validate
+    everything before writing anything" -- a dedup match is a result,
+    not something each bulk function needs to special-case).
+
+    `conn`: see log_food_entries_bulk's own doc on this parameter -- same
+    contract here.
+    """
+    if not entries:
+        return []
+
+    if conn is not None:
+        return await _insert_exercise_entries_bulk(conn, user_id, entries)
+
+    pool = await get_pool()
+    async with pool.acquire() as owned_conn:
+        async with owned_conn.transaction():
+            return await _insert_exercise_entries_bulk(owned_conn, user_id, entries)
+
+
+async def find_existing_by_source(conn, user_id: int, table: str, source: str, source_ids: list[str]) -> dict[str, int]:
+    """Which of these (source, source_id) pairs already have a row in
+    `table` for this user -- BATCH_EVENTS_SPEC.md's per-item duplicate
+    check, run ONCE per table against the batch's own in-flight `conn`
+    (not a separate connection), so it sees this batch's own not-yet-
+    committed inserts from an earlier item too. `table` is always a
+    hardcoded literal at the one call site below, never request input --
+    same invariant CLAUDE.md's composable-SQL pattern already requires
+    elsewhere in this project."""
+    if not source_ids:
+        return {}
+    rows = await conn.fetch(
+        f"SELECT source_id, id FROM {table} WHERE user_id = $1 AND source = $2 AND source_id = ANY($3::text[])",
+        user_id, source, source_ids,
+    )
+    return {r["source_id"]: r["id"] for r in rows}
