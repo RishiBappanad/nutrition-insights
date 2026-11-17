@@ -3,9 +3,24 @@ steps:
     args:
       - 'build'
       - '--build-arg'
+      - 'BASE_PATH=${_BASE_PATH}'
+      - '--build-arg'
+      - 'API_BASE=${_API_BASE}'
+      - '--build-arg'
       - 'TRACKSTACK_AUTH_URL=${_TRACKSTACK_AUTH_URL}'
       - '-t'
       - '${_IMAGE}'
       - '.'
 images:
   - '${_IMAGE}'
+substitutions:
+  # Matches .github/workflows/deploy.yml's own values -- this service is
+  # only ever meant to be reached through trackstack-gateway at /nutrition
+  # (see that workflow's own comment). Without these two, the frontend
+  # builds in standalone/root-path mode: its asset and API URLs come out
+  # rooted at "/" instead of "/nutrition/", which 404s/misroutes through
+  # the gateway and produces a blank page with no app-level console error
+  # -- found live 2026-11-17 after a manual `gcloud builds submit
+  # --config=cloudbuild.yaml` (this file, pre-fix) omitted them.
+  _BASE_PATH: /nutrition/
+  _API_BASE: /nutrition
